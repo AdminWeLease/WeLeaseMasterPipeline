@@ -1,0 +1,1498 @@
+/**
+ * WeLease Pipeline — COMPUTE LAYER  v1.0.0 · 2026-08-05
+ * Requires Core_v2.gs and Jobs.gs. Reads the tabs the jobs wrote — never re-pulls the API.
+ *
+ * computeMetrics() walks the registry, runs the matching calculation, and writes one
+ * row per metric per period to Metrics, appending the same rows to Metrics_History
+ * so trends accumulate.
+ *
+ * Every result carries numerator, denominator, and n. A rate without a denominator
+ * is not publishable, and this layer will not emit one.
+ */
+
+// ============================================================ SHEET READER
+
+// _tabCache moved to Core_v2.gs, beside readTab_ which owns it.
+// Two `var _tabCache = {}` declarations in one global scope would reset the cache
+// depending on file load order, so this must NOT be reinstated here.
+
+
+
+/** Lazy data context — each tab is read at most once per run. */
+function dataContext_() {
+  var cache = {};
+  function get(tab) {
+    if (!(tab in cache)) cache[tab] = readTab_(tab);
+    return cache[tab];
+  }
+  return {
+    units:      function () { return get('Unit_Directory'); },
+    occ:        function () { return get('Occupancy_Summary'); },
+    rentRoll:   function () { return get('Rent_Roll'); },
+    delinq:     function () { return get('Delinquency_Aged'); },
+    unpaid:     function () { return get('Unpaid_Charges'); },
+    wo:         function () { return get('Work_Orders'); },
+    tickler:    function () { return get('Tenant_Tickler'); },
+    renewals:   function () { return get('Renewals'); },
+    apps:       function () { return get('Applications'); },
+    vacancy:    function () { return get('Unit_Vacancy'); },
+    inspections:function () { return get('Inspections'); },
+    groups:     function () { return get('PM_Groups'); }
+  };
+}
+
+// ============================================================ RESULT SHAPE
+
+function res_(value, numerator, denominator, n, extra) {
+  var o = { value: value, numerator: numerator, denominator: denominator, n: n };
+  if (extra) for (var k in extra) o[k] = extra[k];
+  return o;
+}
+
+/** Monthly series from dated rows. fn receives the rows for one month. */
+function monthly_(rows, dateField, fn) {
+  var g = groupBy_(rows, function (r) { return monthKey_(r[dateField]); });
+  return Object.keys(g).sort().map(function (m) {
+    var out = fn(g[m]);
+    out.period = m;
+    return out;
+  });
+}
+
+// ============================================================ CALCULATIONS
+
+var MAKE_READY_NOTE = 'Make Ready is NOT separable from Turnover in the current AppFolio ' +
+  'configuration — work_order_type has one turn value ("Unit Turn") and unit_turn_category ' +
+  'has one non-null value. This is the same population as turnover_speed. Separating them ' +
+  'requires a new work order type or populated turn categories in AppFolio.';
+
+/**
+ * Completed tasks inside the reporting window.
+ *
+ * The seed backfills five years because the step-duration metrics need history to find
+ * enough completions. The RATE metrics do not — a skip rate averaged over five years
+ * barely moves when the process changes, which is the opposite of what a dashboard is
+ * for. Both read this instead of the whole tab.
+ */
+var LS_METRIC_WINDOW_DAYS = 400;
+
+function lsRecentTasks_(days, opts) {
+  opts = opts || {};
+  var cutoff = ymd_(addDays_(today_(), -(days || LS_METRIC_WINDOW_DAYS)));
+  return readTab_('LS_Tasks_All').filter(function (r) {
+    // The tab holds every task now. A finished task is one with a completed date OR
+    // one that was skipped — a skipped step is resolved, just not by doing it, and
+    // leaving them out of the denominator is what made the skip rate unmeasurable.
+    var done = ymd_(r.completed_date);
+    var skipped = r.skipped === 'YES';
+    if (!done && !skipped) return false;
+    if (opts.completedOnly && !done) return false;
+    var when = done || ymd_(r.due_date);
+    return when && when >= cutoff;
+  });
+}
+
+/**
+ * Onboarding processes, assembled from BOTH tabs.
+ *
+ * onboarding_cycle_time read LS_Processes and needed closed_date. Every onboarding tile on
+ * the Performance view was blank, and the reason is that LS_Processes carries the processes
+ * the sync returns — which in practice skew open. A cycle time measured only on open
+ * processes cannot exist.
+ *
+ * LS_Tasks_All solves it without another API call: every completed task carries its parent
+ * process's created_at AND closed_at inline. A closed onboarding process that never reached
+ * LS_Processes still has its tasks in there. The two sources are unioned and the one that
+ * knows a close date wins.
+ */
+function lsOnboardingProcs_() {
+  var byId = {};
+
+  function put(id, type, created, closed, src) {
+    // THE onboarding process, not everything matching "onboard" — see LS_ONBOARDING.
+    if (!id || !lsIsOnboardingType_(type)) return;
+    var cur = byId[id];
+    if (!cur) {
+      byId[id] = { id: id, type: type, created: created || null, closed: closed || null,
+                   sources: [src] };
+      return;
+    }
+    if (cur.sources.indexOf(src) === -1) cur.sources.push(src);
+    if (!cur.created && created) cur.created = created;
+    if (!cur.closed && closed) cur.closed = closed;
+  }
+
+  readTab_('LS_Processes').forEach(function (r) {
+    put(r.process_id, r.process_type, ymd_(r.created_date), ymd_(r.closed_date), 'processes');
+  });
+  readTab_('LS_Tasks_All').forEach(function (r) {
+    put(r.process_id, r.process_type, ymd_(r.process_created), ymd_(r.process_closed), 'tasks');
+  });
+
+  return Object.keys(byId).map(function (k) { return byId[k]; });
+}
+
+/** What "onboard" matches that we are deliberately NOT measuring, with counts. */
+function lsOnboardingExcluded_() {
+  var counts = {};
+  readTab_('LS_Processes').forEach(function (r) {
+    var t = String(r.process_type || '');
+    if (!LS_ONBOARDING.ALSO_MATCHING.test(t)) return;
+    if (lsIsOnboardingType_(t)) return;
+    counts[t] = (counts[t] || 0) + 1;
+  });
+  return counts;
+}
+
+/**
+ * Median days from an onboarding process opening to a named step being completed.
+ *
+ * The step is matched on a PATTERN against step.description rather than an exact name,
+ * because LeadSimple step descriptions are free text and get edited. An exact-match list
+ * stops matching silently the first time someone fixes a typo; a pattern survives that, and
+ * the metric reports how many distinct step names it matched so a bad pattern is visible
+ * rather than invisible.
+ */
+function lsOnboardingStepDays_(pattern, label) {
+  var procs = lsOnboardingProcs_();
+  if (!procs.length) {
+    return res_(null, null, null, 0, {
+      note: 'No onboarding processes in LS_Processes or LS_Tasks_All. Seed LeadSimple, then ' +
+            'run lsListProcessTypes() to confirm a type name contains "onboard".' });
+  }
+  var createdOf = {};
+  procs.forEach(function (p) { if (p.created) createdOf[p.id] = p.created; });
+
+  var tasks = readTab_('LS_Tasks_All');
+  var withStep = 0, matchedNames = {}, earliest = {};
+  tasks.forEach(function (t) {
+    if (!createdOf[t.process_id]) return;          // not an onboarding process
+    var step = String(t.step || '');
+    if (!step) return;
+    withStep++;
+    if (!pattern.test(step)) return;
+    matchedNames[step] = (matchedNames[step] || 0) + 1;
+    var done = ymd_(t.completed_date);
+    if (!done) return;                              // skipped steps have no completion date
+    var prev = earliest[t.process_id];
+    if (!prev || done < prev) earliest[t.process_id] = done;
+  });
+
+  var days = [];
+  Object.keys(earliest).forEach(function (pid) {
+    var g = daysBetween_(createdOf[pid], earliest[pid]);
+    if (g !== null && g >= 0) days.push(g);
+  });
+
+  var names = Object.keys(matchedNames);
+  if (!days.length) {
+    return res_(null, null, null, 0, {
+      onboarding_processes: procs.length,
+      onboarding_tasks_with_a_step_name: withStep,
+      step_names_matched: names.length,
+      note: !withStep
+        ? 'Onboarding processes exist but none of their tasks carries a step name. Re-run ' +
+          'lsSeedCompletedTasks() — tasks seeded before the step.description fix have a ' +
+          'blank step column.'
+        : names.length
+          ? 'Matched ' + names.length + ' step name(s) for ' + label + ' but none has a ' +
+            'completion date yet.'
+          : 'No step name matches ' + label + ' across ' + withStep + ' onboarding tasks. ' +
+            'Run lsListSteps() and send me the list — the pattern needs widening.' });
+  }
+
+  return res_(median_(days), null, null, days.length, {
+    p90: p90_(days),
+    step_names_matched: names.slice(0, 6).join(' | '),
+    distinct_step_names: names.length,
+    note: 'Days from the onboarding process opening to the first completed step matching ' +
+          label + '. Matched on the step description, so a renamed step keeps counting.' });
+}
+
+var CALC = {
+
+  // ---------- Vacancy & Leasing ----------
+  occupancy_rate: function (D) {
+    var occupied = D.occ().reduce(function (s, r) { return s + (num_(r.occupied) || 0); }, 0);
+    var total = D.units().length;
+    return res_(total ? round1_(occupied / total * 100) : null, occupied, total, total,
+      { note: 'Denominator is unit_directory (canon). AppFolio UI shows this against occupancy_summary and will differ.' });
+  },
+
+  days_without_revenue: function (D) {
+    var v = D.vacancy().map(function (r) { return num_(r.days_vacant); })
+                       .filter(function (x) { return x !== null && x >= 0; });
+    return res_(median_(v), null, null, v.length, {
+      p90: p90_(v),
+      over_30: v.filter(function (x) { return x > 30; }).length,
+      over_60: v.filter(function (x) { return x > 60; }).length
+    });
+  },
+
+  speed_to_lease_executed: function (D) {
+    var d = D.apps().filter(function (r) { return r.approved_at && r.lease_start_date; })
+      .map(function (r) { return daysBetween_(r.approved_at, r.lease_start_date); })
+      .filter(function (x) { return x !== null && x >= 0 && x <= 120; });
+    return res_(median_(d), null, null, d.length, { p90: p90_(d) });
+  },
+
+  // ---------- Applications ----------
+  application_qualification_speed: function (D) {
+    var rows = D.apps().filter(function (r) {
+      return r.received && r.decision_made_at &&
+             String(r.application_status || '').toLowerCase().indexOf('cancel') === -1;
+    });
+    var d = rows.map(function (r) { return daysBetween_(r.received, r.decision_made_at); })
+                .filter(function (x) { return x !== null && x >= 0 && x <= 60; });
+    var screen = D.apps().filter(function (r) { return r.received && r.screened_on; })
+      .map(function (r) { return daysBetween_(r.received, r.screened_on); })
+      .filter(function (x) { return x !== null && x >= 0 && x <= 60; });
+    return res_(median_(d), null, null, d.length, {
+      p90: p90_(d),
+      screening_leg_median: median_(screen),
+      screening_n: screen.length,
+      note: 'Column is "received", not "received_on". Two legs: received to screened, screened to decided.'
+    });
+  },
+
+  // ---------- Collections ----------
+  rent_delinquency_rate: function (D) {
+    var current = D.rentRoll().filter(function (r) {
+      return String(r.status || '').toLowerCase() === 'current';
+    });
+    // Negative past_due is a prepaid credit, not delinquency. Excluded.
+    var delq = current.filter(function (r) { return (num_(r.past_due) || 0) > 0; });
+
+    // AS-OF SENSITIVITY. rent_roll.past_due is a snapshot. Pulled a few days after
+    // rent is due, everyone still inside the grace period counts as delinquent — which
+    // roughly doubles the rate versus a month-end pull. The aged figure below comes
+    // from the delinquency report's server-side buckets and is cycle-independent.
+    var aged = D.delinq().filter(function (r) {
+      return (num_(r['30_plus']) || 0) > 0;
+    });
+    var agedRate = current.length ? round1_(aged.length / current.length * 100) : null;
+
+    return res_(current.length ? round1_(delq.length / current.length * 100) : null,
+      delq.length, current.length, current.length, {
+        past_due_total: round2_(delq.reduce(function (s, r) { return s + num_(r.past_due); }, 0)),
+        aged_30_plus_rate: agedRate,
+        aged_30_plus_count: aged.length,
+        as_of: ymd_(today_()),
+        note: 'Headline value is a point-in-time snapshot and moves with the rent cycle. ' +
+              'For trend and benchmark comparison use aged_30_plus_rate, which excludes ' +
+              'residents still inside the grace period. Always state the as-of date.'
+      });
+  },
+
+  total_delinquency_rate: function (D) {
+    var rr = D.rentRoll();
+    var delq = rr.filter(function (r) { return (num_(r.past_due) || 0) > 0; });
+    var total = D.units().length;
+    return res_(total ? round1_(delq.length / total * 100) : null, delq.length, total, total,
+      { past_due_total: round2_(delq.reduce(function (s, r) { return s + num_(r.past_due); }, 0)) });
+  },
+
+  aged_delinquency_buckets: function (D) {
+    var d = D.delinq();
+    function sum(f) { return round2_(d.reduce(function (s, r) { return s + (num_(r[f]) || 0); }, 0)); }
+    return res_(sum('amount_receivable'), null, null, d.length, {
+      not_yet_due: sum('not_yet_due'), b00_30: sum('00_to30'), b30_60: sum('30_to60'),
+      b60_90: sum('60_to90'), b90_plus: sum('90_plus'),
+      in_collections: d.filter(function (r) { return r.in_collections; }).length
+    });
+  },
+
+  // ---------- Maintenance ----------
+  maint_speed_to_repair: function (D) {
+    var wo = completedWO_(D);
+    var d = spanDays_(wo, 'created_at', 'completed_on', 365);
+    return res_(median_(d), null, null, d.length,
+      { p90: p90_(d), monthly: monthly_(wo, 'created_at', function (rows) {
+          var x = spanDays_(rows, 'created_at', 'completed_on', 365);
+          return { value: median_(x), n: x.length };
+        }) });
+  },
+
+  maint_speed_to_schedule: function (D) {
+    var d = spanDays_(D.wo(), 'created_at', 'scheduled_start', 180);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d) });
+  },
+
+  maint_owner_approval: function (D) {
+    var d = spanDays_(D.wo(), 'estimate_req_on', 'estimate_approved_on', 180);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d) });
+  },
+
+  maint_cancellation_rate: function (D) {
+    var wo = D.wo();
+    var canceled = wo.filter(function (r) { return r.canceled_on; }).length;
+    return res_(wo.length ? round1_(canceled / wo.length * 100) : null, canceled, wo.length, wo.length,
+      { note: 'Operational metric. NOT the KPI guide "resolved without dispatch" benchmark.' });
+  },
+
+  work_orders_aging: function (D) {
+    var cut = ymd_(addDays_(today_(), -CFG.WORK_ORDER_AGING_DAYS));
+    var open = D.wo().filter(function (r) {
+      return !r.completed_on && !r.canceled_on && ymd_(r.created_at) && ymd_(r.created_at) < cut;
+    });
+    var ages = open.map(function (r) { return daysBetween_(r.created_at, ymd_(today_())); });
+    return res_(open.length, open.length, D.wo().length, open.length,
+      { median_age_days: median_(ages), oldest_days: ages.length ? Math.max.apply(null, ages) : null });
+  },
+
+  // ---------- Turnover / Make Ready ----------
+  turnover_speed: function (D) {
+    var turns = turnWO_(D);
+    var d = spanDays_(turns, 'created_at', 'completed_on', 180);
+    return res_(median_(d), null, null, d.length,
+      { p90: p90_(d), note: 'work_order_type = "Unit Turn". Make Ready is not separable in the current AppFolio setup.' });
+  },
+
+  turnover_dispatch: function (D) {
+    var d = spanDays_(turnWO_(D), 'created_at', 'scheduled_start', 180);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d) });
+  },
+
+  // ---------- Lease Renewal ----------
+  renewal_signed_leadtime: function (D) {
+    // INVERTED: higher is better. Signing far ahead of expiry is good.
+    var d = D.renewals().filter(function (r) { return r.countersigned_date && r.previous_lease_end; })
+      .map(function (r) { return daysBetween_(r.countersigned_date, r.previous_lease_end); })
+      .filter(function (x) { return x !== null && x > -30 && x < 400; });
+    return res_(median_(d), null, null, d.length,
+      { p90: p90_(d), signed_after_expiry: d.filter(function (x) { return x < 0; }).length,
+        note: 'INVERTED — higher is better.' });
+  },
+
+  renewal_rent_increase: function (D) {
+    var p = D.renewals().map(function (r) { return num_(r.percent_difference); })
+                        .filter(function (x) { return x !== null; });
+    return res_(median_(p), null, null, p.length, {
+      mean: p.length ? round2_(p.reduce(function (a, b) { return a + b; }, 0) / p.length) : null,
+      zero_or_negative: p.filter(function (x) { return x <= 0; }).length,
+      note: 'CALIFORNIA: reporting only. Increases are governed by statute, local ordinance, and lease terms.'
+    });
+  },
+
+  // ---------- Portfolio ----------
+  unit_churn: function (D) {
+    var mo = D.tickler().filter(isMoveOutEvent_);
+    var total = D.units().length;
+    var span = 400; // rebuildCompliance pulls a 400-day window
+    var annualized = total ? mo.length / total * (365 / span) * 100 : null;
+    return res_(round1_(annualized), mo.length, total, mo.length, {
+      raw_moveouts: mo.length, window_days: span,
+      note: 'ANNUALIZED from the pull window before benchmark comparison.'
+    });
+  },
+
+  resident_flow: function (D) {
+    var t = D.tickler();
+    var ins = t.filter(function (r) {
+      var e = String(r.event || '').toLowerCase().replace(/[^a-z]/g, '');
+      return e.indexOf('movein') !== -1 && e.indexOf('notice') === -1;
+    });
+    var outs = t.filter(isMoveOutEvent_);
+    var notices = t.filter(function (r) {
+      return String(r.event || '').toLowerCase().indexOf('notice') !== -1;
+    });
+    return res_(ins.length - outs.length, ins.length, outs.length, t.length, {
+      move_ins: ins.length, move_outs: outs.length, notices: notices.length,
+      note: 'Direction is context-dependent — move-ins up is good, move-outs up is not. Do not apply one colour rule.'
+    });
+  },
+
+  rent_to_market_variance: function (D) {
+    var rows = D.rentRoll().filter(function (r) {
+      return String(r.status || '').toLowerCase() === 'current' && num_(r.rent) > 0;
+    }).map(function (r) {
+      var mkt = num_(r.market_rent) || num_(r.computed_market_rent);
+      var rent = num_(r.rent);
+      if (!mkt || mkt <= 0) return null;
+      return { unit_id: r.unit_id, property_id: r.property_id, property_name: r.property_name,
+               property_street: r.property_street, property_street2: r.property_street2,
+               unit: r.unit, tenant_id: r.tenant_id, status: r.status,
+               rent: rent, market_rent: mkt, gap: round2_(mkt - rent),
+               gap_pct: round1_((mkt - rent) / mkt * 100), lease_to: ymd_(r.lease_to) };
+    }).filter(function (x) { return x; });
+
+    var under = rows.filter(function (r) { return r.gap > 0; })
+                    .sort(function (a, b) { return b.gap - a.gap; });
+    writeTab_('Rent_To_Market', under.slice(0, 500));
+    return res_(round2_(under.reduce(function (s, r) { return s + r.gap; }, 0)),
+      under.length, rows.length, rows.length, {
+        median_gap_pct: median_(under.map(function (r) { return r.gap_pct; })),
+        note: 'Monthly revenue gap across under-market occupied units. CALIFORNIA: identifies a gap only — any increase is statute and lease governed.'
+      });
+  },
+
+  // ---------- Move-Out ----------
+  // ---------- Make Ready ----------
+  // AppFolio has ONE turn-related work_order_type ("Unit Turn") and unit_turn_category
+  // carries a single non-null value. Make Ready and Turnover are therefore the SAME
+  // population here. The numbers are real; the separation the KPI guide assumes is not
+  // available without a configuration change in AppFolio.
+  make_ready_speed: function (D) {
+    var d = spanDays_(turnWO_(D), 'created_at', 'completed_on', 180);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d), note: MAKE_READY_NOTE });
+  },
+  make_ready_estimate_sent: function (D) {
+    var d = spanDays_(turnWO_(D), 'estimate_req_on', 'estimated_on', 90);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d), note: MAKE_READY_NOTE });
+  },
+  make_ready_dispatch: function (D) {
+    var d = spanDays_(turnWO_(D), 'estimate_approved_on', 'scheduled_start', 90);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d), note: MAKE_READY_NOTE });
+  },
+  make_ready_owner_approval: function (D) {
+    var d = spanDays_(turnWO_(D), 'estimate_req_on', 'estimate_approved_on', 90);
+    return res_(median_(d), null, null, d.length, { p90: p90_(d), note: MAKE_READY_NOTE });
+  },
+
+  turnover_callback_rate: function (D) {
+    return callbackRate_(D, turnWO_(D),
+      'Inferred from a 30-day same-unit window. Confirm the definition with the maintenance team before publishing.');
+  },
+
+  renewal_capture_rate: function (D) {
+    // APPROXIMATION, and it is labelled as one. renewal_summary rows are completed
+    // renewals; there is no "did not renew" record. Using move-outs as the negative
+    // side overstates non-renewal, because early terminations and evictions are in
+    // there too. The exact denominator needs historical lease_expiration_detail.
+    var renewed = D.renewals().length;
+    var movedOut = D.tickler().filter(isMoveOutEvent_).length;
+    var denom = renewed + movedOut;
+    return res_(denom ? round1_(renewed / denom * 100) : null, renewed, denom, denom, {
+      renewals: renewed, move_outs: movedOut,
+      note: 'APPROXIMATION — denominator is renewals + all move-outs. Early terminations and evictions inflate the negative side, so the true capture rate is HIGHER than this. Label the source on any published figure.'
+    });
+  },
+
+  // ---------- Move-Out (computed by their own jobs, read back here) ----------
+  moveout_deposit_disposition: function (D) {
+    var rows = readTab_('Deposit_Compliance');
+    if (!rows.length) return res_(null, null, null, 0, { note: 'Run buildDepositCompliance() first.' });
+    var measured = rows.filter(function (r) {
+      return r.status === 'WITHIN_THRESHOLD' || r.status === 'EXCEEDED_THRESHOLD';
+    });
+    var days = measured.map(function (r) { return num_(r.days_elapsed); });
+    var within = measured.filter(function (r) { return r.status === 'WITHIN_THRESHOLD'; }).length;
+    return res_(median_(days), within, measured.length, measured.length, {
+      p90: p90_(days),
+      compliance_rate_pct: measured.length ? round1_(within / measured.length * 100) : null,
+      exceeded: measured.length - within,
+      owner_held_unmeasurable: rows.filter(function (r) { return r.status === 'CANNOT_MEASURE_OWNER_HELD'; }).length,
+      still_open: rows.filter(function (r) { return String(r.status || '').indexOf('OPEN') === 0; }).length,
+      threshold_days: CFG.DEPOSIT_DISPOSITION_DAYS,
+      note: 'CALIFORNIA: reporting only. Threshold is a configured standard, not a legal determination.'
+    });
+  },
+
+  moveout_assessment_speed: function (D) {
+    var rows = readTab_('MoveOut_Assessment');
+    if (!rows.length) return res_(null, null, null, 0, { note: 'Run buildMoveOutAssessment() first.' });
+    var ok = rows.filter(function (r) { return r.status === 'OK'; });
+    var days = ok.map(function (r) { return num_(r.days_to_assessment); });
+    var corrob = ok.filter(function (r) { return r.corroborated === 'YES'; }).length;
+    return res_(median_(days), null, null, ok.length, {
+      p90: p90_(days),
+      no_inspection_found: rows.filter(function (r) { return r.status === 'NO_INSPECTION_FOUND'; }).length,
+      name_corroboration_pct: ok.length ? round1_(corrob / ok.length * 100) : null,
+      note: 'Date-driven: first inspection on or after move-out. Independent of inspection naming.'
+    });
+  },
+
+  maint_callback_rate: function (D) {
+    return callbackRate_(D, completedWO_(D),
+      'Same-unit work order within 30 days of completion. Same unit does not always mean same issue.');
+  },
+
+  make_ready_callback_rate: function (D) {
+    return callbackRate_(D, turnWO_(D).filter(function (r) { return r.completed_on; }),
+      MAKE_READY_NOTE + ' Callback inferred from a 30-day same-unit window.');
+  },
+
+  maint_validation_speed: function (D) {
+    var wo = completedWO_(D);
+    var f = spanDays_(wo, 'completed_on', 'follow_up_on', 90);
+    var i = spanDays_(wo, 'completed_on', 'inspection_date', 90);
+    var use = f.length >= i.length ? f : i;
+    var field = f.length >= i.length ? 'follow_up_on' : 'inspection_date';
+    var zeros = use.filter(function (x) { return x === 0; }).length;
+    var zeroPct = use.length ? Math.round(zeros / use.length * 100) : 0;
+
+    // A median of exactly zero with most values at zero does not mean work is validated
+    // the instant it completes — it means the field mirrors the completion date. Report
+    // NO VALUE rather than a flattering 0.
+    if (use.length > 5 && median_(use) === 0 && zeroPct >= 60) {
+      return res_(null, null, null, use.length, {
+        field_examined: field, zero_pct: zeroPct,
+        follow_up_n: f.length, inspection_n: i.length,
+        note: 'NO SOURCE. ' + zeroPct + '% of ' + field + ' values equal completed_on, so the field ' +
+              'mirrors completion rather than recording a separate validation. AppFolio has no ' +
+              'distinct validation date. To measure this, either adopt a follow-up inspection step ' +
+              'or a work order status that marks verification.'
+      });
+    }
+    return res_(median_(use), null, null, use.length, {
+      p90: p90_(use), field_used: field, zero_pct: zeroPct,
+      follow_up_n: f.length, follow_up_median: median_(f),
+      inspection_n: i.length, inspection_median: median_(i),
+      note: 'AppFolio has no explicit validation field. Confirm which date your team actually uses.'
+    });
+  },
+
+  maint_resolved_without_dispatch: function (D) {
+    var wo = D.wo();
+    var ai = wo.filter(function (r) { return r.ai_resolved; }).length;
+    return res_(wo.length ? round1_(ai / wo.length * 100) : null, ai, wo.length, wo.length, {
+      note: ai === 0
+        ? 'ai_resolved is unpopulated across the portfolio — AppFolio AI triage appears unused. ' +
+          'This reports 0%, which is NOT the same as "no issues resolved without dispatch". ' +
+          'The KPI guide metric has no source until either AI triage is adopted or a work order ' +
+          'convention marks no-dispatch resolutions.'
+        : 'Based on ai_resolved. Confirm it captures all no-dispatch resolutions, not just AI-channel ones.'
+    });
+  },
+
+  movein_evaluation_speed: function (D) {
+    // WINDOW MATTERS, and the first version got it wrong. A move-out assessment always
+    // follows the resident leaving, so ">= move_out_date" is right there. A MOVE-IN
+    // walkthrough is routinely done a few days BEFORE or on the day of handover — so
+    // ">= move_in_date" matched only 25 of 184 move-ins. Window is -7 to +30 days,
+    // nearest to the move-in date.
+    var BEFORE = 7, AFTER = 30;
+    var ins = D.tickler().filter(function (r) {
+      var e = String(r.event || '').toLowerCase().replace(/[^a-z]/g, '');
+      return r.move_in_date && e.indexOf('movein') !== -1 && e.indexOf('notice') === -1;
+    });
+    var byOcc = {};
+    D.inspections().forEach(function (r) {
+      if (r.occupancy_id === null || r.occupancy_id === undefined) return;
+      var d = parseDate_(r.inspected_on);
+      if (!d) return;
+      (byOcc[r.occupancy_id] = byOcc[r.occupancy_id] || []).push(d.getTime());
+    });
+
+    var days = [], before = 0, matched = 0;
+    ins.forEach(function (mi) {
+      var mid = parseDate_(mi.move_in_date);
+      if (!mid) return;
+      var t = mid.getTime(), best = null;
+      (byOcc[mi.occupancy_id] || []).forEach(function (x) {
+        var diff = Math.round((x - t) / 86400000);
+        if (diff < -BEFORE || diff > AFTER) return;
+        if (best === null || Math.abs(diff) < Math.abs(best)) best = diff;
+      });
+      if (best === null) return;
+      matched++;
+      if (best < 0) before++;
+      days.push(Math.max(0, best));   // inspected early counts as day 0, never negative
+    });
+
+    return res_(median_(days), null, null, days.length, {
+      p90: p90_(days), move_ins: ins.length, matched: matched,
+      match_rate_pct: ins.length ? round1_(matched / ins.length * 100) : null,
+      inspected_before_movein: before,
+      // Zero is a real, good answer here: the walkthrough happened on or before
+      // handover day. Tells sanityCheck not to treat it as an empty date field.
+      zero_is_meaningful: true,
+      note: 'Nearest inspection within -7 to +30 days of move-in. Early inspections count as day 0. ' +
+            'A low match rate means move-ins are happening without a recorded inspection — an operational ' +
+            'gap worth checking, not a data error.'
+    });
+  },
+
+  /** Share of completed tasks that were skipped rather than done. Lower is better. */
+  skipped_step_rate: function (D) {
+    // Windowed. The backfill holds five years of tasks; a skip rate averaged over five
+    // years tells you nothing about how the process is running now, and would barely
+    // move when it changed.
+    var t = lsRecentTasks_(LS_METRIC_WINDOW_DAYS);
+    if (!t.length) {
+      return res_(null, null, null, 0, {
+        note: 'LS_Tasks_Completed is empty. The nightly sync pulls only UPCOMING tasks — ' +
+              'run lsSeedCompletedTasks() once to backfill.' });
+    }
+    var skipped = t.filter(function (r) { return r.skipped === 'YES'; }).length;
+    if (!skipped) {
+      // Zero across tens of thousands is a claim worth doubting. The extraction is
+      // correct — skipped is a boolean on the payload — but due_type=completed may
+      // simply never return a skipped task, in which case this is unmeasurable here
+      // rather than genuinely zero. lsProbeTask() compares against an unfiltered pull.
+      return res_(null, null, null, t.length, {
+        window_days: LS_METRIC_WINDOW_DAYS,
+        tasks_examined: t.length,
+        note: 'Not a single skipped task in ' + t.length + ' completed tasks. Published ' +
+              'as no-value rather than 0%, because a rate of exactly zero across a set ' +
+              'that large is more likely a filter than a fact. Run lsProbeTask() and ' +
+              're-seed if the tab predates 2026-08-13, when the seed still filtered to ' +
+              'due_type=completed and could not see a skipped task at all.' });
+    }
+    return res_(round1_(skipped / t.length * 100), skipped, t.length, t.length, {
+      window_days: LS_METRIC_WINDOW_DAYS,
+      note: 'Last ' + LS_METRIC_WINDOW_DAYS + ' days. Tasks marked skipped as a share of ' +
+            'all completed tasks in that window. A skipped step is ' +
+            'not automatically wrong — some are genuinely not applicable — but a rising ' +
+            'rate means the process is being worked around rather than followed.'
+    });
+  },
+
+  /** Share of automated sends that errored. Lower is better. */
+  automation_failure_rate: function (D) {
+    var t = lsRecentTasks_(LS_METRIC_WINDOW_DAYS, { completedOnly: true })
+              .filter(function (r) { return r.auto_send === 'YES'; });
+    if (!t.length) {
+      return res_(null, null, null, 0, {
+        note: 'No completed task is flagged auto_send. Either automation is not in use on ' +
+              'these process types, or LS_Tasks_Completed has not been seeded.' });
+    }
+    var failed = t.filter(function (r) { return String(r.auto_send_error || '').trim(); }).length;
+    return res_(round1_(failed / t.length * 100), failed, t.length, t.length, {
+      automated_tasks: t.length,
+      window_days: LS_METRIC_WINDOW_DAYS,
+      note: 'Last ' + LS_METRIC_WINDOW_DAYS + ' days. Automated sends carrying an error, ' +
+            'as a share of all automated sends in that window.'
+    });
+  },
+
+  /**
+   * Share of renewals whose annual inspection was completed at least 80 days before the
+   * renewal date. Direction: higher is better.
+   *
+   * The denominator is only renewals whose deadline HAS ARRIVED. A renewal six months out
+   * is not late, and counting it as compliant-so-far would flatter the number into
+   * uselessness — which is the failure mode of every on-time rate that includes the future.
+   */
+  renewal_inspection_ontime: function (D) {
+    var rows = readTab_('Renewal_Pipeline').filter(function (r) { return r.address; });
+    if (!rows.length) {
+      return res_(null, null, null, 0, {
+        note: 'Renewal_Pipeline is empty. Run buildRenewalPipeline(), or wait for ' +
+              'rebuildCompliance tonight.' });
+    }
+    function n(st) {
+      return rows.filter(function (r) { return r.inspection_status === st; }).length;
+    }
+    var onTime = n('DONE ON TIME');
+    var measurable = rows.filter(function (r) {
+      return r.inspection_status !== 'NO RENEWAL DATE' &&
+             r.inspection_status !== 'NOT YET DUE';
+    }).length;
+    if (!measurable) {
+      return res_(null, null, null, 0, {
+        renewals_in_horizon: rows.length,
+        no_renewal_date: n('NO RENEWAL DATE'),
+        note: 'No renewal has reached its inspection deadline yet, so there is nothing to ' +
+              'be on time for. This fills in as deadlines pass.' });
+    }
+    return res_(round1_(onTime / measurable * 100), onTime, measurable, measurable, {
+      done_late: n('DONE LATE'),
+      overdue: n('OVERDUE'),
+      due_soon: n('DUE SOON'),
+      scheduled: n('SCHEDULED'),
+      no_renewal_date: n('NO RENEWAL DATE'),
+      lead_days_standard: RENEWAL.INSPECTION_LEAD_DAYS,
+      note: 'Inspection completed at least ' + RENEWAL.INSPECTION_LEAD_DAYS + ' days before ' +
+            'the renewal date — a WeLease operating standard, not a statute. Measured only ' +
+            'against renewals whose deadline has passed.' });
+  },
+
+  /** Days from an onboarding process opening to closing. Lower is better. */
+  onboarding_cycle_time: function (D) {
+    // Reads BOTH LS_Processes and LS_Tasks_All — see lsOnboardingProcs_. Reading only
+    // LS_Processes is why every onboarding tile was blank.
+    var all = lsOnboardingProcs_();
+    var closed = all.filter(function (p) { return p.created && p.closed; });
+
+    if (!closed.length) {
+      var types = {};
+      readTab_('LS_Processes').forEach(function (r) {
+        types[String(r.process_type || '(none)')] = 1;
+      });
+      var other = lsOnboardingExcluded_();
+      var otherNames = Object.keys(other);
+      return res_(null, null, null, 0, {
+        onboarding_processes_found: all.length,
+        process_types_present: Object.keys(types).length,
+        measuring: LS_ONBOARDING.TYPES.join(' / '),
+        note: all.length
+          ? all.length + ' "' + LS_ONBOARDING.TYPES.join('" / "') + '" process(es) found, ' +
+            'none with both an open and a close date. If they are genuinely all still open ' +
+            'this fills in as they close; if not, the sync is returning open processes only ' +
+            'and the closed ones reach us via their tasks — diagnoseOnboarding() separates ' +
+            'those two.'
+          : 'No process of type "' + LS_ONBOARDING.TYPES.join('" or "') + '" found across ' +
+            Object.keys(types).length + ' types.' +
+            (otherNames.length
+              ? ' ' + otherNames.length + ' other type(s) do contain "onboard" (' +
+                otherNames.join(', ') + ') but are deliberately excluded — if the owner ' +
+                'onboarding process has been renamed, update LS_ONBOARDING.TYPES.'
+              : ' Run lsListProcessTypes().') });
+    }
+
+    var days = [];
+    closed.forEach(function (p) {
+      var g = daysBetween_(p.created, p.closed);
+      if (g !== null && g >= 0) days.push(g);
+    });
+    if (!days.length) return res_(null, null, null, 0, { note: 'No usable open-to-close dates.' });
+
+    var fromTasks = closed.filter(function (p) {
+      return p.sources.indexOf('processes') === -1;
+    }).length;
+
+    var excluded = lsOnboardingExcluded_();
+    var exNames = Object.keys(excluded);
+    return res_(median_(days), null, null, days.length, {
+      p90: p90_(days),
+      measuring: LS_ONBOARDING.TYPES.join(' / '),
+      onboarding_processes_total: all.length,
+      recovered_from_tasks_only: fromTasks,
+      excluded_types: exNames.length
+        ? exNames.map(function (k) { return k + ' (' + excluded[k] + ')'; }).join(', ') : '',
+      note: 'The owner onboarding process, created to closed. This is the process LeadSimple ' +
+            'opens when an owner is won, so the clock starts when WeLease takes the property ' +
+            'on.' +
+            (exNames.length ? ' ' + exNames.length + ' other "onboard" type(s) are excluded ' +
+                              'on purpose — they start from different events.' : '') +
+            (fromTasks ? ' ' + fromTasks + ' were found only through their tasks, not in ' +
+                         'LS_Processes.' : '') });
+  },
+
+  /** Days from onboarding start to the information-collected step. Lower is better. */
+  onboarding_info_collected: function (D) {
+    return lsOnboardingStepDays_(/inform.*collect|collect.*inform|gather.*inform/i,
+                                 'information collected');
+  },
+
+  /** Days from onboarding start to the information-in-system step. Lower is better. */
+  onboarding_info_in_system: function (D) {
+    return lsOnboardingStepDays_(/in\s*(the\s*)?system|enter.*(appfolio|system)|set\s*up.*system/i,
+                                 'information in the system');
+  },
+
+  /** Days from onboarding start to proof of insurance. Lower is better. */
+  onboarding_proof_of_insurance: function (D) {
+    return lsOnboardingStepDays_(/insurance|proof\s*of\s*ins/i, 'proof of insurance');
+  },
+
+  /** Units under management per person on the team. Direction: higher is better. */
+  units_per_team_member: function (D) {
+    // Not an API figure. Headcount is a fact about WeLease, so it lives in a tab
+    // someone maintains rather than being inferred from process assignees — which
+    // would silently drop anyone who happened to have no open work that day.
+    var roster = readTab_('Team_Roster').filter(function (r) {
+      return String(r.name || '').trim() && String(r.counts_toward_ratio || '')
+        .toUpperCase() !== 'NO';
+    });
+    if (!roster.length) {
+      return res_(null, null, null, 0, {
+        note: 'Team_Roster is empty. This is the one metric that needs a number from a ' +
+              'person rather than an API — add one row per team member. Set ' +
+              'counts_toward_ratio to NO for anyone not carrying doors.' });
+    }
+    var fte = roster.reduce(function (a, r) {
+      var f = num_(r.fte);
+      return a + (f === null ? 1 : f);
+    }, 0);
+    var units = dropTPO_(readTab_('Unit_Directory')).length;
+    if (!fte) return res_(null, null, null, 0, { note: 'Roster FTE totals zero.' });
+    return res_(round1_(units / fte), units, fte, roster.length, {
+      team_members: roster.length,
+      total_fte: round1_(fte),
+      units_counted: units,
+      note: 'Managed units divided by team FTE from Team_Roster. TPO units are excluded, ' +
+            'since WeLease does not manage them.'
+    });
+  },
+
+  // ---- ShowMojo, live since 2026-08-12 ---------------------------------------
+  //
+  // READ THIS BEFORE EDITING. The registry's stated formulas for these metrics were
+  // written against fields that do not exist. It assumed listing_and_showing_metrics
+  // carried listing_id, listed_date, unlisted_date, leased_date and showings_count.
+  // Verified against the live account, that report is an EVENT LOG — listing_uid,
+  // timestamp, entry_type, referrer, listing_code — about 1,500 rows a month.
+  //
+  // The numbers below come from where the data actually is:
+  //   detailed_listing_data   -> days_on_market, market_status, last_on_market
+  //   listing_performance     -> Scheduled showings, Actual showings, Leads per listing
+  //
+  // Each returns a note saying what it measured, because it is not what the registry
+  // formula says.
+
+  /** Median days on market across listings. Straight from the field of that name. */
+  days_on_market: function (D) {
+    var rows = readTab_('SM_Listings');
+    if (!rows.length) {
+      return res_(null, null, null, 0, {
+        note: 'SM_Listings is empty — run rebuildShowMojo().' });
+    }
+    var v = rows.map(function (r) { return num_(r.days_on_market); })
+                .filter(function (x) { return x !== null && x >= 0; });
+    if (!v.length) {
+      return res_(null, null, null, 0, {
+        note: 'No listing carries a days_on_market value.' });
+    }
+    return res_(median_(v), null, null, v.length, {
+      p90: p90_(v),
+      listings: rows.length,
+      longest: Math.max.apply(null, v),
+      note: 'Median of detailed_listing_data.days_on_market. The registry formula ' +
+            '(unlisted/leased minus listed) was written against fields ShowMojo does ' +
+            'not return; this reads the value ShowMojo publishes directly.'
+    });
+  },
+
+  /** Actual showings as a share of scheduled. Higher is better. */
+  showing_completion_rate: function (D) {
+    var perf = readTab_('SM_Listing_Performance');
+    if (!perf.length) {
+      return res_(null, null, null, 0, {
+        note: 'SM_Listing_Performance is empty — run rebuildShowMojo().' });
+    }
+    var sched = 0, actual = 0;
+    perf.forEach(function (r) {
+      sched += num_(r['Scheduled showings']) || 0;
+      actual += num_(r['Actual showings']) || 0;
+    });
+    if (!sched) {
+      return res_(null, null, null, 0, { note: 'No showings were scheduled in this period.' });
+    }
+    return res_(round1_(actual / sched * 100), actual, sched, sched, {
+      listings: perf.length,
+      no_shows: sched - actual,
+      note: 'Actual over scheduled showings across every listing. listing_performance ' +
+            'accepts no date parameters, so this is account-to-date rather than a window.'
+    });
+  },
+
+  /**
+   * Completed showings per listing that actually leased. Lower is better.
+   *
+   * ShowMojo cannot answer "did it lease". The live account carries exactly two
+   * market_status values — "On market" and "Off market" — and a listing goes off market
+   * when it leases, when the owner pulls it, or when it is paused. Counting all 47
+   * off-market listings as leases would have inflated the denominator with withdrawals.
+   *
+   * The lease event lives in AppFolio. A listing counts as leased when its joined unit
+   * has a move-in on or after the day it left the market.
+   */
+  showings_per_lease: function (D) {
+    var join = readTab_('SM_Unit_Join').filter(function (r) { return r.unit_id; });
+    var funnel = readTab_('SM_Listing_Funnel');
+    if (!join.length) {
+      return res_(null, null, null, 0, {
+        note: 'SM_Unit_Join is empty. ShowMojo alone cannot tell which listings leased — ' +
+              'its only statuses are On market and Off market. Run buildShowMojoJoin().' });
+    }
+    var showingsByCode = {};
+    funnel.forEach(function (f) {
+      showingsByCode[String(f.listing_code)] = num_(f.actual_showings);
+    });
+
+    // AppFolio move-ins per unit.
+    var moveIns = {};
+    D.tickler().forEach(function (r) {
+      var e = String(r.event || '').toLowerCase().replace(/[^a-z]/g, '');
+      if (!r.move_in_date || e.indexOf('movein') === -1 || e.indexOf('notice') !== -1) return;
+      var d = ymd_(r.move_in_date);
+      if (!d || !r.unit_id) return;
+      if (!moveIns[r.unit_id] || d > moveIns[r.unit_id]) moveIns[r.unit_id] = d;
+    });
+
+    var v = [], leased = 0, offMarketNoLease = 0;
+    join.forEach(function (j) {
+      var off = /off/i.test(String(j.market_status || ''));
+      if (!off) return;
+      var left = ymd_(j.last_on_market);
+      var mi = moveIns[j.unit_id];
+      if (!mi || (left && mi < left)) { offMarketNoLease++; return; }
+      leased++;
+      var n = showingsByCode[String(j.listing_code)];
+      if (n !== null && n !== undefined) v.push(n);
+    });
+
+    if (!v.length) {
+      return res_(null, null, null, 0, {
+        off_market_listings: offMarketNoLease + leased,
+        off_market_without_a_movein: offMarketNoLease,
+        note: 'No off-market listing has a matching AppFolio move-in, so none can be ' +
+              'confirmed as leased. Either the join rate is low or those listings were ' +
+              'withdrawn rather than let.' });
+    }
+    return res_(median_(v), null, null, v.length, {
+      p90: p90_(v),
+      leased_listings: leased,
+      off_market_without_a_movein: offMarketNoLease,
+      note: 'Median completed showings on listings that left the market AND whose ' +
+            'AppFolio unit recorded a move-in afterwards. Off-market listings with no ' +
+            'move-in are counted separately as withdrawals, not leases — ShowMojo has ' +
+            'no "leased" status to distinguish them.'
+    });
+  },
+
+  /** AppFolio applications per completed ShowMojo showing. Higher is better. */
+  showing_to_application_rate: function (D) {
+    var perf = readTab_('SM_Listing_Performance');
+    var apps = D.apps ? D.apps() : readTab_('Applications');   // dataContext_ names it apps
+    if (!perf.length) {
+      return res_(null, null, null, 0, {
+        note: 'SM_Listing_Performance is empty — run rebuildShowMojo().' });
+    }
+    var actual = perf.reduce(function (a, r) { return a + (num_(r['Actual showings']) || 0); }, 0);
+    if (!actual) return res_(null, null, null, 0, { note: 'No completed showings.' });
+    var n = (apps || []).length;
+    return res_(round1_(n / actual * 100), n, actual, actual, {
+      applications: n,
+      completed_showings: actual,
+      note: 'Applications received over completed showings, ACCOUNT-WIDE. The registry ' +
+            'asks for this per unit per period; that needs listing_code matched to an ' +
+            'AppFolio unit, which is not built yet — run diagnoseShowMojo() to see ' +
+            'whether the codes can be joined. Periods also differ: listing_performance ' +
+            'takes no dates, so showings are account-to-date while applications are ' +
+            'windowed. Read this as a ratio of scale, not a conversion rate.'
+    });
+  },
+
+  /** Days from a unit going vacant to the listing going live. Lower is better. */
+  speed_to_listing: function (D) {
+    var join = readTab_('SM_Unit_Join').filter(function (r) { return r.unit_id && r.last_on_market; });
+    if (!join.length) {
+      return res_(null, null, null, 0, {
+        note: 'SM_Unit_Join is empty — run buildShowMojoJoin().' });
+    }
+    var vac = {};
+    D.vacancy().forEach(function (r) {
+      var d = ymd_(r.last_move_out);
+      if (r.unit_id && d) vac[r.unit_id] = d;
+    });
+    var days = [], noVacancy = 0, listedFirst = 0;
+    join.forEach(function (j) {
+      var out = vac[j.unit_id];
+      if (!out) { noVacancy++; return; }
+      var gap = daysBetween_(out, j.last_on_market);
+      if (gap === null) return;
+      // Listed before the resident left is normal practice, not negative time.
+      if (gap < 0) { listedFirst++; days.push(0); return; }
+      days.push(gap);
+    });
+    if (!days.length) {
+      return res_(null, null, null, 0, {
+        joined_listings: join.length, without_a_move_out_date: noVacancy,
+        note: 'No joined listing has a last_move_out to measure from.' });
+    }
+    return res_(median_(days), null, null, days.length, {
+      p90: p90_(days),
+      listed_before_move_out: listedFirst,
+      without_a_move_out_date: noVacancy,
+      zero_is_meaningful: true,
+      note: 'AppFolio last_move_out to ShowMojo last_on_market, on listings joined by ' +
+            'address. Listings that went live before the resident left count as 0 rather ' +
+            'than a negative — pre-marketing is good practice, not negative elapsed time.'
+    });
+  },
+
+  /** Days from listing live to the first application. Lower is better. */
+  speed_to_first_applicant: function (D) {
+    var join = readTab_('SM_Unit_Join').filter(function (r) { return r.unit_id && r.last_on_market; });
+    if (!join.length) {
+      return res_(null, null, null, 0, {
+        note: 'SM_Unit_Join is empty — run buildShowMojoJoin().' });
+    }
+    var firstApp = {};
+    D.apps().forEach(function (a) {
+      var d = ymd_(a.received);
+      if (!a.unit_id || !d) return;
+      if (!firstApp[a.unit_id] || d < firstApp[a.unit_id]) firstApp[a.unit_id] = d;
+    });
+    var days = [], noApp = 0;
+    join.forEach(function (j) {
+      var got = firstApp[j.unit_id];
+      if (!got) { noApp++; return; }
+      var gap = daysBetween_(j.last_on_market, got);
+      // An application dated before the listing went live belongs to an earlier
+      // vacancy, not this one.
+      if (gap === null || gap < 0) return;
+      days.push(gap);
+    });
+    if (!days.length) {
+      return res_(null, null, null, 0, {
+        joined_listings: join.length, without_an_application: noApp,
+        note: 'No joined listing has an application dated after it went live.' });
+    }
+    return res_(median_(days), null, null, days.length, {
+      p90: p90_(days),
+      listings_with_no_application: noApp,
+      note: 'ShowMojo last_on_market to the first AppFolio application on the joined ' +
+            'unit. Applications dated before the listing went live belong to an earlier ' +
+            'vacancy and are excluded.'
+    });
+  },
+
+  // ---- LeadSimple, live since 2026-08-10 -------------------------------------
+  // These three read the LS_* tabs rebuildLeadSimple already writes. They stay null
+  // until their registry status is changed from "deferred" — computeMetrics skips a
+  // deferred metric before it ever reaches CALC, so adding a calculation alone
+  // changes nothing. See FINDINGS for the exact registry edits.
+
+  /** Share of open processes that are NOT past their due date. Higher is better. */
+  process_ontime_rate: function (D) {
+    var open = readTab_('LS_Processes').filter(function (r) { return r.is_open === 'YES'; });
+    var dated = open.filter(function (r) { return r.due_date; });
+    if (!dated.length) {
+      return res_(null, null, null, 0, {
+        note: 'No open process carries a due date, so on-time cannot be measured. ' +
+              'Set due dates on processes in LeadSimple.' });
+    }
+    var onTime = dated.filter(function (r) { return !(num_(r.days_overdue) > 0); }).length;
+    return res_(round1_(onTime / dated.length * 100), onTime, dated.length, dated.length, {
+      open_total: open.length,
+      without_due_date: open.length - dated.length,
+      note: 'Open processes with a due date, not yet past it. Processes with no due date ' +
+            'are excluded from the denominator rather than counted as on time \u2014 ' +
+            'they cannot be either.'
+    });
+  },
+
+  /** Share of open processes nobody has touched recently. Lower is better. */
+  stalled_process_rate: function (D) {
+    var open = readTab_('LS_Processes').filter(function (r) { return r.is_open === 'YES'; });
+    if (!open.length) return res_(null, null, null, 0, { note: 'No open processes.' });
+    var stalled = open.filter(function (r) { return r.is_stalled === 'YES'; }).length;
+    return res_(round1_(stalled / open.length * 100), stalled, open.length, open.length, {
+      threshold_days: (typeof LS !== 'undefined' && LS.STALLED_DAYS) || 30,
+      note: 'Untouched longer than the stalled threshold. Counts activity, not lateness ' +
+            '\u2014 a process with no due date can stall without ever being overdue.'
+    });
+  },
+
+  /**
+   * Hours from an owner lead arriving to the first recorded contact. Lower is better.
+   *
+   * time_to_first_touch is in HOURS — confirmed by Frank, 2026-08-13. My earlier ratio
+   * check called the unit UNCLEAR, and the check was not wrong so much as asking the
+   * wrong question: it compared every deal, including leads tagged "Bad Email Address"
+   * or "Unsubscribed" and records that sat dormant for months before anyone tried. A
+   * median across those describes the state of the data, not the speed of the team.
+   *
+   * So the field is used as hours, and LS_Deal_Review decides which deals belong in the
+   * average. Blank action follows the suggestion; KEEP or FIXED overrides it. The count
+   * of exclusions is published alongside the figure — a median over a quietly filtered
+   * population is exactly the kind of number that stops being trustworthy.
+   */
+  lead_first_touch_speed: function (D) {
+    var deals = readTab_('LS_Deals');
+    if (!deals.length) return res_(null, null, null, 0, { note: 'LS_Deals is empty.' });
+
+    var ignored = (typeof lsIgnoredDeals_ === 'function') ? lsIgnoredDeals_() : {};
+    var hrs = [], never = 0, active = 0, excluded = 0, disagreed = 0;
+
+    deals.forEach(function (d) {
+      if (d.is_active === 'YES') active++;
+      if (ignored[String(d.deal_id)]) { excluded++; return; }
+
+      var v = num_(d.ls_time_to_first_touch_raw);      // hours, per the vendor
+      var ours = num_(d.hours_to_first_touch);         // hours, computed from timestamps
+      if (v === null || v < 0) {
+        if (d.is_active === 'YES' && !d.first_contacted_date) never++;
+        return;
+      }
+      if (ours !== null && v > 0 && Math.abs(ours - v) / Math.max(v, 1) > 0.5) disagreed++;
+      hrs.push(v);
+    });
+
+    if (!hrs.length) {
+      return res_(null, null, null, 0, {
+        deals_excluded_by_review: excluded,
+        never_contacted_active: never,
+        note: 'No deal carries a usable time_to_first_touch once LS_Deal_Review exclusions ' +
+              'are applied. If that number is large, open LS_Deal_Review \u2014 a blank ' +
+              'action follows the suggestion, so a wave of newly tagged leads can empty ' +
+              'this on its own.' });
+    }
+    return res_(median_(hrs), null, null, hrs.length, {
+      p90: p90_(hrs),
+      within_2_hours: hrs.filter(function (x) { return x <= 2; }).length,
+      within_1_day: hrs.filter(function (x) { return x <= 24; }).length,
+      slowest_hours: Math.max.apply(null, hrs),
+      deals_excluded_by_review: excluded,
+      timestamps_disagree: disagreed,
+      never_contacted_active: never,
+      active_deals: active,
+      note: 'LeadSimple time_to_first_touch, in hours. ' + excluded + ' deal(s) left out ' +
+            'via LS_Deal_Review \u2014 leads tagged as a bad email address, unsubscribed ' +
+            'or similar, plus records dormant long enough that the figure describes ' +
+            'neglect rather than response time. Deals never contacted have no duration ' +
+            'and are counted separately.' +
+            (disagreed ? ' ' + disagreed + ' deal(s) where the vendor figure and the ' +
+             'created-to-first-contact timestamps disagree by more than half \u2014 they ' +
+             'are in the review tab and still counted, since the field is authoritative.' : '')
+    });
+  },
+
+  moveout_trigger_mix: function (D) {
+    var mo = D.tickler().filter(isMoveOutEvent_);
+    var g = groupBy_(mo, function (r) { return r.move_out_reason || '(not recorded)'; });
+    var mix = Object.keys(g).sort(function (a, b) { return g[b].length - g[a].length; })
+      .map(function (k) { return k + ': ' + g[k].length + ' (' + Math.round(g[k].length / mo.length * 100) + '%)'; });
+    return res_(mo.length, mo.length, mo.length, mo.length, {
+      mix: mix.join(' · '),
+      not_recorded: (g['(not recorded)'] || []).length,
+      note: 'Separate controllable from uncontrollable (owner termination, military orders) before drawing a retention conclusion. FAIR HOUSING: never segment by protected characteristic.'
+    });
+  }
+};
+
+/**
+ * Callback rate — a new work order on the same unit within 30 days of a completion.
+ *
+ * PERFORMANCE: the first version compared every completed job against every work
+ * order and re-parsed dates inside the loop. At 120 rows that was instant; once the
+ * status filter was corrected and thousands of rows came back, it hung past Apps
+ * Script's execution cap. This indexes by unit once and compares epoch millis.
+ */
+function callbackRate_(D, population, note) {
+  var done = population.filter(function (r) { return r.completed_on; });
+  var byUnit = {};
+  D.wo().forEach(function (w) {
+    var u = w.unit_id;
+    if (u === null || u === undefined) return;
+    var c = parseDate_(w.created_at);
+    if (!c) return;
+    (byUnit[u] = byUnit[u] || []).push(c.getTime());
+  });
+
+  var WINDOW = 30 * 86400000, callbacks = 0;
+  done.forEach(function (t) {
+    var d = parseDate_(t.completed_on);
+    if (!d) return;
+    var t0 = d.getTime(), t1 = t0 + WINDOW;
+    var list = byUnit[t.unit_id] || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] > t0 && list[i] <= t1) { callbacks++; return; }
+    }
+  });
+
+  return res_(done.length ? round1_(callbacks / done.length * 100) : null,
+    callbacks, done.length, done.length, { note: note });
+}
+
+// ============================================================ SHARED FILTERS
+
+function completedWO_(D) {
+  return D.wo().filter(function (r) { return r.completed_on && !r.canceled_on; });
+}
+
+function turnWO_(D) {
+  return D.wo().filter(function (r) {
+    return String(r.work_order_type || '').toLowerCase().indexOf('turn') !== -1 || r.unit_turn_id;
+  });
+}
+
+function spanDays_(rows, fromField, toField, maxDays) {
+  return rows.map(function (r) { return daysBetween_(r[fromField], r[toField]); })
+             .filter(function (x) { return x !== null && x >= 0 && x <= (maxDays || 365); });
+}
+
+
+// ============================================================ RUNNER
+
+/**
+ * RESUMABLE, because one pass is not enough.
+ *
+ * 55 metrics against a 400-unit portfolio does not fit in the six minutes Apps Script
+ * allows. On 2026-08-12 exactly 9 metrics computed and 41 were marked not_run — which
+ * on the dashboard looked like "the Performance view is broken", when in fact the job
+ * simply ran out of time and gave up.
+ *
+ * So it now checkpoints. Each pass computes what it can, appends to _metrics_partial,
+ * saves its position, and re-arms itself a minute later. When the last metric lands it
+ * promotes _metrics_partial to Metrics in one write and clears the checkpoint.
+ *
+ * The Metrics tab is therefore never half-written: the dashboard keeps serving the
+ * previous complete set until a full run finishes. Same pattern as lsSeedProcesses.
+ *
+ * Run it once and walk away. Watch _refresh_log for PARTIAL, then COMPLETE.
+ */
+var METRICS_PROP_AT = 'METRICS_RESUME_AT';
+var METRICS_PROP_RUN = 'METRICS_RUN_STAMP';
+var METRICS_PARTIAL_TAB = '_metrics_partial';
+var METRICS_TIMING_TAB = '_metric_timing';
+
+var METRICS_PROP_TRIGGER = 'METRICS_CONTINUATION_ID';
+
+/**
+ * Continuations are deleted BY ID, never by handler name.
+ *
+ * A one-off after() trigger and the nightly 4:30 schedule are both CLOCK triggers on
+ * the same handler, and the API gives no way to tell them apart after creation. Sweeping
+ * by handler name would have quietly deleted the nightly run every time a resumable
+ * pass finished — the metrics would have stopped updating and nothing would have said so.
+ */
+function metricsClearContinuation_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty(METRICS_PROP_TRIGGER);
+  if (!id) return;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    try { if (t.getUniqueId() === id) ScriptApp.deleteTrigger(t); } catch (e) {}
+  });
+  props.deleteProperty(METRICS_PROP_TRIGGER);
+}
+
+function metricsScheduleContinuation_() {
+  metricsClearContinuation_();
+  var t = ScriptApp.newTrigger('computeMetrics').timeBased().after(60 * 1000).create();
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty(METRICS_PROP_TRIGGER, t.getUniqueId());
+  } catch (e) {}
+}
+
+/** Wipes the checkpoint so the next call starts clean. */
+function resetComputeMetrics() {
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty(METRICS_PROP_AT);
+  props.deleteProperty(METRICS_PROP_RUN);
+  try { clearTabRows_(METRICS_PARTIAL_TAB); } catch (e) {}
+  try { metricsClearContinuation_(); } catch (e) {}
+  Logger.log('Checkpoint cleared. computeMetrics() will start from the beginning.');
+  return 'reset';
+}
+
+function computeMetrics() {
+  var t0 = new Date().getTime();
+  var props = PropertiesService.getScriptProperties();
+
+  /**
+   * ONE AT A TIME.
+   *
+   * This is what broke the Metrics tab on 2026-08-12. A continuation trigger and a
+   * manual run overlapped: both read the same checkpoint, both computed from the same
+   * index, and the first to finish promoted its rows and cleared the partial tab. The
+   * second then reached the end, found the partial tab empty, and promoted only the
+   * tail it happened to hold — so occupancy_rate and everything else early in the
+   * registry vanished from a run that reported COMPLETE.
+   *
+   * A second caller now backs off instead of racing.
+   */
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    logRun_('computeMetrics', 'derived', '-', 0, 0,
+            'SKIPPED — another pass is already running.');
+    Logger.log('Another computeMetrics pass is already running. Nothing to do.');
+    return { skipped_locked: true };
+  }
+
+  try {
+    return computeMetricsPass_(t0, props);
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function computeMetricsPass_(t0, props) {
+  var reg = loadRegistry_();
+  var D = dataContext_();
+
+  var startAt = parseInt(props.getProperty(METRICS_PROP_AT) || '0', 10) || 0;
+  var runDate = props.getProperty(METRICS_PROP_RUN);
+  if (!startAt || !runDate) { runDate = nowStamp_(); props.setProperty(METRICS_PROP_RUN, runDate); }
+
+  var rows = [], timing = [], computed = 0, skipped = 0, failed = 0, abandoned = 0;
+  // 240s, not 280s. The old margin left nothing for the promote-and-write at the end,
+  // and a pass that dies mid-write loses everything it just computed.
+  var BUDGET_MS = 240000;
+  var stoppedAt = -1;
+
+  reg.metrics.forEach(function (m, idx) {
+    if (idx < startAt) return;                       // done on an earlier pass
+    if (stoppedAt >= 0) return;                      // budget already blown
+    if (new Date().getTime() - t0 > BUDGET_MS) {
+      stoppedAt = idx;
+      return;
+    }
+    var mStart = new Date().getTime();
+    var base = {
+      run_date: runDate, metric_id: m.id, name: m.name, kpi_category: m.kpi_category,
+      system: m.system, direction: m.direction, status: m.status,
+      benchmark_median: m.benchmark ? m.benchmark.median : null,
+      benchmark_top25: m.benchmark ? m.benchmark.top_25_pct : null,
+      benchmark_unit: m.benchmark ? m.benchmark.unit : null,
+      // Carries whether this target is ours or an industry survey, so the dashboard
+      // can stop calling a WeLease standard an "industry average".
+      benchmark_source: m.benchmark ? (m.benchmark.source || '') : ''
+    };
+
+    if (m.status === 'deferred' || m.status === 'blocked') {
+      rows.push(Object.assign({}, base, {
+        period: 'ALL', value: null,
+        notes: m.status === 'deferred'
+          ? 'Source system not connected — ' + String(m.system).split('+')[0]
+          : 'No source available in any current endpoint'
+      }));
+      skipped++;
+      return;
+    }
+
+    var fn = CALC[m.id];
+    if (!fn) {
+      rows.push(Object.assign({}, base, {
+        period: 'ALL', value: null, status: 'not_implemented',
+        notes: 'Defined in the registry, no calculation written yet'
+      }));
+      skipped++;
+      return;
+    }
+
+    try {
+      var r = fn(D);
+      var publishable = (r.n === null || r.n === undefined) ? true : r.n >= CFG.MIN_N_TO_PUBLISH;
+      var extras = {};
+      Object.keys(r).forEach(function (k) {
+        if (['value', 'numerator', 'denominator', 'n', 'monthly', 'note'].indexOf(k) === -1) {
+          // mean, p90 and the rest land in the detail JSON and are read by people.
+          // Same rounding, same reason.
+          extras[k] = publishNum_(r[k]);
+        }
+      });
+
+      rows.push(Object.assign({}, base, {
+        // Rounded here, once, for every metric. See publishNum_ in Core_v2.gs.
+        period: 'ALL', value: publishNum_(r.value),
+        numerator: publishNum_(r.numerator), denominator: publishNum_(r.denominator), n: r.n,
+        vs_benchmark: vsBenchmark_(r.value, m.benchmark, m.direction),
+        publishable: publishable ? 'YES' : 'NO — n below ' + CFG.MIN_N_TO_PUBLISH,
+        detail: Object.keys(extras).length ? JSON.stringify(extras) : null,
+        notes: r.note || null
+      }));
+
+      (r.monthly || []).forEach(function (mo) {
+        rows.push(Object.assign({}, base, {
+          period: mo.period, value: publishNum_(mo.value), n: mo.n,
+          vs_benchmark: vsBenchmark_(mo.value, m.benchmark, m.direction),
+          publishable: (mo.n >= CFG.MIN_N_TO_PUBLISH) ? 'YES' : 'NO — n below ' + CFG.MIN_N_TO_PUBLISH
+        }));
+      });
+      computed++;
+    } catch (e) {
+      rows.push(Object.assign({}, base, { period: 'ALL', value: null, status: 'error',
+                                          notes: e.message.slice(0, 300) }));
+      logError_('compute', m.id, e.message);
+      failed++;
+    }
+    timing.push({ metric_id: m.id, name: m.name, ms: new Date().getTime() - mStart,
+                  status: m.status || '', run_date: runDate });
+  });
+
+  var headers = ['run_date','metric_id','name','kpi_category','system','period','value',
+                 'numerator','denominator','n','benchmark_median','benchmark_top25','benchmark_unit',
+                 'benchmark_source','direction','vs_benchmark','publishable','status','detail','notes'];
+
+  // Everything computed on this pass joins what earlier passes produced.
+  if (rows.length) appendTab_(METRICS_PARTIAL_TAB, rows, headers);
+  if (timing.length) appendTab_(METRICS_TIMING_TAB, timing,
+    ['run_date', 'metric_id', 'name', 'ms', 'status']);
+
+  var elapsed = new Date().getTime() - t0;
+
+  if (stoppedAt >= 0) {
+    // More to do. Save the position and come back in a minute.
+    props.setProperty(METRICS_PROP_AT, String(stoppedAt));
+    var remaining = reg.metrics.length - stoppedAt;
+    try { metricsScheduleContinuation_(); } catch (e) {
+      logError_('compute', 'continuation',
+        'Could not schedule the continuation: ' + e.message + ' — run computeMetrics() again by hand.');
+    }
+    logRun_('computeMetrics', 'derived', METRICS_PARTIAL_TAB, rows.length, elapsed,
+      'PARTIAL — ' + computed + ' computed this pass, paused at metric ' + stoppedAt +
+      ' of ' + reg.metrics.length + ', ' + remaining + ' to go. Continuation scheduled.');
+    Logger.log('PARTIAL — paused at ' + stoppedAt + '/' + reg.metrics.length +
+               '. ' + remaining + ' metrics remain. A continuation runs in ~1 minute.');
+    return { partial: true, computed: computed, paused_at: stoppedAt,
+             remaining: remaining, rows: rows.length };
+  }
+
+  // Finished — but prove it before overwriting anything.
+  var all = readTab_(METRICS_PARTIAL_TAB).concat(rows);
+
+  // Overlapping passes could append the same metric twice. Last write wins.
+  var seen = {}, deduped = [];
+  for (var i = all.length - 1; i >= 0; i--) {
+    var k = String(all[i].metric_id) + '|' + String(all[i].period);
+    if (seen[k]) continue;
+    seen[k] = 1;
+    deduped.unshift(all[i]);
+  }
+
+  var haveAll = {};
+  deduped.forEach(function (r) { if (r.period === 'ALL') haveAll[String(r.metric_id)] = 1; });
+  var absent = reg.metrics.filter(function (m) { return !haveAll[String(m.id)]; })
+                          .map(function (m) { return m.id; });
+
+  /**
+   * REFUSE TO PUBLISH AN INCOMPLETE SET.
+   *
+   * writeTab_ with an empty array does not leave a tab alone — it clears the sheet and
+   * writes "No rows returned" into A1. So a pass that reached the end holding nothing
+   * did not skip the write, it destroyed the Metrics tab. A partial set is just as bad
+   * in a quieter way: the dashboard reports every missing metric as "not in the Metrics
+   * tab at all", which reads like a wiring fault rather than an interrupted job.
+   *
+   * The previous complete set stays up until a full one is ready to replace it.
+   */
+  if (absent.length) {
+    props.setProperty(METRICS_PROP_AT, '0');           // start the next attempt clean
+    logError_('compute', 'incomplete',
+      'Refused to publish: ' + deduped.length + ' rows covering ' +
+      Object.keys(haveAll).length + ' of ' + reg.metrics.length + ' metrics. Missing ' +
+      absent.slice(0, 12).join(', ') + (absent.length > 12 ? ' and ' + (absent.length - 12) + ' more' : '') +
+      '. The Metrics tab was left untouched. Most likely two passes overlapped. ' +
+      'Run resetComputeMetrics() then computeMetrics().');
+    try { metricsScheduleContinuation_(); } catch (e) {}
+    logRun_('computeMetrics', 'derived', METRICS_PARTIAL_TAB, deduped.length, elapsed,
+      'INCOMPLETE — ' + absent.length + ' metric(s) missing, Metrics tab NOT overwritten');
+    Logger.log('INCOMPLETE — ' + absent.length + ' metrics missing. Metrics tab untouched.\n' +
+               'Missing: ' + absent.join(', '));
+    return { incomplete: true, missing: absent, rows: deduped.length };
+  }
+
+  var final = deduped;
+  writeTab_('Metrics', final, { headers: headers });
+  appendTab_('Metrics_History', final, headers);
+
+  props.deleteProperty(METRICS_PROP_AT);
+  props.deleteProperty(METRICS_PROP_RUN);
+  try { clearTabRows_(METRICS_PARTIAL_TAB); } catch (e) {}
+  try { metricsClearContinuation_(); } catch (e) {}
+
+  var withValue = final.filter(function (r) {
+    return r.period === 'ALL' && r.value !== null && r.value !== '';
+  }).length;
+  var stillNotRun = final.filter(function (r) { return r.status === 'not_run'; }).length;
+
+  logRun_('computeMetrics', 'derived', 'Metrics', final.length, elapsed,
+    'COMPLETE — ' + withValue + ' of ' + reg.metrics.length + ' metrics published a value · ' +
+    computed + ' computed on the final pass · ' + skipped + ' skipped · ' + failed + ' failed');
+  Logger.log('COMPLETE — ' + final.length + ' rows, ' + withValue + ' metrics with a value.');
+
+  if (stillNotRun) {
+    logError_('compute', 'not_run',
+      stillNotRun + ' row(s) are still marked not_run after a complete pass. Run ' +
+      'resetComputeMetrics() then computeMetrics() to rebuild from scratch.');
+  }
+
+  // Which calculations are eating the clock. Answers "why did this need three passes".
+  try {
+    var t = readTab_(METRICS_TIMING_TAB).filter(function (r) { return r.run_date === runDate; })
+      .sort(function (a, b) { return (num_(b.ms) || 0) - (num_(a.ms) || 0); });
+    if (t.length) {
+      Logger.log('Slowest: ' + t.slice(0, 8).map(function (r) {
+        return r.metric_id + ' ' + Math.round((num_(r.ms) || 0) / 1000) + 's'; }).join(' · '));
+    }
+  } catch (e) {}
+
+  return { complete: true, rows: final.length, with_value: withValue,
+           computed: computed, skipped: skipped, failed: failed };
+}
