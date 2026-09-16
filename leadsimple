@@ -1,0 +1,1819 @@
+/**
+ * WeLease Pipeline — LEADSIMPLE  v2.0.0 · 2026-08-10
+ *
+ * Reactivates the adapter Core_v2 left dormant. Drop this file in, apply the two
+ * Core_v2 edits in CORE_V2_PATCH.md, run lsVerify().
+ *
+ * WHY IT WAS BLOCKED
+ * ------------------
+ * Core_v2 recorded: 'HTTP 401 "Invalid Access Token" on every auth scheme tested.'
+ * It was one scheme, not every scheme. LS_AUTH_MODE defaulted to 'x-api-key'.
+ * Verified live against the WeLease account on 2026-08-10:
+ *
+ *     Authorization: <key>            -> 200   <-- the only one that works
+ *     Authorization: Bearer <key>     -> 401 {"error":"Invalid Access Token"}
+ *     X-API-Key: <key>                -> 401 {"error":"Invalid Access Token"}
+ *     Authorization: Token <key>      -> 401
+ *     X-Access-Token: <key>           -> 401
+ *     ?api_key=<key>                  -> 401
+ *
+ * Core_v2's 'raw' mode was already correct. The default was not. This file stops
+ * guessing and always sends the raw header.
+ *
+ * RATE LIMITS — the real constraint, and what the old adapter got wrong
+ * --------------------------------------------------------------------
+ * LeadSimple meters RECORDS, not just requests, on a rolling 60s window:
+ *     x-ratelimit-metric-records-limit:  1000
+ *     x-ratelimit-metric-requests-limit: 100
+ *
+ * The old adapter slept 1200ms between 200-record pages — 10,000 records/minute,
+ * ten times over. Measured: the 6th consecutive 200-record page returns 429.
+ *
+ * On a 429 LeadSimple DOES send x-ratelimit-retry-after (confirmed: value 34).
+ * That exposes a live bug in Core_v2's httpWithRetry_:
+ *
+ *     Utilities.sleep(wait > 0 ? wait * 1000 : CFG.BACKOFF_BASE_MS * Math.pow(2, attempt++));
+ *
+ * `attempt++` sits in the FALSE branch only. Whenever the header is present, attempt
+ * never increments, so `while (attempt <= CFG.MAX_RETRIES)` never exits — the call
+ * spins until Apps Script kills the execution at 6 minutes with no partial result.
+ * See CORE fix in LEADSIMPLE_REACTIVATION.md §3 Edit C. This also affects AppFolio
+ * on any 429 that carries a retry-after header.
+ *
+ * This adapter paces on the record counters the API returns, and checkpoints across
+ * executions so the 6-minute Apps Script cap is a pause, not a failure.
+ *
+ * ACCOUNT SIZE (measured 2026-08-10)
+ *     processes       7,110 total   ~8 min full pull   80/day changed
+ *     Owners deals    1,129         ~1.5 min           ~20/day changed
+ *     tasks          68,222 total   DO NOT full-pull   1,433 upcoming
+ *
+ * So: seed once (resumable), then sync nightly with updated_since. Nightly is <1 min.
+ */
+
+// ============================================================ CONFIG
+
+var LS = {
+  BASE: 'https://api.leadsimple.com/rest',
+  OWNERS_PIPELINE_ID: '9154e358-1915-41bb-acd5-e49b9d34f9dd',
+
+  // "Leads: AppFolio Tenant Applicants" is a PIPELINE, not a process type. It was wired
+  // into LS_TYPE.LEAD, which reads LS_Processes, so buildLeadToMoveIn looked for it among
+  // the 19 process types, never found it, and logged a rename that never happened.
+  // Applicant leads are DEALS. Run lsListPipelines() and paste the id here.
+  LEADS_PIPELINE_ID: '',
+
+  PER_PAGE: 200,
+  RECORD_BUDGET: 900,        // of 1000/min — headroom for anything else on the key
+  REQUEST_BUDGET: 90,        // of 100/min
+  WINDOW_MS: 62000,
+
+  // Apps Script kills at 6 min with no partial result. Stop at 4:30 and checkpoint.
+  EXEC_BUDGET_MS: 270000,
+
+  // Operating thresholds. WeLease standards, not legal determinations.
+  STALLED_DAYS: 30,          // open process untouched this long
+  DEAL_STALE_DAYS: 14,       // active Owners deal with no touch this long
+  SEED_LOOKBACK_DAYS: 0,     // 0 = full history. 400 cuts the seed to ~3,100 records.
+
+  PROP_SYNC_SINCE: 'LS_SYNC_SINCE',
+  PROP_SEED_PAGE: 'LS_SEED_PAGE',
+  PROP_SEED_KIND: 'LS_SEED_KIND'
+};
+
+// ============================================================ HTTP + PACING
+
+var _lsWindow = { start: 0, records: 0, requests: 0 };
+
+function lsResetWindow_() {
+  _lsWindow = { start: new Date().getTime(), records: 0, requests: 0 };
+}
+
+/**
+ * Pace on records, not requests. Called before every fetch.
+ * Sleeps out the remainder of the window when the next page would exceed budget.
+ */
+function lsPace_(expectedRecords) {
+  var now = new Date().getTime();
+  if (!_lsWindow.start || now - _lsWindow.start >= LS.WINDOW_MS) { lsResetWindow_(); return; }
+  if (_lsWindow.records + expectedRecords > LS.RECORD_BUDGET ||
+      _lsWindow.requests + 1 > LS.REQUEST_BUDGET) {
+    var wait = LS.WINDOW_MS - (now - _lsWindow.start);
+    if (wait > 0) Utilities.sleep(wait);
+    lsResetWindow_();
+  }
+}
+
+/**
+ * Single GET. Always sends the raw Authorization header — the only scheme that works.
+ * Trusts the server's own counters over our local estimate when they disagree.
+ */
+function lsGet2_(path, params, expectedRecords) {
+  var key = prop_('LEADSIMPLE_API_KEY');
+  var q = buildQuery_(params || {});
+  var url = LS.BASE + path + (q ? '?' + q : '');
+
+  for (var attempt = 0; attempt <= 4; attempt++) {
+    lsPace_(expectedRecords || 1);
+    var resp;
+    try {
+      resp = UrlFetchApp.fetch(url, {
+        method: 'get',
+        headers: { 'Accept': 'application/json', 'Authorization': key },
+        muteHttpExceptions: true
+      });
+    } catch (e) {
+      Utilities.sleep(3000 * Math.pow(2, attempt));
+      continue;
+    }
+
+    var code = resp.getResponseCode();
+    var text = resp.getContentText();
+    var h = resp.getAllHeaders();
+
+    // Server-reported counters beat our local guess.
+    var recs = parseInt(h['x-ratelimit-metric-records-count'] ||
+                        h['X-RateLimit-Metric-Records-Count'] || -1, 10);
+    var reqs = parseInt(h['x-ratelimit-metric-requests-count'] ||
+                        h['X-RateLimit-Metric-Requests-Count'] || -1, 10);
+    if (recs >= 0) _lsWindow.records = Math.max(_lsWindow.records, recs);
+    if (reqs >= 0) _lsWindow.requests = Math.max(_lsWindow.requests, reqs);
+
+    if (code >= 200 && code < 300) {
+      try { return JSON.parse(text); }
+      catch (e) { throw new Error('LeadSimple returned non-JSON (HTTP ' + code + '): ' + text.slice(0, 300)); }
+    }
+    if (code === 429) {
+      // Documented: X-RateLimit-Retry-After is sent ONLY on a 429. Honour it.
+      // x-ratelimit-metric-error names which ceiling broke — 'records' or 'requests'.
+      var ra = parseInt(h['x-ratelimit-retry-after'] || h['X-RateLimit-Retry-After'] || 0, 10);
+      logError_('leadsimple', 'rate_limit',
+        'HTTP 429 on ' + path + ' (' + (h['x-ratelimit-metric-error'] || '?') +
+        '). Waiting ' + (ra > 0 ? ra : 62) + 's.');
+      Utilities.sleep((ra > 0 ? ra : 62) * 1000);
+      lsResetWindow_();
+      continue;                      // deliberately does NOT consume an attempt
+    }
+    if (code >= 500)  { Utilities.sleep(3000 * Math.pow(2, attempt)); continue; }
+    if (code === 401) {
+      throw new Error('LeadSimple 401 "Invalid Access Token". The key is wrong, revoked, ' +
+                      'or LS_AUTH_MODE is being applied somewhere. This adapter always ' +
+                      'sends the raw Authorization header, which is the scheme that works.');
+    }
+    throw new Error('LeadSimple HTTP ' + code + ' — ' + url + '\n' + text.slice(0, 400));
+  }
+  throw new Error('LeadSimple: exhausted retries for ' + url);
+}
+
+/**
+ * Pages an endpoint until done OR the execution budget runs out.
+ * Returns { rows, complete, nextPage, totalCount }. Never throws on a timeout —
+ * a partial pull that says so is worth more than an exception at minute six.
+ */
+function lsPaged_(path, params, opts) {
+  opts = opts || {};
+  var t0 = opts.startedAt || new Date().getTime();
+  var budget = opts.budgetMs || LS.EXEC_BUDGET_MS;
+  var page = opts.startPage || 1;
+  var rows = [], totalPages = null, totalCount = null;
+
+  while (true) {
+    if (new Date().getTime() - t0 > budget) {
+      return { rows: rows, complete: false, nextPage: page, totalCount: totalCount };
+    }
+    var p = Object.assign({}, params || {});
+    p.page = page;
+    p.per_page = LS.PER_PAGE;
+
+    var body = lsGet2_(path, p, LS.PER_PAGE);
+    var batch = (body && body.data) || [];
+    var meta = (body && body.meta) || {};
+    if (totalPages === null) { totalPages = meta.total_pages || 1; totalCount = meta.total_count || 0; }
+    rows = rows.concat(batch);
+
+    if (!batch.length || page >= totalPages) {
+      return { rows: rows, complete: true, nextPage: null, totalCount: totalCount };
+    }
+    page++;
+  }
+}
+
+// ============================================================ FLATTENERS
+// The API nests deeply. Sheets and Looker want flat. Anything that stays an object
+// gets JSON.stringify'd by writeTab_ and becomes unusable downstream.
+
+function lsProcessRow_(p) {
+  var stage = p.stage || {};
+  var ptype = p.process_type || {};
+  var user  = p.user || {};
+  var prop  = (p.properties && p.properties[0]) || {};
+  var unit  = prop.unit || {};
+
+  var due     = p.due_at ? ymd_(p.due_at) : null;
+  var isOpen  = !p.closed_at;
+  var today   = ymd_(today_());
+  var overdue = (isOpen && due) ? daysBetween_(due, today) : null;   // positive = late
+
+  return {
+    process_id: p.id,
+    process_name: p.name || null,
+    process_type: ptype.name || null,
+    process_type_id: p.process_type_id || ptype.id || null,
+    stage: stage.name || null,
+    stage_status: stage.status || null,          // working | backlog | completed | canceled
+    owner: user.name || null,
+    owner_email: user.email || null,
+    is_open: isOpen ? 'YES' : null,
+    due_date: due,
+    closed_date: p.closed_at ? ymd_(p.closed_at) : null,
+    days_overdue: (overdue !== null && overdue > 0) ? overdue : null,
+    days_since_update: daysBetween_(ymd_(p.updated_at), today),
+    is_stalled: (isOpen && daysBetween_(ymd_(p.updated_at), today) > LS.STALLED_DAYS) ? 'YES' : null,
+    is_unassigned: (isOpen && !user.name) ? 'YES' : null,
+    no_due_date: (isOpen && !due) ? 'YES' : null,
+    property_address: prop.address || null,
+    property_city: prop.city || null,
+    property_id: prop.id || null,
+    unit: unit.unit_number || null,
+    unit_occupancy: unit.occupancy || null,
+    delinquent_rent: num_(unit.delinquent_rent),
+    lease_end_date: unit.lease_end_date ? ymd_(unit.lease_end_date) : null,
+    owner_contact: lsRoleNames_(p.contact_roles, ['owners', 'owner']),
+    tenant_contact: lsRoleNames_(p.contact_roles, ['tenants', 'tenant']),
+    assignees: lsAssigneeNames_(p.assignee_roles),
+    tags: (p.tags || []).join(', ') || null,
+    created_date: ymd_(p.created_at),
+    updated_date: ymd_(p.updated_at),
+    link: p.link || null
+  };
+}
+
+/** Role keys are inconsistent across process types — 'owners' here, 'owner' there. */
+function lsRoleNames_(roles, keys) {
+  if (!roles || !roles.length) return null;
+  var names = [];
+  roles.forEach(function (r) {
+    if (keys.indexOf(String(r.key || '').toLowerCase()) === -1) return;
+    (r.contacts || []).forEach(function (c) { if (c.name) names.push(c.name); });
+  });
+  return names.length ? names.join(' | ') : null;
+}
+
+function lsAssigneeNames_(roles) {
+  if (!roles || !roles.length) return null;
+  var out = [];
+  roles.forEach(function (r) {
+    if (r.user && r.user.name) out.push(r.name + ': ' + r.user.name);
+  });
+  return out.length ? out.join(' | ') : null;
+}
+
+function lsDealRow_(d) {
+  var stage = d.stage || {};
+  var today = ymd_(today_());
+  var touches = [d.last_called_at, d.last_emailed_at, d.last_inbound_touch_at]
+    .filter(function (x) { return x; }).map(function (x) { return ymd_(x); }).sort();
+  var lastTouch = touches.length ? touches[touches.length - 1] : null;
+  var sinceTouch = lastTouch ? daysBetween_(lastTouch, today) : null;
+  var nextTask = d.next_task_due_at ? ymd_(d.next_task_due_at) : null;
+  var isActive = stage.status === 'active';
+
+  return {
+    deal_id: d.id,
+    deal_name: d.name || null,
+    stage: stage.name || null,
+    stage_status: stage.status || null,    // active|won|lost|passive|past|invalid
+    source: (d.source || {}).name || null,
+    assignee: (d.assignee || {}).name || null,
+    contact: ((d.contacts || [])[0] || {}).name || null,
+    company: ((d.contacts || [])[0] || {}).company_name || null,
+    property_address: ((d.properties || [])[0] || {}).address || null,
+    num_units: num_(d.num_units),
+    value: num_(d.value),
+    created_date: ymd_(d.created_at),
+    first_contacted_date: d.first_contacted_at ? ymd_(d.first_contacted_at) : null,
+    last_touch_date: lastTouch,
+    days_since_last_touch: sinceTouch,
+    days_since_update: daysBetween_(ymd_(d.updated_at), today),
+    outbound_touches: num_(d.num_outbound_touches),
+    outbound_calls: num_(d.num_outbound_calls),
+    outbound_emails: num_(d.num_outbound_emails),
+    next_task_due: nextTask,
+    next_task_kind: d.next_task_kind || null,
+    next_task_days_overdue: nextTask ? Math.max(0, daysBetween_(nextTask, today)) || null : null,
+    closed_date: d.closed_at ? ymd_(d.closed_at) : null,
+    // RAW, and named raw. The unit and baseline of these are unverified — see
+    // LS_DURATION_UNIT_VERIFIED. Kept for comparison, not for publishing.
+    ls_time_to_close_raw: num_(d.time_to_close),
+    ls_time_to_first_touch_raw: num_(d.time_to_first_touch),
+    ls_time_to_first_call_raw: num_(d.time_to_first_call),
+    ls_time_to_first_email_raw: num_(d.time_to_first_email),
+
+    // COMPUTED HERE, from the full timestamps, so the definition is ours and provable.
+    // lsDealRow_ used to truncate created_at and first_contacted_at to dates, which is
+    // why the old metric could only answer "same day or not" against an hourly target.
+    hours_to_first_touch: lsHoursBetween_(d.created_at, d.first_contacted_at),
+    hours_to_close: lsHoursBetween_(d.created_at, d.closed_at),
+    // Assignment is the other plausible baseline for the vendor figure. Captured so the
+    // two can be compared rather than argued about.
+    hours_assigned_to_first_touch: lsHoursBetween_(d.last_assigned_at, d.first_contacted_at),
+    is_active: isActive ? 'YES' : null,
+    is_stale: (isActive && (sinceTouch === null || sinceTouch > LS.DEAL_STALE_DAYS)) ? 'YES' : null,
+    no_next_task: (isActive && !nextTask) ? 'YES' : null,
+    never_contacted: (isActive && !d.first_contacted_at) ? 'YES' : null,
+    utm_source: d.marketing_utm_source || null,
+    utm_campaign: d.marketing_utm_campaign || null,
+    tags: (d.tags || []).join(', ') || null,
+    link: d.link || null
+  };
+}
+
+// ============================================================ UPSERT
+
+/**
+ * Merge new rows into a tab by key, preserving rows the sync did not touch.
+ * Incremental syncs only return what changed, so a blind writeTab_ would delete
+ * every untouched record.
+ */
+function lsUpsertTab_(tabName, newRows, keyField) {
+  if (!newRows || !newRows.length) return readTab_(tabName).length;
+  var existing = readTab_(tabName);
+  var byKey = {}, order = [];
+  existing.forEach(function (r) {
+    var k = r[keyField];
+    if (k === null || k === undefined || k === '') return;
+    if (!(k in byKey)) order.push(k);
+    byKey[k] = r;
+  });
+  newRows.forEach(function (r) {
+    var k = r[keyField];
+    if (!(k in byKey)) order.push(k);
+    byKey[k] = r;
+  });
+  var merged = order.map(function (k) { return byKey[k]; });
+  writeTab_(tabName, merged);
+  return merged.length;
+}
+
+// ============================================================ SEED (resumable)
+
+/**
+ * First-run backfill of every process. ~7,100 records, ~8 minutes of API time —
+ * longer than one Apps Script execution. Checkpoints the page number and
+ * self-schedules a continuation one minute out. Run once; it finishes itself.
+ *
+ * Set LS.SEED_LOOKBACK_DAYS = 400 to pull ~3,100 records instead of 7,100 if you
+ * only need recent history.
+ */
+function lsSeedProcesses() {
+  var t0 = new Date().getTime();
+  var props = PropertiesService.getScriptProperties();
+  var startPage = parseInt(props.getProperty(LS.PROP_SEED_PAGE) || '1', 10);
+
+  var params = {
+    include_custom_fields: 'false',
+    include_property_groups: 'false'
+  };
+  if (LS.SEED_LOOKBACK_DAYS > 0) {
+    params.updated_since = Math.floor(addDays_(today_(), -LS.SEED_LOOKBACK_DAYS).getTime() / 1000);
+  }
+
+  var res = lsPaged_('/processes', params, { startPage: startPage, startedAt: t0 });
+  var rows = res.rows.map(lsProcessRow_);
+  var total = lsUpsertTab_('LS_Processes', rows, 'process_id');
+
+  if (res.complete) {
+    props.deleteProperty(LS.PROP_SEED_PAGE);
+    props.setProperty(LS.PROP_SYNC_SINCE, String(Math.floor(t0 / 1000)));
+    lsClearContinuation_('lsSeedProcesses');
+    logRun_('lsSeedProcesses', 'leadsimple', 'LS_Processes', total,
+            new Date().getTime() - t0,
+            'SEED COMPLETE — ' + res.totalCount + ' processes. Nightly sync armed.');
+  } else {
+    props.setProperty(LS.PROP_SEED_PAGE, String(res.nextPage));
+    lsScheduleContinuation_('lsSeedProcesses');
+    logRun_('lsSeedProcesses', 'leadsimple', 'LS_Processes', total,
+            new Date().getTime() - t0,
+            'PARTIAL — paused at page ' + res.nextPage + ' of ~' +
+            Math.ceil((res.totalCount || 0) / LS.PER_PAGE) +
+            '. Continuation trigger set for +1 min.');
+  }
+  Logger.log('LS_Processes now holds ' + total + ' rows. Complete: ' + res.complete);
+  return { rows: total, complete: res.complete, nextPage: res.nextPage };
+}
+
+function lsScheduleContinuation_(fnName) {
+  lsClearContinuation_(fnName);
+  ScriptApp.newTrigger(fnName).timeBased().after(60 * 1000).create();
+}
+
+function lsClearContinuation_(fnName) {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === fnName &&
+        t.getEventType() === ScriptApp.EventType.CLOCK) {
+      // Only remove one-off continuations, never the nightly schedule.
+      try { ScriptApp.deleteTrigger(t); } catch (e) {}
+    }
+  });
+}
+
+// ============================================================ NIGHTLY JOB
+
+/**
+ * Referenced by Core_v2 installTriggers() at 04:00 but never defined — that is why
+ * enabling LeadSimple would have created a trigger pointing at nothing.
+ *
+ * Incremental. Measured cost: ~80 processes + ~285 tasks + ~20 deals per night.
+ * Well under a minute and nowhere near the record budget.
+ */
+function rebuildLeadSimple() {
+  if (!systemEnabled_('leadsimple')) {
+    logError_('leadsimple', 'rebuildLeadSimple', 'System disabled — nothing ran.');
+    return;
+  }
+  var t0 = new Date().getTime();
+  var props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty(LS.PROP_SEED_PAGE)) {
+    logError_('leadsimple', 'rebuildLeadSimple',
+      'Seed is still in progress (page ' + props.getProperty(LS.PROP_SEED_PAGE) +
+      '). Skipping the incremental sync so the two do not interleave.');
+    return;
+  }
+
+  lsResetWindow_();
+  var since = parseInt(props.getProperty(LS.PROP_SYNC_SINCE) || '0', 10);
+  // First sync with no seed: fall back to 30 days rather than pulling all 7,110.
+  if (!since) since = Math.floor(addDays_(today_(), -30).getTime() / 1000);
+  var notes = [];
+
+  // --- processes (changed only) ---
+  try {
+    var pr = lsPaged_('/processes', {
+      updated_since: since,
+      include_custom_fields: 'false',
+      include_property_groups: 'false'
+    }, { startedAt: t0, budgetMs: 120000 });
+    var n = lsUpsertTab_('LS_Processes', pr.rows.map(lsProcessRow_), 'process_id');
+    notes.push('processes +' + pr.rows.length + ' changed, ' + n + ' total' +
+               (pr.complete ? '' : ' (TRUNCATED)'));
+  } catch (e) { logError_('leadsimple', 'processes', e.message); notes.push('processes FAILED'); }
+
+  // --- Owners deals (full refresh — only 1,129, and stage moves are the whole point) ---
+  try {
+    var dl = lsPaged_('/pipelines/' + LS.OWNERS_PIPELINE_ID + '/deals', {},
+                      { startedAt: t0, budgetMs: 150000 });
+    if (dl.complete) {
+      writeTab_('LS_Deals', dl.rows.map(lsDealRow_));
+      notes.push('deals ' + dl.rows.length + ' (full)');
+    } else {
+      lsUpsertTab_('LS_Deals', dl.rows.map(lsDealRow_), 'deal_id');
+      notes.push('deals ' + dl.rows.length + ' (PARTIAL — upserted)');
+    }
+  } catch (e) { logError_('leadsimple', 'deals', e.message); notes.push('deals FAILED'); }
+
+  // --- Applicant leads (their own tab, deliberately) ---
+  // These are deals too, but they go to LS_Leads rather than LS_Deals. Four metrics and
+  // three views read LS_Deals as "the owners pipeline" and filter on stage_status —
+  // applicant stages carry different names, so mixing them in would quietly change the
+  // owners win rate rather than fail loudly.
+  if (LS.LEADS_PIPELINE_ID) {
+    try {
+      var ld = lsPaged_('/pipelines/' + LS.LEADS_PIPELINE_ID + '/deals', {},
+                        { startedAt: t0, budgetMs: 120000 });
+      var lrows = ld.rows.map(lsDealRow_);
+      if (ld.complete) { writeTab_('LS_Leads', lrows); notes.push('leads ' + lrows.length + ' (full)'); }
+      else { lsUpsertTab_('LS_Leads', lrows, 'deal_id'); notes.push('leads ' + lrows.length + ' (PARTIAL)'); }
+    } catch (e) { logError_('leadsimple', 'leads', e.message); notes.push('leads FAILED'); }
+  } else {
+    notes.push('leads SKIPPED — LS.LEADS_PIPELINE_ID not set');
+  }
+
+  // The upcoming-tasks pull used to sit here, writing LS_Tasks. Nothing ever read that
+  // tab — it was an API call and a sheet write every night producing data no metric or
+  // view consumed. LS_Tasks_All now holds every task, upcoming ones included.
+
+  props.setProperty(LS.PROP_SYNC_SINCE, String(Math.floor(t0 / 1000)));
+
+  try { buildLeadSimpleSummary(); } catch (e) { logError_('leadsimple', 'summary', e.message); }
+  // Needs LS_Processes fresh above AND Tenant_Tickler from the 02:00 AppFolio run, so
+  // it belongs here at 04:20 rather than anywhere earlier in the night.
+  try { buildLeadToMoveIn(); } catch (e) { logError_('leadsimple', 'lead to move-in', e.message); }
+  // Flags the deals whose timing should not be averaged. Runs after LS_Deals is written.
+  try { buildLeadSimpleReview(); }
+  catch (e) { logError_('leadsimple', 'deal review', e.message); }
+  // Where onboarding time goes, step by step. Needs LS_Processes and LS_Tasks_All, both
+  // current by this point.
+  try { buildOnboardingSteps(); }
+  catch (e) { logError_('leadsimple', 'onboarding steps', e.message); }
+  // One row per onboarding: the service branch, first touch, milestones and manual email
+  // traffic. Separately wrapped, because a failure here should not cost the step table.
+  try { buildOnboardingJourneys(); }
+  catch (e) { logError_('leadsimple', 'onboarding journeys', e.message); }
+
+  logRun_('rebuildLeadSimple', 'leadsimple', '-', 0, new Date().getTime() - t0, notes.join(' · '));
+  Logger.log(notes.join('\n'));
+  return notes;
+}
+
+// ============================================================ ROLLUPS
+
+/**
+ * Two summary tabs the dashboard can read directly, so no view has to re-derive
+ * these numbers on page load.
+ *
+ * LS_Compliance   — process adherence and per-person workload
+ * LS_Owners_Funnel — stage counts, win rate, loss reasons
+ *
+ * REPORTING ONLY. Nothing here should trigger a notice, a fee, or any resident or
+ * owner communication. Escalate exceptions to a person.
+ */
+function buildLeadSimpleSummary() {
+  var t0 = new Date().getTime();
+  var procs = readTab_('LS_Processes');
+  var deals = readTab_('LS_Deals');
+  var open = procs.filter(function (r) { return r.is_open === 'YES'; });
+
+  // ---- per-person workload ----
+  var byUser = {};
+  open.forEach(function (r) {
+    var who = r.owner || 'Unassigned';
+    var u = byUser[who] || (byUser[who] = {
+      owner: who, open_processes: 0, overdue: 0, stalled: 0,
+      oldest_overdue_days: 0, no_due_date: 0
+    });
+    u.open_processes++;
+    if (num_(r.days_overdue) > 0) {
+      u.overdue++;
+      u.oldest_overdue_days = Math.max(u.oldest_overdue_days, num_(r.days_overdue));
+    }
+    if (r.is_stalled === 'YES') u.stalled++;
+    if (r.no_due_date === 'YES') u.no_due_date++;
+  });
+  var workload = Object.keys(byUser).map(function (k) {
+    var u = byUser[k];
+    u.overdue_pct = u.open_processes ? Math.round(u.overdue / u.open_processes * 100) : 0;
+    return u;
+  }).sort(function (a, b) { return (b.overdue - a.overdue) || (b.open_processes - a.open_processes); });
+
+  // ---- adherence by process type ----
+  var byType = {};
+  open.forEach(function (r) {
+    var k = r.process_type || 'Unknown';
+    var t = byType[k] || (byType[k] = { process_type: k, open: 0, overdue: 0, stalled: 0, unassigned: 0 });
+    t.open++;
+    if (num_(r.days_overdue) > 0) t.overdue++;
+    if (r.is_stalled === 'YES') t.stalled++;
+    if (r.is_unassigned === 'YES') t.unassigned++;
+  });
+  var typeRows = Object.keys(byType).map(function (k) {
+    var t = byType[k];
+    t.overdue_pct = t.open ? Math.round(t.overdue / t.open * 100) : 0;
+    return t;
+  }).sort(function (a, b) { return b.overdue - a.overdue; });
+
+  writeTab_('LS_Compliance', typeRows);
+  writeTab_('LS_Workload', workload);
+
+  // ---- Owners funnel ----
+  var stageCount = {}, statusCount = {}, lossReasons = {};
+  deals.forEach(function (d) {
+    var s = d.stage || 'No stage', st = d.stage_status || 'unknown';
+    stageCount[s] = stageCount[s] || { stage: s, stage_status: st, deals: 0 };
+    stageCount[s].deals++;
+    statusCount[st] = (statusCount[st] || 0) + 1;
+    if (st === 'lost') lossReasons[s] = (lossReasons[s] || 0) + 1;
+  });
+  var funnel = Object.keys(stageCount).map(function (k) { return stageCount[k]; })
+    .sort(function (a, b) { return b.deals - a.deals; });
+  writeTab_('LS_Owners_Funnel', funnel);
+
+  var won = statusCount['won'] || 0, lost = statusCount['lost'] || 0;
+  var active = deals.filter(function (d) { return d.is_active === 'YES'; });
+
+  var summary = {
+    run_date: nowStamp_(),
+    metric: 'leadsimple_process_and_pipeline',
+    processes_total: procs.length,
+    processes_open: open.length,
+    processes_overdue: open.filter(function (r) { return num_(r.days_overdue) > 0; }).length,
+    processes_stalled: open.filter(function (r) { return r.is_stalled === 'YES'; }).length,
+    processes_unassigned: open.filter(function (r) { return r.is_unassigned === 'YES'; }).length,
+    processes_no_due_date: open.filter(function (r) { return r.no_due_date === 'YES'; }).length,
+    overdue_rate_pct: open.length
+      ? Math.round(open.filter(function (r) { return num_(r.days_overdue) > 0; }).length / open.length * 100)
+      : null,
+    owners_deals_total: deals.length,
+    owners_deals_active: active.length,
+    owners_deals_stale: active.filter(function (d) { return d.is_stale === 'YES'; }).length,
+    owners_deals_no_next_task: active.filter(function (d) { return d.no_next_task === 'YES'; }).length,
+    owners_won: won,
+    owners_lost: lost,
+    // Passive/past/invalid are excluded from the denominator on purpose — nurture
+    // volume is not a loss, and counting it as one understates the rate badly.
+    owners_win_rate_pct: (won + lost) ? Math.round(won / (won + lost) * 100) : null,
+    top_loss_reason: Object.keys(lossReasons).sort(function (a, b) {
+      return lossReasons[b] - lossReasons[a];
+    })[0] || null,
+    publishable: open.length >= CFG.MIN_N_TO_PUBLISH ? 'YES' : 'NO — n below ' + CFG.MIN_N_TO_PUBLISH
+  };
+  appendTab_('Metrics_History', [summary]);
+
+  logRun_('buildLeadSimpleSummary', 'leadsimple', 'LS_Compliance', typeRows.length,
+          new Date().getTime() - t0,
+          'open=' + summary.processes_open + ' overdue=' + summary.processes_overdue +
+          ' win_rate=' + summary.owners_win_rate_pct + '%');
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
+
+// ============================================================ VERIFY
+
+/**
+ * Run this first. Proves auth, reports account size, and tells you the exact cost
+ * of a seed before you start one.
+ */
+function lsVerify() {
+  var out = [];
+  try {
+    var acct = lsGet2_('/info/account', {}, 1);
+    var a = acct.data || {};
+    out.push('AUTH OK — account "' + (a.name || '?') + '" (id ' + (a.id || '?') + ')');
+  } catch (e) {
+    out.push('AUTH FAILED — ' + e.message.slice(0, 300));
+    Logger.log(out.join('\n'));
+    return out;
+  }
+
+  [['processes', '/processes', {}],
+   ['Owners deals', '/pipelines/' + LS.OWNERS_PIPELINE_ID + '/deals', {}],
+   ['all tasks', '/tasks', {}],
+   ['pipelines', '/pipelines', {}],
+   ['process types', '/process_types', {}]
+  ].forEach(function (row) {
+    try {
+      var p = Object.assign({ per_page: 1 }, row[2]);
+      var body = lsGet2_(row[1], p, 1);
+      var n = (body.meta || {}).total_count;
+      var mins = Math.ceil(n / LS.RECORD_BUDGET);
+      out.push(row[0] + ': ' + n + ' records (~' + mins + ' min to full-pull)');
+    } catch (e) { out.push(row[0] + ' FAILED — ' + e.message.slice(0, 160)); }
+  });
+
+  var seedPage = PropertiesService.getScriptProperties().getProperty(LS.PROP_SEED_PAGE);
+  out.push(seedPage ? 'Seed IN PROGRESS at page ' + seedPage : 'Seed: not started or complete');
+  out.push('LS_Processes rows: ' + readTab_('LS_Processes').length);
+  out.push('LS_Deals rows: ' + readTab_('LS_Deals').length);
+
+  Logger.log(out.join('\n'));
+  logRun_('lsVerify', 'leadsimple', '-', out.length, 0, out.join(' | '));
+  return out;
+}
+
+// ============================================================ WEBHOOKS
+
+/**
+ * The fix for the time-in-stage gap.
+ *
+ * The REST payload has no stage-entered timestamp, so time-in-stage cannot be derived
+ * from a poll — that is why LS_Stage_Timings was never buildable. The API does publish
+ * stage-change events, so the answer is to record them as they happen and accumulate
+ * your own history.
+ *
+ * Confirmed event names from the live spec:
+ *   deal/created  deal/changed_stage  deal/changed_pipeline  deal/changed_tags
+ *   deal/reassigned  deal/opened_email
+ *   task/created  task/reminder_due  task/completed
+ *   task/completed/manually  task/completed/automatically
+ *   process/created  process/updated  process/changed_stage  process/changed_tags
+ *   process/reassigned
+ *   call/completed  inbound_conversation/created  outbound_conversation/created
+ *
+ * Requires a public POST endpoint. A doGet/doPost Web App deployed from this project
+ * ("Anyone" access) is the least-moving-parts option — have it append the payload to
+ * LS_Stage_Events, then compute durations between consecutive events per record.
+ *
+ * Nothing calls this automatically. Run it by hand once the receiver is deployed.
+ */
+function lsSubscribeStageEvents(targetUrl) {
+  if (!targetUrl) throw new Error('Pass the deployed Web App /exec URL.');
+  var key = prop_('LEADSIMPLE_API_KEY');
+  var events = ['process/changed_stage', 'process/created',
+                'deal/changed_stage', 'deal/created'];
+  var out = [];
+  events.forEach(function (ev) {
+    var resp = UrlFetchApp.fetch(LS.BASE + '/webhook_subscriptions', {
+      method: 'post',
+      headers: { 'Accept': 'application/json', 'Authorization': key },
+      payload: { event_name: ev, target_url: targetUrl },
+      muteHttpExceptions: true
+    });
+    out.push(ev + ' -> HTTP ' + resp.getResponseCode() + ' ' +
+             resp.getContentText().slice(0, 160));
+    Utilities.sleep(1000);
+  });
+  Logger.log(out.join('\n'));
+  logRun_('lsSubscribeStageEvents', 'leadsimple', '-', out.length, 0, out.join(' | '));
+  return out;
+}
+
+/** Lists what is currently subscribed, so you never double-subscribe. */
+function lsListWebhooks() {
+  var body = lsGet2_('/webhook_subscriptions', { per_page: 100 }, 100);
+  var rows = (body.data || []).map(function (w) {
+    return w.event_name + ' -> ' + w.target_url + ' (' + w.id + ')';
+  });
+  Logger.log(rows.length ? rows.join('\n') : 'No webhook subscriptions.');
+  return rows;
+}
+
+// ============================================================ LEAD → MOVE-IN
+// Added for the Performance view, 2026-08-10.
+
+/**
+ * Process type names, exactly as they read in the WeLease account.
+ *
+ * Matched case-insensitively on the trimmed name. If someone renames a type in
+ * LeadSimple this stops matching silently, which is why buildLeadToMoveIn logs the
+ * types it actually found alongside the ones it expected — run lsListProcessTypes()
+ * to see the current list.
+ */
+/**
+ * The onboarding process, singular.
+ *
+ * A /onboard/i regex matched three of WeLease's types at once — "01 Owner Onboarding
+ * Process", "02 Property Onboarding Process" and "TPO Owner Onboarding Process". Blending
+ * them gives a median that describes no real cycle: they start from different events, run
+ * different lengths, and TPO properties are excluded from every other count on this
+ * dashboard.
+ *
+ * Frank, 2026-08-17: onboarding performance comes from THE onboarding process — the one
+ * LeadSimple creates automatically when an owner is won in the owners pipeline. That is the
+ * clock that starts when WeLease takes the property on, and the one worth improving.
+ *
+ * Everything else matching "onboard" is counted and reported as EXCLUDED rather than
+ * silently dropped, so the choice is visible and reversible.
+ */
+var LS_ONBOARDING = {
+  TYPES: ['01 Owner Onboarding Process'],
+  // Named so a rename in LeadSimple produces a message that says what to do, not a blank.
+  ALSO_MATCHING: /onboard/i,
+
+  // ============================================================================
+  // WHAT THE ONBOARDING PANEL ACTUALLY MEASURES
+  //
+  // The stage has seventeen steps. Listing all seventeen produced a table nobody read,
+  // because most of them are one-minute administrative ticks and three of them are the
+  // whole job. Below are only the ones a person would ask about.
+  //
+  // WeLease runs two services through one process. It branches at "Confirm we have
+  // received PMA | Identify Full Management or TPO?", and the branch is visible in which
+  // intro email fired. TPO is tenant placement only — no owner portal, no monthly
+  // statements — so averaging the two together produces a cycle time that describes
+  // neither. They are reported apart.
+  //
+  // AUTOMATED STEPS ARE NOT WORK. An email LeadSimple sends by itself completes whether
+  // anyone is paying attention, so counting it as a completed step measures the
+  // automation, not the team. They are excluded from the step table and from adherence —
+  // but they still count for FIRST TOUCH, because the owner received an email either way
+  // and that is the thing being measured.
+  // ============================================================================
+
+  // The service branch, read off whichever intro email fired.
+  SERVICE: [
+    { key: 'TPO',      label: 'Tenant placement only', match: /\(\s*TPO\s*\)|\bTPO\b/i },
+    { key: 'FULL_PMA', label: 'Full management',       match: /\(\s*full\s*pma\s*\)|full\s*management/i }
+  ],
+
+  // First touch = process created -> the first email that reached the owner. Auto or
+  // manual; the owner cannot tell the difference and neither should this number.
+  FIRST_TOUCH: /intro email/i,
+
+  // The milestones. Order is the order they happen, and the label is what a person would
+  // call the step rather than what the step is called in LeadSimple.
+  MILESTONES: [
+    { key: 'intro',     label: 'Intro email out',        match: /intro email/i },
+    { key: 'pma',       label: 'PMA received, service identified',
+                        match: /confirm we have received pma|identify full management/i },
+    { key: 'docs_sent', label: 'Onboarding docs sent',   match: /send onboarding docs|docusign/i },
+    { key: 'call',      label: 'Onboarding call booked', match: /intro call to the owner|schedule onboarding call/i },
+    { key: 'docs_back', label: 'All docs received',      match: /confirm all onboarding documents/i },
+    { key: 'appfolio',  label: 'Owner created in AppFolio', match: /create owner in appfolio/i },
+    { key: 'portal',    label: 'Owner portal activated', match: /owner portal announcement|activate owner portal/i }
+  ],
+
+  // Days from process creation by which a milestone is expected, taken from the delays on
+  // the process itself. Used only to say "on time" or "late" — never to invent a deadline
+  // the team has not agreed to.
+  TARGET_DAYS: { intro: 1, pma: 1, docs_sent: 1, call: 3, docs_back: 5, appfolio: 5, portal: 5 }
+};
+
+/** Which service this onboarding is for, read from the intro email that fired. */
+function lsServiceOf_(stepName) {
+  var s = String(stepName || '');
+  for (var i = 0; i < LS_ONBOARDING.SERVICE.length; i++) {
+    if (LS_ONBOARDING.SERVICE[i].match.test(s)) return LS_ONBOARDING.SERVICE[i].key;
+  }
+  return null;
+}
+
+/** The milestone a step belongs to, or null if it is one of the routine ticks. */
+function lsMilestoneOf_(stepName) {
+  var s = String(stepName || '');
+  for (var i = 0; i < LS_ONBOARDING.MILESTONES.length; i++) {
+    if (LS_ONBOARDING.MILESTONES[i].match.test(s)) return LS_ONBOARDING.MILESTONES[i].key;
+  }
+  return null;
+}
+
+function lsIsOnboardingType_(name) {
+  return lsTypeIs_(name, LS_ONBOARDING.TYPES);
+}
+
+var LS_TYPE = {
+  // LEAD is empty on purpose. Applicant leads live in a pipeline (LS.LEADS_PIPELINE_ID),
+  // not in LS_Processes, so there is no process type for buildLeadToMoveIn to match.
+  // Leaving a name here that no type can ever equal produced a nightly error blaming a
+  // rename in LeadSimple for a wiring mistake in this file.
+  LEAD:    [],
+  MOVE_IN: ['06 Move In Process'],
+  OWNERS:  ['Owners']
+};
+
+/** Widest sensible gap between first enquiry and handing over keys. */
+var LS_JOIN = {
+  MAX_DAYS: 365,        // beyond a year it is a different tenancy, not a slow one
+  MIN_DAYS: 0           // a move-in before the lead existed is a bad match, not fast work
+};
+
+function lsTypeIs_(name, list) {
+  var n = String(name || '').trim().toLowerCase();
+  for (var i = 0; i < list.length; i++) {
+    if (n === String(list[i]).trim().toLowerCase()) return true;
+  }
+  return false;
+}
+
+/**
+ * Normalise a person's name for matching across two systems that never agreed on
+ * formatting. "Garcia, María J." and "maria garcia" have to collide.
+ *
+ * Accents folded, punctuation dropped, middle initials dropped, tokens sorted so
+ * "Last First" and "First Last" land on the same key.
+ */
+function lsNameKey_(raw) {
+  var s = String(raw || '')
+    .replace(/[À-Åà-å]/g, 'a').replace(/[È-Ëè-ë]/g, 'e')
+    .replace(/[Ì-Ïì-ï]/g, 'i').replace(/[Ò-Öò-ö]/g, 'o')
+    .replace(/[Ù-Üù-ü]/g, 'u').replace(/[Ññ]/g, 'n')
+    .toLowerCase()
+    .replace(/\b(jr|sr|ii|iii|iv|mr|mrs|ms|dr)\b/g, ' ')
+    .replace(/[^a-z\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!s) return '';
+  var parts = s.split(' ').filter(function (w) { return w.length > 1; });   // drop initials
+  if (parts.length < 2) return '';                       // one name is not enough to match on
+  return parts.sort().join(' ');
+}
+
+/**
+ * A contact field can hold several people: "A Smith | B Smith".
+ *
+ * NOT split on commas. A comma is far more often "Garcia, Maria" than a separator,
+ * and splitting there turned every Last-First name into two single words, which
+ * lsNameKey_ then rejected — silently matching nothing at all. Pipes, semicolons,
+ * slashes and " and " only; lsNameKey_ strips the comma as punctuation and sorts
+ * the tokens, so "Garcia, Maria" and "Maria Garcia" land on the same key anyway.
+ */
+function lsNameKeys_(raw) {
+  return String(raw || '').split(/\s*[|;\/]\s*|\s+and\s+|\s*&\s*/i)
+    .map(lsNameKey_).filter(function (k) { return k; });
+}
+
+/**
+ * Days from the LeadSimple lead being created to the resident moving in.
+ *
+ * JOIN CAVEAT, stated up front: LeadSimple processes carry LeadSimple ids and AppFolio
+ * move-ins carry AppFolio ids. There is no shared key, so this matches on the
+ * resident's NAME — Frank's call, 2026-08-10. Name matching is fuzzy, so the rule is
+ * deliberately strict: a lead is only counted when it resolves to exactly ONE move-in.
+ * Anything ambiguous is written to _ls_join_exceptions rather than guessed at, because
+ * a wrong match produces a plausible-looking duration that nobody would question.
+ *
+ * The match rate is published with the figure. Below half, the median describes the
+ * subset that happened to match rather than the portfolio, and the panel says so.
+ */
+/**
+ * Applicant leads, in one shape, wherever they live.
+ *
+ * They are deals in the "Leads: AppFolio Tenant Applicants" pipeline. This used to read
+ * LS_Processes and filter on a process type of that name, which cannot exist — the result
+ * was zero leads every night and an error blaming LeadSimple for a rename.
+ *
+ * LS_Processes is still checked second, because LS_TYPE.LEAD is configurable and if WeLease
+ * ever does run applicants as a process the metric should pick them up without a code
+ * change. Both sources are normalised so the matcher below never has to care which won.
+ */
+function lsLeadRecords_(procs) {
+  var out = [];
+
+  readTab_('LS_Leads').forEach(function (d) {
+    var status = String(d.stage_status || '').toLowerCase();
+    out.push({
+      lead_id: d.deal_id,
+      lead_source: 'pipeline deal',
+      // A deal's contact is the applicant; deal_name is the fallback, and on this pipeline
+      // it is usually the applicant's name too.
+      name: d.contact || d.deal_name || '',
+      created_date: d.created_date,
+      property_address: d.property_address || '',
+      unit: d.unit || '',
+      // "active" and "passive" are both still in play. Only won/lost/past are settled, and
+      // an unmatched open lead is not a data problem — the exception text leans on this.
+      is_open: (status === 'active' || status === 'passive' || (!status && !d.closed_date))
+        ? 'YES' : ''
+    });
+  });
+
+  if (LS_TYPE.LEAD && LS_TYPE.LEAD.length) {
+    (procs || readTab_('LS_Processes')).forEach(function (r) {
+      if (!lsTypeIs_(r.process_type, LS_TYPE.LEAD)) return;
+      out.push({
+        lead_id: r.process_id,
+        lead_source: 'process',
+        name: r.tenant_contact || r.process_name || '',
+        created_date: r.created_date,
+        property_address: r.property_address || '',
+        unit: r.unit || '',
+        is_open: r.is_open === 'YES' ? 'YES' : ''
+      });
+    });
+  }
+
+  return out;
+}
+
+function buildLeadToMoveIn() {
+  var t0 = new Date().getTime();
+  var today = ymd_(today_());
+
+  var procs = readTab_('LS_Processes');
+  var leads = lsLeadRecords_(procs);
+  var moveProcs = procs.filter(function (r) { return lsTypeIs_(r.process_type, LS_TYPE.MOVE_IN); });
+
+  // AppFolio side: the tickler is the only place carrying BOTH a resident name and a
+  // move-in date. rental_applications has the dates but no name column at all.
+  var moveIns = readTab_('Tenant_Tickler').filter(function (r) {
+    var e = String(r.event || '').toLowerCase().replace(/[^a-z]/g, '');
+    return r.move_in_date && e.indexOf('movein') !== -1 && e.indexOf('notice') === -1;
+  });
+
+  var miByName = {}, miAll = [];
+  moveIns.forEach(function (r) {
+    var d = ymd_(r.move_in_date);
+    if (!d) return;
+    lsNameKeys_(r.tenant).forEach(function (k) {
+      var entry = { date: d, row: r, key: k, tokens: k.split(' ') };
+      (miByName[k] = miByName[k] || []).push(entry);
+      miAll.push(entry);
+    });
+  });
+
+  // Move-in processes, so coverage can be reported separately from the timing.
+  var mpByName = {};
+  moveProcs.forEach(function (r) {
+    lsNameKeys_(r.tenant_contact || r.process_name).forEach(function (k) {
+      (mpByName[k] = mpByName[k] || []).push(r);
+    });
+  });
+
+  var rows = [], exceptions = [], days = [];
+  var seenLead = {};
+
+  leads.forEach(function (L) {
+    var created = ymd_(L.created_date);
+    var keys = lsNameKeys_(L.name);
+    var name = L.name || '';
+
+    function except(reason) {
+      exceptions.push({
+        source: 'lead_to_movein', process_id: L.lead_id, lead_name: name,
+        lead_created: created || '', property: L.property_address || '',
+        reason: reason, checked_on: today
+      });
+    }
+
+    if (!created) { except('lead has no created date'); return; }
+    if (!keys.length) { except('no usable name on the lead — needs at least two words'); return; }
+
+    // A person who enquired twice should not be counted twice.
+    var dedupe = keys.join('+');
+    if (seenLead[dedupe] && seenLead[dedupe] <= created) { except('duplicate lead for the same person'); return; }
+
+    function inWindow(c) {
+      var gap = daysBetween_(created, c.date);
+      return gap !== null && gap >= LS_JOIN.MIN_DAYS && gap <= LS_JOIN.MAX_DAYS;
+    }
+
+    var candidates = [], how = 'resident name';
+    keys.forEach(function (k) {
+      (miByName[k] || []).forEach(function (c) {
+        if (inWindow(c) && candidates.indexOf(c) === -1) candidates.push(c);
+      });
+    });
+
+    // Nothing exact. Try a containment match before giving up: "Garcia, Robert" against
+    // "Robert Smith Garcia" is the same person recorded with both surnames in one system
+    // and one in the other, which is ordinary in San Diego and would otherwise be dropped
+    // as a miss. Every token of the shorter name must appear in the longer one, and at
+    // least two must — so "Ana Ruiz" cannot swallow "Ana Ruiz Delgado" AND "Ana Ruiz Vega"
+    // without tripping the ambiguity guard below.
+    if (!candidates.length) {
+      keys.forEach(function (k) {
+        var lt = k.split(' ');
+        miAll.forEach(function (c) {
+          if (!inWindow(c) || candidates.indexOf(c) > -1) return;
+          var big = lt.length >= c.tokens.length ? lt : c.tokens;
+          var small = lt.length >= c.tokens.length ? c.tokens : lt;
+          if (small.length < 2) return;
+          var all = small.every(function (w) { return big.indexOf(w) > -1; });
+          if (all) candidates.push(c);
+        });
+      });
+      if (candidates.length) how = 'resident name (partial)';
+    }
+
+    if (!candidates.length) {
+      // Open leads that simply have not converted yet are not a data problem.
+      except(L.is_open === 'YES' ? 'no move-in yet — lead still open'
+                                 : 'no move-in found within ' + LS_JOIN.MAX_DAYS + ' days');
+      return;
+    }
+    if (candidates.length > 1) {
+      // Try the address before giving up. Same name, two units, is rare but real.
+      var addr = String(L.property_address || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      var narrowed = addr ? candidates.filter(function (c) {
+        var a = String(c.row.property_street || c.row.property_name || '')
+          .toLowerCase().replace(/[^a-z0-9]/g, '');
+        return a && addr.indexOf(a) === 0;
+      }) : [];
+      if (narrowed.length === 1) candidates = narrowed;
+      else {
+        except('ambiguous — ' + candidates.length + ' move-ins match this name');
+        return;
+      }
+    }
+
+    var m = candidates[0];
+    var d = daysBetween_(created, m.date);
+    seenLead[dedupe] = created;
+    days.push(d);
+    rows.push({
+      lead_id: L.lead_id,
+      lead_source: L.lead_source,
+      resident: name,
+      lead_created: created,
+      moved_in: m.date,
+      days_lead_to_movein: d,
+      property: m.row.property_street || m.row.property_name || L.property_address || '',
+      unit: m.row.unit || L.unit || '',
+      occupancy_id: m.row.occupancy_id || '',
+      had_movein_process: keys.some(function (k) { return (mpByName[k] || []).length; }) ? 'YES' : '',
+      matched_on: how
+    });
+  });
+
+  rows.sort(function (a, b) { return String(a.moved_in) < String(b.moved_in) ? 1 : -1; });
+  writeTab_('Lead_To_MoveIn', rows.length ? rows
+    : [{ note: 'No lead matched a move-in. See _ls_join_exceptions.' }]);
+
+  if (exceptions.length) {
+    var prior = readTab_('_ls_join_exceptions').filter(function (r) {
+      return r.source !== 'lead_to_movein';
+    });
+    writeTab_('_ls_join_exceptions', prior.concat(exceptions));
+  }
+
+  var matchRate = leads.length ? Math.round(rows.length / leads.length * 100) : null;
+  var withProcess = rows.filter(function (r) { return r.had_movein_process === 'YES'; }).length;
+  var partial = rows.filter(function (r) { return r.matched_on !== 'resident name'; }).length;
+
+  var summary = {
+    run_date: nowStamp_(),
+    metric: 'lead_to_movein_days',
+    leads_examined: leads.length,
+    matched: rows.length,
+    match_rate_pct: matchRate,
+    median_days: publishNum_(median_(days)),
+    mean_days: publishNum_(days.length ? days.reduce(function (a, b) { return a + b; }, 0) / days.length : null),
+    p90_days: publishNum_(p90_(days)),
+    fastest_days: days.length ? Math.min.apply(null, days) : null,
+    slowest_days: days.length ? Math.max.apply(null, days) : null,
+    with_movein_process: withProcess,
+    matched_on_partial_name: partial,
+    unmatched: exceptions.length,
+    publishable: (rows.length >= CFG.MIN_N_TO_PUBLISH && matchRate !== null && matchRate >= 50)
+      ? 'YES'
+      : (rows.length < CFG.MIN_N_TO_PUBLISH
+          ? 'NO — n below ' + CFG.MIN_N_TO_PUBLISH
+          : 'NO — only ' + matchRate + '% of leads matched a move-in')
+  };
+  appendTab_('Metrics_History', [summary]);
+
+  logRun_('buildLeadToMoveIn', 'leadsimple', 'Lead_To_MoveIn', rows.length,
+          new Date().getTime() - t0,
+          'leads=' + leads.length + ' matched=' + rows.length + ' (' + matchRate + '%)' +
+          ' median=' + summary.median_days + ' unmatched=' + exceptions.length +
+          (partial ? ' · ' + partial + ' via a partial name match' : ''));
+
+  if (!leads.length) {
+    logError_('leadsimple', 'lead to move-in',
+      !LS.LEADS_PIPELINE_ID
+        ? 'No leads to measure, because LS.LEADS_PIPELINE_ID is not set. Applicant leads ' +
+          'are a pipeline ("Leads: AppFolio Tenant Applicants"), not a process type — run ' +
+          'lsListPipelines(), paste the id into LS.LEADS_PIPELINE_ID in LeadSimple.gs, then ' +
+          'rebuildLeadSimple(). Every other LeadSimple metric is unaffected.'
+        : 'LS.LEADS_PIPELINE_ID is set but LS_Leads is empty. Run rebuildLeadSimple() — if ' +
+          'it stays empty, the id points at a pipeline with no deals in it and ' +
+          'lsListPipelines() will show which one.');
+  } else if (matchRate !== null && matchRate < 50) {
+    logError_('leadsimple', 'lead to move-in',
+      'Only ' + matchRate + '% of leads matched a move-in by name. The median describes ' +
+      'that subset, not the portfolio, and is published as not-publishable. Review ' +
+      '_ls_join_exceptions — if most say "ambiguous" the names are too common to match on, ' +
+      'and this needs a shared key rather than a better guess.');
+  }
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
+
+// ============================================================ ACCOUNT INSPECTION
+
+/**
+ * Every process type with its open count. Run this whenever a name in LS_TYPE stops
+ * matching — it prints the strings to paste back in.
+ */
+function lsListProcessTypes() {
+  var by = {};
+  readTab_('LS_Processes').forEach(function (r) {
+    var k = r.process_type || '(none)';
+    var t = by[k] || (by[k] = { process_type: k, total: 0, open: 0 });
+    t.total++;
+    if (r.is_open === 'YES') t.open++;
+  });
+  var rows = Object.keys(by).map(function (k) { return by[k]; })
+    .sort(function (a, b) { return b.total - a.total; });
+  var out = rows.map(function (r) {
+    var used = lsTypeIs_(r.process_type, LS_TYPE.LEAD) ? '  <- LS_TYPE.LEAD'
+             : lsTypeIs_(r.process_type, LS_TYPE.MOVE_IN) ? '  <- LS_TYPE.MOVE_IN'
+             : lsTypeIs_(r.process_type, LS_TYPE.OWNERS) ? '  <- LS_TYPE.OWNERS' : '';
+    return r.total + ' total, ' + r.open + ' open   ' + r.process_type + used;
+  }).join('\n');
+  Logger.log(out || 'LS_Processes is empty — run rebuildLeadSimple() first.');
+  return out;
+}
+
+/**
+ * Pipelines with their REST ids, so LS.OWNERS_PIPELINE_ID can be checked against
+ * reality. The web app's /v2/pipelines/<id> URL uses a different id encoding from the
+ * REST API, so a URL cannot simply be pasted into the config.
+ */
+function lsListPipelines() {
+  if (!systemEnabled_('leadsimple')) return 'LeadSimple is disabled.';
+  var res = lsGet2_('/pipelines', {}, 50);
+  var list = (res && (res.data || res.results || res)) || [];
+  var out = (Array.isArray(list) ? list : []).map(function (p) {
+    var mark = (String(p.id) === LS.OWNERS_PIPELINE_ID) ? '   <- LS.OWNERS_PIPELINE_ID'
+             : (LS.LEADS_PIPELINE_ID && String(p.id) === LS.LEADS_PIPELINE_ID) ? '   <- LS.LEADS_PIPELINE_ID'
+             : /applicant|lead|tenant/i.test(String(p.name || '')) ? '   <- looks like the applicants pipeline'
+             : '';
+    return p.id + '   ' + (p.name || '(unnamed)') + mark;
+  }).join('\n');
+  Logger.log(out || 'No pipelines returned.');
+  return out;
+}
+
+// ============================================================ COMPLETED TASKS
+
+/**
+ * The sync pulls only UPCOMING tasks (1,433). Seven deferred metrics need COMPLETED
+ * ones — every onboarding and renewal step duration, skipped_step_rate, and
+ * automation_failure_rate all read Task.completed_at, Task.step, Task.skipped and
+ * Task.auto_send.
+ *
+ * There are 68,222 of them. A full pull is roughly 75 minutes, so it seeds once,
+ * resumably, and then rides updated_since like the processes do — about 285 a day.
+ *
+ * Only the fields the metrics use are kept. Task descriptions are free text written by
+ * staff and occasionally contain resident details; nothing reads them, so they are
+ * dropped rather than stored.
+ */
+var LS_TASK_PROP_PAGE = 'LS_TASK_SEED_PAGE';
+
+/**
+ * DO NOT PUBLISH A METRIC FROM time_to_first_touch. Its baseline is unknown.
+ *
+ * I assumed seconds because 6377 read as 1h 46m and that looked right. Measuring it
+ * disagreed: across 60 deals the ratio of real elapsed seconds (created_at to
+ * first_contacted_at) against the reported value came out at a median of 23.4 — not 1
+ * for seconds, not 60 for minutes, not 3600 for hours. It matches no unit, which means
+ * LeadSimple is not measuring from deal creation at all. It could be from assignment,
+ * or business hours only, or some other event. A ratio cannot tell them apart.
+ *
+ * So durations are stored RAW and clearly labelled raw, and lead_first_touch_speed is
+ * computed from timestamps this pipeline controls instead. An opaque vendor number with
+ * an unknown baseline is worse than a slightly cruder one you can explain.
+ *
+ * This constant survives only for time_to_close, where nothing downstream reads it yet.
+ */
+var LS_DURATION_UNIT_VERIFIED = false;
+
+/**
+ * Every task, not only completed ones. Named for what it holds — a tab called
+ * LS_Tasks_Completed containing skipped and upcoming tasks is the kind of quiet
+ * mislabel that produces the next bug.
+ */
+var LS_TASK_TAB = 'LS_Tasks_All';
+
+/** Hours between two ISO timestamps. Ours, so the definition is knowable. */
+function lsHoursBetween_(a, b) {
+  if (!a || !b) return null;
+  var t0 = new Date(a).getTime(), t1 = new Date(b).getTime();
+  if (!isFinite(t0) || !isFinite(t1)) return null;
+  var h = (t1 - t0) / 3600000;
+  return h < 0 ? null : round2_(h);
+}
+
+function lsCompletedTaskRow_(t) {
+  var proc = t.process || {}, step = t.step || {}, deal = t.deal || {};
+  return {
+    task_id: t.id,
+    kind: t.kind || null,
+    // A third of completed tasks came back with no process type. Those are almost
+    // certainly attached to a DEAL rather than a process — the old upcoming-task
+    // shaper carried
+    // both — and this shape was dropping the deal entirely, so they looked like
+    // orphans. Captured now so the count reconciles.
+    deal_id: deal.id || null,
+    pipeline: (deal.pipeline || {}).name || null,
+    // A step object carries { created_at, updated_at, id, kind, description,
+    // delay_minutes, sort_order } — verified against the live payload 2026-08-13.
+    // There is NO name field. Reading step.name returned undefined on all 57,913
+    // tasks, which is why every step came back blank.
+    // description is empty on most 'email' steps and populated on 'todo' ones. Falling
+    // back to kind alone would collapse every email step in every process into one
+    // bucket called "email", which is how a step list stops being a step list.
+    step: step.description ||
+          (step.kind ? step.kind + ' #' + (step.sort_order === null ||
+             step.sort_order === undefined ? '?' : step.sort_order) : null),
+    step_kind: step.kind || null,
+    step_order: (step.sort_order === null || step.sort_order === undefined)
+      ? null : step.sort_order,
+    step_id: step.id || null,
+    assignee: (t.assignee || {}).name || null,
+    due_date: t.due_at ? ymd_(t.due_at) : null,
+    completed_date: t.completed_at ? ymd_(t.completed_at) : null,
+    skipped: t.skipped ? 'YES' : '',
+    auto_send: t.auto_send ? 'YES' : '',
+    auto_send_error: t.auto_send_error ? String(t.auto_send_error).slice(0, 120) : '',
+    process_id: proc.id || null,
+    process_type: (proc.process_type || {}).name || null,
+    process_created: proc.created_at ? ymd_(proc.created_at) : null,
+    process_closed: proc.closed_at ? ymd_(proc.closed_at) : null
+  };
+}
+
+/** Removes duplicate rows by key, keeping the last. Cheap: one read, one write. */
+function lsDedupeTab_(tabName, keyField) {
+  var rows = readTab_(tabName);
+  if (!rows.length) return 0;
+  var seen = {}, out = [];
+  for (var i = rows.length - 1; i >= 0; i--) {
+    var k = rows[i][keyField];
+    if (k === null || k === undefined || k === '') continue;
+    if (seen[k]) continue;
+    seen[k] = 1;
+    out.unshift(rows[i]);
+  }
+  if (out.length !== rows.length) writeTab_(tabName, out);
+  return out.length;
+}
+
+/**
+ * Resumable seed. Re-arms itself until it logs SEED COMPLETE.
+ *
+ * APPENDS, never upserts. lsUpsertTab_ reads the whole tab, merges in memory and
+ * rewrites it — fine for the nightly delta of ~285 rows, quietly quadratic across a
+ * 342-page backfill. By the last pass it would have been reading 60,000 rows and
+ * writing 68,000 before fetching a single page, so each pass would fetch less than the
+ * one before it and the seed would crawl.
+ *
+ * A paginated walk yields distinct pages, so within one seed there is nothing to merge.
+ * Re-running a checkpointed page can overlap, which is what the dedupe at the end is
+ * for. Safe to paste while a seed is mid-flight: rows already written stay put and the
+ * next pass appends after them.
+ */
+function lsSeedCompletedTasks() {
+  // Name kept so an in-flight checkpoint and any existing trigger still resolve. It
+  // pulls EVERY task now, not just completed ones — see the fetch below.
+  if (!systemEnabled_('leadsimple')) return 'LeadSimple is disabled.';
+  var t0 = new Date().getTime();
+  var props = PropertiesService.getScriptProperties();
+  var page = parseInt(props.getProperty(LS_TASK_PROP_PAGE) || '1', 10) || 1;
+
+  // A fresh seed over a tab that already holds rows would double everything.
+  if (page === 1 && readTab_(LS_TASK_TAB).length) {
+    clearTabRows_(LS_TASK_TAB);
+    Logger.log('Starting from page 1 — cleared the previous ' + LS_TASK_TAB + ' contents.');
+  }
+
+  // 240s not 270s. The old margin let one more page start and then spend the overrun
+  // writing; the observed pass ran 6m04s against a 6m ceiling.
+  // NO due_type FILTER. due_type=completed never returns a skipped task — measured at
+  // 0 of 50 there against 6 of 50 unfiltered — so seeding the completed set made
+  // skipped_step_rate structurally unmeasurable rather than merely zero. The tab holds
+  // every task now, and metrics that want completions filter on completed_date.
+  var res = lsPaged_('/tasks', {},
+                     { startedAt: t0, budgetMs: 240000, startPage: page });
+  var rows = (res.rows || []).map(lsCompletedTaskRow_);
+  if (rows.length) {
+    appendTab_(LS_TASK_TAB, rows,
+      ['task_id', 'kind', 'deal_id', 'pipeline', 'step', 'step_kind', 'step_order',
+       'step_id', 'assignee', 'due_date', 'completed_date', 'skipped', 'auto_send',
+       'auto_send_error', 'process_id', 'process_type', 'process_created',
+       'process_closed']);
+  }
+
+  if (res.complete) {
+    props.deleteProperty(LS_TASK_PROP_PAGE);
+    lsClearContinuation_('lsSeedCompletedTasks');
+    var total = lsDedupeTab_(LS_TASK_TAB, 'task_id');
+    logRun_('lsSeedCompletedTasks', 'leadsimple', LS_TASK_TAB, total,
+            new Date().getTime() - t0, 'SEED COMPLETE — ' + total + ' completed tasks');
+    Logger.log('SEED COMPLETE — ' + total + ' completed tasks. Run lsListSteps() next.');
+    return 'complete';
+  }
+  props.setProperty(LS_TASK_PROP_PAGE, String(res.nextPage || (page + 1)));
+  lsScheduleContinuation_('lsSeedCompletedTasks');
+  logRun_('lsSeedCompletedTasks', 'leadsimple', LS_TASK_TAB, rows.length,
+          new Date().getTime() - t0,
+          'PARTIAL — +' + rows.length + ' rows, paused at page ' + (res.nextPage || page + 1));
+  Logger.log('PARTIAL — +' + rows.length + ' rows, paused at page ' +
+             (res.nextPage || page + 1) + '. Continues in ~1 minute.');
+  return 'partial';
+}
+
+/** Every step name LeadSimple actually uses, so LS_STEPS can be written from fact. */
+function lsListSteps() {
+  var by = {};
+  readTab_(LS_TASK_TAB).forEach(function (r) {
+    var k = (r.process_type || '(no type)') + '  ::  ' + (r.step || '(no step)');
+    var b = by[k] || (by[k] = { k: k, n: 0, skipped: 0 });
+    b.n++;
+    if (r.skipped === 'YES') b.skipped++;
+  });
+  var rows = Object.keys(by).map(function (k) { return by[k]; })
+    .sort(function (a, b) { return b.n - a.n; });
+  var out = rows.length
+    ? rows.map(function (r) {
+        return String(r.n).padStart(6) + ' tasks  ' + String(r.skipped).padStart(4) +
+               ' skipped   ' + r.k; }).join('\n')
+    : LS_TASK_TAB + ' is empty — run lsSeedCompletedTasks() first.';
+  Logger.log(out);
+  return out;
+}
+
+// ============================================================ DEAL DATA REVIEW
+
+/**
+ * The outliers that were making a good field look broken.
+ *
+ * time_to_first_touch IS in hours — Frank, 2026-08-13. My ratio check called it
+ * UNCLEAR because it compared every deal including the ones nobody should be measuring:
+ * leads tagged "Bad Email Address" or "Unsubscribed", deals that sat dormant for months
+ * before anyone tried, records where first_contacted_at was backfilled. A median across
+ * those says nothing about how fast the team responds.
+ *
+ * So this is a worksheet, in the same shape as Master_Units: the pipeline recomputes the
+ * signals every night and suggests an action, and the `action` column is yours and never
+ * overwritten.
+ *
+ *   action = IGNORE   left out of every timing metric
+ *   action = KEEP     included, overriding the suggestion
+ *   action = FIXED    you corrected it in LeadSimple; treated as KEEP until it recomputes
+ *   action = blank    follow `suggested`
+ *
+ * Reversing anything is deleting the value in that column.
+ */
+var LS_REVIEW_TAB = 'LS_Deal_Review';
+
+/** Tags that mean the clock was never really running on this lead. */
+var LS_DEAD_TAGS = [/bad\s*e-?mail/i, /unsubscrib/i, /do\s*not\s*contact/i,
+                    /spam/i, /duplicate/i, /test/i, /wrong\s*number/i];
+
+/** Beyond this, "time to first touch" is describing a dormant record, not a response. */
+var LS_TOUCH_OUTLIER_HOURS = 336;      // two weeks
+
+function lsDeadTags_(tags) {
+  var t = String(tags || '');
+  if (!t) return [];
+  var hits = [];
+  LS_DEAD_TAGS.forEach(function (re) {
+    var m = t.match(re);
+    if (m) hits.push(m[0]);
+  });
+  return hits;
+}
+
+function buildLeadSimpleReview() {
+  var t0 = new Date().getTime();
+  var deals = readTab_('LS_Deals');
+  if (!deals.length) return { rows: 0 };
+
+  // Your column, preserved by deal_id.
+  var prevBy = {};
+  readTab_(LS_REVIEW_TAB).forEach(function (r) {
+    if (r.deal_id) prevBy[String(r.deal_id)] = r;
+  });
+
+  var rows = [];
+  deals.forEach(function (d) {
+    var vendor = num_(d.ls_time_to_first_touch_raw);
+    var ours = num_(d.hours_to_first_touch);
+    var dead = lsDeadTags_(d.tags);
+    var flags = [];
+
+    if (dead.length) flags.push('tagged: ' + dead.join(', '));
+    if (vendor !== null && vendor > LS_TOUCH_OUTLIER_HOURS) {
+      flags.push('first touch after ' + Math.round(vendor / 24) + ' days');
+    }
+    if (d.is_active === 'YES' && d.never_contacted === 'YES') flags.push('never contacted');
+    // The two numbers should agree if both measure the same thing. Where they do not,
+    // one of the timestamps is wrong, and that is worth a human look rather than a guess.
+    if (vendor !== null && ours !== null && vendor > 0) {
+      var gap = Math.abs(ours - vendor) / Math.max(vendor, 1);
+      if (gap > 0.5) {
+        flags.push('vendor ' + round1_(vendor) + 'h vs computed ' + round1_(ours) + 'h');
+      }
+    }
+    if (vendor === null && ours === null && d.is_active === 'YES') {
+      flags.push('no timing on an active deal');
+    }
+
+    if (!flags.length) return;                       // nothing to review
+
+    var prev = prevBy[String(d.deal_id)] || {};
+    rows.push({
+      deal_id: d.deal_id,
+      deal: d.deal_name || '',
+      contact: d.contact || d.company || '',
+      assignee: d.assignee || '',
+      stage: d.stage || '',
+      stage_status: d.stage_status || '',
+      tags: d.tags || '',
+      created: d.created_date || '',
+      first_contacted: d.first_contacted_date || '',
+      vendor_hours: vendor === null ? '' : round1_(vendor),
+      computed_hours: ours === null ? '' : round1_(ours),
+      why: flags.join(' · '),
+      // A dead tag is not a response-time failure, so the default is to leave it out.
+      suggested: dead.length ? 'IGNORE'
+               : (vendor !== null && vendor > LS_TOUCH_OUTLIER_HOURS) ? 'IGNORE' : 'REVIEW',
+      action: prev.action || '',                      // YOUR column — never overwritten
+      note: prev.note || '',
+      link: d.link || ''
+    });
+  });
+
+  rows.sort(function (a, b) {
+    // Undecided first, then the biggest distortions.
+    var ap = a.action ? 1 : 0, bp = b.action ? 1 : 0;
+    if (ap !== bp) return ap - bp;
+    return (num_(b.vendor_hours) || 0) - (num_(a.vendor_hours) || 0);
+  });
+
+  writeTab_(LS_REVIEW_TAB, rows.length ? rows
+    : [{ note: 'No deal needs review. Every active deal has plausible timing and no ' +
+               'disqualifying tag.' }]);
+
+  var undecided = rows.filter(function (r) { return !r.action; }).length;
+  logRun_('buildLeadSimpleReview', 'leadsimple', LS_REVIEW_TAB, rows.length,
+          new Date().getTime() - t0,
+          rows.length + ' deal(s) flagged · ' + undecided + ' awaiting a decision');
+  return { rows: rows.length, undecided: undecided };
+}
+
+/**
+ * Deal ids to leave out of timing metrics.
+ *
+ * Blank action follows the suggestion, so a freshly flagged "Bad Email Address" lead is
+ * excluded on the first night rather than waiting for someone to confirm it. KEEP and
+ * FIXED override that and put the deal back in.
+ */
+function lsIgnoredDeals_() {
+  var out = {};
+  readTab_(LS_REVIEW_TAB).forEach(function (r) {
+    if (!r.deal_id) return;
+    var a = String(r.action || '').trim().toUpperCase();
+    if (a === 'KEEP' || a === 'FIXED') return;
+    if (a === 'IGNORE') { out[String(r.deal_id)] = r.why || 'excluded by hand'; return; }
+    if (!a && String(r.suggested || '').toUpperCase() === 'IGNORE') {
+      out[String(r.deal_id)] = r.why || 'suggested';
+    }
+  });
+  return out;
+}
+
+// ============================================================ ONBOARDING STEPS
+
+/**
+ * Where the time actually goes inside owner onboarding.
+ *
+ * A single cycle-time number tells you onboarding takes N days. It does not tell you which
+ * step is eating them, so it cannot tell you what to fix. Frank's example — sending the
+ * onboarding documents takes time — is exactly the kind of thing that is invisible in a
+ * median and obvious in a step breakdown.
+ *
+ * Per step: how many processes reached it, the median and p90 days from the process opening
+ * to that step completing, how long the step waited after the PREVIOUS one, how often it is
+ * skipped, and how many processes are sitting at it right now unfinished.
+ *
+ * DAYS FROM PROCESS START, not from the step being created. LeadSimple creates every step up
+ * front, so a "step age" would just be the process age for all of them. Elapsed-since-start
+ * is what compounds into the cycle time, and the gap between consecutive steps is what
+ * isolates the slow one.
+ */
+/**
+ * One row per onboarding, in the shape a person asks about it.
+ *
+ * The step table answers "where does the time go". This answers "how did THIS owner's
+ * onboarding go", which is the question the team actually has, and it is the only place
+ * the TPO / Full PMA split can live — because the split is a property of the process,
+ * not of a step.
+ *
+ * THREE THINGS IT MEASURES AND WHY EACH ONE IS DEFINED THE WAY IT IS.
+ *
+ * FIRST TOUCH is process creation to the first intro email, automated or not. The owner
+ * has no idea which kind it was. Measuring only manual emails here would report a first
+ * touch of "never" for every owner the automation served correctly.
+ *
+ * MANUAL EMAILS are counted separately, and they are the ones that measure the team. An
+ * automated send completes whether anyone is watching; including it in an adherence
+ * figure measures LeadSimple's uptime.
+ *
+ * SUBJECT CONSISTENCY is the share of onboardings that received each manual email. A
+ * subject sent to 40% of owners is either optional — in which case it should not be a
+ * step — or it is being missed. Both are worth knowing; neither is visible from a
+ * completion count alone.
+ */
+function buildOnboardingJourneys() {
+  var t0 = new Date().getTime();
+  var procs = lsOnboardingProcs_();
+  if (!procs.length) {
+    writeTab_('Onboarding_Journeys', [{ note: 'No onboarding processes. Run diagnoseOnboarding().' }]);
+    return { processes: 0 };
+  }
+
+  var byId = {};
+  procs.forEach(function (p) {
+    byId[p.id] = { process_id: p.id, created: p.created || null, closed: p.closed || null,
+                   service: null, first_email: null, first_email_auto: '',
+                   manual_emails_sent: 0, manual_emails_open: 0, ms: {}, subjects: {} };
+  });
+
+  var emailSubjects = {};     // subject -> { auto, sent, processes }
+  readTab_('LS_Tasks_All').forEach(function (r) {
+    var j = byId[r.process_id];
+    if (!j) return;
+    var name = String(r.step || '').trim();
+    if (!name) return;
+    var isEmail = String(r.step_kind || '').toLowerCase().indexOf('email') > -1;
+    var auto = String(r.auto_send || '') === 'YES';
+    var done = ymd_(r.completed_date);
+
+    // The service branch. Whichever intro email fired names it.
+    if (!j.service && LS_ONBOARDING.FIRST_TOUCH.test(name)) {
+      var svc = lsServiceOf_(name);
+      // Only a COMPLETED intro email settles the branch. Both sit on every process; the
+      // one that did not fire is skipped, and reading the unfired one would label half
+      // the portfolio with the wrong service.
+      if (svc && done) j.service = svc;
+    }
+
+    // First touch: earliest completed intro email, whoever or whatever sent it.
+    if (isEmail && done && LS_ONBOARDING.FIRST_TOUCH.test(name)) {
+      if (!j.first_email || done < j.first_email) {
+        j.first_email = done;
+        j.first_email_auto = auto ? 'YES' : '';
+      }
+    }
+
+    // Manual email traffic — the part that measures the team.
+    if (isEmail && !auto) {
+      var s = emailSubjects[name] || (emailSubjects[name] = { subject: name, sent: 0, open: 0, procs: {} });
+      s.procs[r.process_id] = 1;
+      if (done) { s.sent++; j.manual_emails_sent++; j.subjects[name] = 1; }
+      else if (String(r.skipped || '') !== 'YES' && !j.closed) { s.open++; j.manual_emails_open++; }
+    }
+
+    var key = lsMilestoneOf_(name);
+    if (key && done && (!j.ms[key] || done < j.ms[key])) j.ms[key] = done;
+  });
+
+  var rows = Object.keys(byId).map(function (id) {
+    var j = byId[id];
+    var row = {
+      process_id: id,
+      created: j.created, closed: j.closed,
+      service: j.service || 'UNKNOWN',
+      is_open: j.closed ? '' : 'YES',
+      first_touch_date: j.first_email || '',
+      first_touch_days: (j.created && j.first_email) ? daysBetween_(j.created, j.first_email) : null,
+      first_touch_automated: j.first_email_auto,
+      manual_emails_sent: j.manual_emails_sent,
+      manual_emails_open: j.manual_emails_open,
+      cycle_days: (j.created && j.closed) ? daysBetween_(j.created, j.closed) : null,
+      age_days: j.created && !j.closed ? daysBetween_(j.created, ymd_(today_())) : null
+    };
+    LS_ONBOARDING.MILESTONES.forEach(function (m) {
+      var d = j.ms[m.key] || '';
+      row[m.key + '_date'] = d;
+      row[m.key + '_days'] = (j.created && d) ? daysBetween_(j.created, d) : null;
+    });
+    return row;
+  }).sort(function (a, b) { return String(b.created) < String(a.created) ? -1 : 1; });
+
+  writeTab_('Onboarding_Journeys', rows);
+
+  // Consistency, per manual email subject.
+  var total = rows.length;
+  var subs = Object.keys(emailSubjects).map(function (k) {
+    var s = emailSubjects[k];
+    var reached = Object.keys(s.procs).length;
+    return {
+      subject: s.subject,
+      onboardings_with_this_step: reached,
+      sent: s.sent,
+      still_open: s.open,
+      sent_pct: reached ? round1_(s.sent / reached * 100) : null,
+      coverage_pct: total ? round1_(reached / total * 100) : null
+    };
+  }).sort(function (a, b) { return (a.sent_pct || 0) - (b.sent_pct || 0); });
+  writeTab_('Onboarding_Emails', subs);
+
+  var unknown = rows.filter(function (r) { return r.service === 'UNKNOWN'; }).length;
+  if (unknown) {
+    logError_('leadsimple', 'onboarding',
+      unknown + ' of ' + rows.length + ' onboarding(s) could not be identified as TPO or ' +
+      'Full PMA, because neither intro email is recorded as completed. They are shown ' +
+      'separately rather than folded into one of the two — the split only means something ' +
+      'if every process is on one side of it.');
+  }
+
+  logRun_('buildOnboardingJourneys', 'derived', 'Onboarding_Journeys', rows.length,
+          new Date().getTime() - t0,
+          rows.length + ' onboarding(s) · ' + subs.length + ' manual email subject(s) · ' +
+          unknown + ' unidentified service');
+  return { processes: rows.length, subjects: subs.length, unknown: unknown };
+}
+
+function buildOnboardingSteps() {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+
+  var procs = lsOnboardingProcs_();
+  if (!procs.length) {
+    writeTab_('Onboarding_Steps', [{
+      note: 'No "' + LS_ONBOARDING.TYPES.join('" / "') + '" process found. Run ' +
+            'diagnoseOnboarding() — it lists every type containing "onboard" and marks ' +
+            'which one is being measured.' }]);
+    logRun_('buildOnboardingSteps', 'derived', 'Onboarding_Steps', 0,
+            new Date().getTime() - t0, 'no onboarding processes');
+    return { steps: 0, processes: 0 };
+  }
+
+  var startOf = {}, closeOf = {};
+  procs.forEach(function (p) {
+    if (p.created) startOf[p.id] = p.created;
+    if (p.closed) closeOf[p.id] = p.closed;
+  });
+
+  // Gather every task belonging to an onboarding process, keyed by step name.
+  var steps = {};
+  var order = {};
+  var tasksSeen = 0, withStepName = 0;
+  readTab_('LS_Tasks_All').forEach(function (r) {
+    var start = startOf[r.process_id];
+    if (!start) return;
+    tasksSeen++;
+    var name = String(r.step || '').trim();
+    if (!name) return;
+    withStepName++;
+
+    var b = steps[name] || (steps[name] = {
+      name: name, reached: 0, completed: 0, skipped: 0, open: 0,
+      days: [], processes: {}, autoFail: 0 });
+    b.reached++;
+    b.processes[r.process_id] = 1;
+    if (r.skipped === 'YES') b.skipped++;
+    if (r.auto_send_error) b.autoFail++;
+
+    // sort_order puts the table in the sequence the team works, not alphabetically.
+    var so = num_(r.step_order);
+    if (so !== null) {
+      order[name] = (order[name] === undefined) ? so : Math.min(order[name], so);
+    }
+
+    var done = ymd_(r.completed_date);
+    if (done) {
+      b.completed++;
+      var g = daysBetween_(start, done);
+      if (g !== null && g >= 0) b.days.push({ d: g, pid: r.process_id });
+    } else if (r.skipped !== 'YES' && !closeOf[r.process_id]) {
+      // Still open, on a process that has not closed — someone is waiting on this.
+      b.open++;
+    }
+  });
+
+  var names = Object.keys(steps);
+  if (!names.length) {
+    writeTab_('Onboarding_Steps', [{
+      note: procs.length + ' onboarding process(es) found and ' + tasksSeen + ' task(s) ' +
+            'belong to them, but none carries a step name. Tasks seeded before the ' +
+            'step.description fix have a blank step column — re-run lsSeedCompletedTasks().' }]);
+    logError_('leadsimple', 'onboarding steps',
+      tasksSeen + ' onboarding tasks carry no step name. Re-run lsSeedCompletedTasks().');
+    logRun_('buildOnboardingSteps', 'derived', 'Onboarding_Steps', 0,
+            new Date().getTime() - t0, 'no step names on ' + tasksSeen + ' tasks');
+    return { steps: 0, processes: procs.length };
+  }
+
+  names.sort(function (a, b) {
+    var oa = order[a] === undefined ? 9999 : order[a];
+    var ob = order[b] === undefined ? 9999 : order[b];
+    return oa - ob || a.localeCompare(b);
+  });
+
+  var rows = [], prevMedian = null;
+  names.forEach(function (name, i) {
+    var b = steps[name];
+    var ds = b.days.map(function (x) { return x.d; });
+    var med = ds.length ? median_(ds) : null;
+
+    // The wait ADDED by this step: its median elapsed minus the previous step's. Negative
+    // values are possible when steps complete out of order, and are reported as 0 rather
+    // than as time saved — a step cannot give days back.
+    var added = (med !== null && prevMedian !== null) ? Math.max(0, round1_(med - prevMedian))
+              : (med !== null && i === 0 ? med : null);
+
+    rows.push({
+      seq: i + 1,
+      step: name,
+      processes_reached: Object.keys(b.processes).length,
+      completed: b.completed,
+      still_open: b.open,
+      skipped: b.skipped,
+      skipped_pct: b.reached ? round1_(b.skipped / b.reached * 100) : null,
+      median_days_from_start: publishNum_(med),
+      p90_days_from_start: publishNum_(ds.length ? p90_(ds) : null),
+      days_added_by_this_step: publishNum_(added),
+      slowest_days: ds.length ? Math.max.apply(null, ds) : null,
+      automation_failures: b.autoFail
+    });
+    if (med !== null) prevMedian = med;
+  });
+
+  // The bottleneck: the step adding the most elapsed time, among steps with enough
+  // observations to mean anything.
+  var ranked = rows.filter(function (r) {
+    return num_(r.days_added_by_this_step) !== null && r.completed >= 3;
+  }).sort(function (a, b) {
+    return num_(b.days_added_by_this_step) - num_(a.days_added_by_this_step);
+  });
+
+  writeTab_('Onboarding_Steps', rows);
+
+  var summary = {
+    run_date: nowStamp_(),
+    metric: 'onboarding_step_breakdown',
+    measuring: LS_ONBOARDING.TYPES.join(' / '),
+    processes: procs.length,
+    closed_processes: procs.filter(function (p) { return p.created && p.closed; }).length,
+    steps: rows.length,
+    tasks_with_a_step_name: withStepName,
+    tasks_total: tasksSeen,
+    slowest_step: ranked.length ? ranked[0].step : null,
+    slowest_step_days_added: ranked.length ? ranked[0].days_added_by_this_step : null,
+    steps_with_anyone_waiting: rows.filter(function (r) { return r.still_open > 0; }).length
+  };
+  appendTab_('Metrics_History', [summary]);
+
+  logRun_('buildOnboardingSteps', 'derived', 'Onboarding_Steps', rows.length,
+          new Date().getTime() - t0,
+          rows.length + ' steps across ' + procs.length + ' process(es)' +
+          (summary.slowest_step ? ' · slowest: "' + summary.slowest_step + '" adding ' +
+            summary.slowest_step_days_added + ' days' : ''));
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
