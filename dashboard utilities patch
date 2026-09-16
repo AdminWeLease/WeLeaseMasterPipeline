@@ -1,0 +1,323 @@
+/**
+ * WeLease Dashboard — UTILITY BILLING VIEW  v2.1.0 · 2026-08-05
+ * Requires Dashboard.gs (1465-line version), Utility_Schedule.gs v2.0.0, Core_v2.gs, Shared.gs.
+ *
+ * Adds a seventh view: "Utility Billing". Five blocks plus a summary panel.
+ * Scorecards on Needs Attention are generated from VIEWS automatically, so they appear
+ * with no extra work once the view is registered.
+ *
+ * v2.0.0 rewritten against your current Dashboard.gs. What changed from v1:
+ *   - row.src is the RAW ROW OBJECT, not a string. addrLink_(r, label) reads r.unit_id
+ *     and r.property_id off it to build the AppFolio link. Passing a string silently
+ *     produced an unlinked cell.
+ *   - pmOf_ now takes three arguments: pmOf_(map, propertyId, unitId).
+ *   - rows carry `days` and `sort` for the sort, and `key` for acknowledgments.
+ *   - TPO and excluded properties are dropped with dropTPO_(), not a hand-rolled filter.
+ *   - the summary panel uses .card / .cards / .sc markup. My v1 used .kpi* classes,
+ *     which do not exist in your CSS — it would have rendered unstyled.
+ *
+ * v2.2.0 (2026-08-06) — scope narrowed at Frank's direction:
+ *   - TENANT CHARGES ONLY. Vendor bills and owner draws no longer create billing events;
+ *     vendor rows are read solely to learn the provider name.
+ *   - Series with fewer than USCHED_SCOPE.MIN_POSTINGS_TO_TRACK postings are DROPPED, not
+ *     listed as INSUFFICIENT HISTORY. One posting from years ago is not a cycle, and
+ *     showing it as unmeasured read as a task.
+ *   - Properties whose management has ended are excluded.
+ *   - Single-family homes excluded unless at least MIN_MANUAL_POSTINGS_SFH postings carry
+ *     a hand-typed service period.
+ *   The old "No cycle inferred yet" block is replaced by "Excluded from the schedule",
+ *   which is a receipt rather than a worklist.
+ *
+ * v2.1.0 tracks Utility_Schedule.gs v2.0.0:
+ *   - columns renamed: gl_number/gl_name -> service_group/utility, next_expected_issue ->
+ *     expected_posting. The clock is now ONE 5-day window (USCHED.POST_WINDOW_DAYS), not
+ *     a receive window plus a process window.
+ *   - a utility is a GROUP: water and sewer are one bill, and SDG&E gas+electric is one
+ *     bill however it was coded. There is no per-GL row any more.
+ *   - the anomalies count surfaces in the panel.
+ *
+ * ---------------------------------------------------------------------------
+ * FOUR EDITS TO Dashboard.gs
+ * ---------------------------------------------------------------------------
+ *
+ * The view id 'utilities' is hardcoded in THREE separate places. Miss one and the tab
+ * renders but shows nothing, silently. Edits 1-3 are all required.
+ *
+ * EDIT 1 — register the view. VIEWS array, line ~36:
+ *
+ *     var VIEWS = [
+ *       { id: 'action',      label: 'Needs Attention' },
+ *       ...
+ *       { id: 'performance', label: 'Performance' },
+ *       { id: 'utilities',   label: 'Utility Billing' }      // <-- add
+ *     ];
+ *
+ * EDIT 2 — render the view. renderPage_(), line ~590:
+ *
+ *     ['leasing', 'maintenance', 'delinquency', 'renewals', 'utilities']   // <-- add
+ *       .forEach(function (v) { h.push(renderListView_(U, v)); });
+ *
+ * EDIT 3 — the client-side tab switcher. js_(), line ~1230. Replace:
+ *
+ *     'var VIEWS=["action","leasing","maintenance","delinquency","renewals","performance"];' +
+ *
+ *   with a line derived from the single source of truth, so this can never drift again:
+ *
+ *     'var VIEWS=' + JSON.stringify(VIEWS.map(function (v) { return v.id; })) + ';' +
+ *
+ *   Do EDIT 3 even if you drop this view. It is a latent bug either way.
+ *
+ * EDIT 4 — append the blocks. End of urgencies_(), immediately before `return U;` (line ~535):
+ *
+ *     U = U.concat(utilityScheduleBlocks_(pm));               // <-- add
+ *     return U;
+ *
+ * OPTIONAL — the summary panel. renderListView_(), beside the existing delinquency hook
+ * (line ~861):
+ *
+ *     if (viewId === 'utilities') h.push(utilitySchedulePanel_());
+ *
+ * ---------------------------------------------------------------------------
+ * NIGHTLY ORDER
+ * ---------------------------------------------------------------------------
+ * buildUtilitySchedule() must run BEFORE buildDashboardCache(), or the cached page
+ * serves yesterday's schedule. In installTriggers():
+ *
+ *     ['rebuildPortfolio', 4, 0],
+ *     ['buildUtilitySchedule', 4, 15],                        // <-- add
+ *     ['computeMetrics', 4, 30]
+ */
+
+// ============================================================ THE BLOCKS
+
+/**
+ * Five blocks for the Utility Billing view, worst first.
+ *
+ * House rules, same as every other list: identified by street address, TPO and excluded
+ * properties dropped, acknowledged rows hidden. sev 'bad' is what the Needs Attention
+ * banner counts as "need action now", so only genuinely overdue postings earn it.
+ *
+ * ACK KEY. Every other list keys acknowledgments on the address alone. That is wrong
+ * here: one property can carry water and energy on separate cycles, from separate
+ * providers, and an address-only key would clear them all at once. The key is
+ * address + service group + provider.
+ */
+function utilityScheduleBlocks_(pm) {
+  var sched = readTab_('Utility_Schedule');
+  var B = [];
+
+  // Tracked only. Exempt rows are recurring charges billed with rent — they have no
+  // deadline and must never appear in an operational list.
+  var rows = dropTPO_(sched).filter(function (r) { return String(r.exempt) === 'No'; });
+
+  // utility is the GROUP label now — "Water & Sewer", "Gas & Electric" — because water
+  // and sewer are one bill and SDG&E energy is one bill however it was coded.
+  function utilityOf(r) { return r.utility; }   // provider has its own column
+  // Ack key is group + provider, not GL number: one property can hold water AND energy
+  // on separate cycles, and an address-only key would clear both at once.
+  function keyOf(r) { return r.property_label + ' · ' + r.service_group +
+                             (r.provider ? ' · ' + r.provider : ''); }
+
+  /** Row in the shape renderListView_ expects. src MUST be the row itself. */
+  function mk(r, cells, sev, sortVal) {
+    return {
+      days: sortVal, sort: sortVal,
+      pm: pmOf_(pm, r.property_id, r.unit_id),   // unit_id is absent on property-level
+      key: keyOf(r),                              // bills; pmOf_ falls back to property
+      src: r,                                     // raw row — addrLink_ reads ids off it
+      cells: cells, sev: sev
+    };
+  }
+
+  function pick(status, ackList) {
+    var ack = ackSet_(ackList);
+    return rows.filter(function (r) {
+      return r.status === status && !isAcked_(ack, keyOf(r));
+    });
+  }
+
+  // ---- 1. overdue — past the deadline AND past grace. The alert list. ----------
+  var overdue = pick('OVERDUE', 'utility_late').map(function (r) {
+    return mk(r, [r.property_label, utilityOf(r), r.provider || '—',
+                  r.last_posted, r.post_by, (daySpan_(num_(r.days_late)) || '\u2014') + ' late'],
+              'bad', -num_(r.days_late));
+  }).sort(function (a, b) { return a.sort - b.sort; });
+
+  B.push(block_('Utility postings overdue', overdue,
+    ['Address', 'Utility', 'Provider', 'Last posted', 'Was due', 'Overdue by'],
+    'Past the posting deadline and past the ' + USCHED.ALERT_GRACE_DAYS + '-day grace. ' +
+    'Either the bill arrived and was not processed, or it never arrived and the provider ' +
+    'needs chasing — the schedule cannot tell those apart, so both need a person.',
+    'util_overdue', 'utilities', 'Utility_Schedule'));
+
+  // ---- 2. past the deadline, still inside grace --------------------------------
+  var pastDue = pick('PAST DUE', 'utility_late').map(function (r) {
+    return mk(r, [r.property_label, utilityOf(r), r.provider || '—',
+                  r.post_by, r.alert_after, (daySpan_(num_(r.days_late)) || '\u2014') + ' over'],
+              'warn', -num_(r.days_late));
+  }).sort(function (a, b) { return a.sort - b.sort; });
+
+  B.push(block_('Past the deadline, inside grace', pastDue,
+    ['Address', 'Utility', 'Provider', 'Was due', 'Alerts on', 'Status'],
+    'The deadline has passed but the ' + USCHED.ALERT_GRACE_DAYS + '-day grace has not. ' +
+    'Clear these and they never become alerts.',
+    'util_pastdue', 'utilities', 'Utility_Schedule'));
+
+  // ---- 3. due soon -------------------------------------------------------------
+  var dueSoon = pick('DUE SOON', 'utility_soon').map(function (r) {
+    return mk(r, [r.property_label, utilityOf(r), r.provider || '—',
+                  r.expected_posting, r.post_by, 'due ' + r.post_by],
+              'ok', 0);
+  });
+
+  B.push(block_('Due within ' + USCHED.DUE_SOON_DAYS + ' days', dueSoon,
+    ['Address', 'Utility', 'Provider', 'Posting expected', 'Post by', 'Deadline'],
+    'Work these and the overdue list stays empty.',
+    'util_duesoon', 'utilities', 'Utility_Schedule'));
+
+  // ---- 4. service period missing or wrong --------------------------------------
+  // A separate compliance failure from lateness. A charge can post on time and still
+  // not be auditable, and that is a different problem with a different fix.
+  var ackP = ackSet_('utility_period');
+  var badPeriod = rows.filter(function (r) {
+    return r.service_period_status &&
+           String(r.service_period_status).indexOf('OK') !== 0 &&
+           !isAcked_(ackP, keyOf(r));
+  }).map(function (r) {
+    // A description that disagrees with the ledger is worse than one that is missing,
+    // because it reads as correct. That one is 'bad'.
+    var disagrees = String(r.service_period_status).indexOf('DISAGREE') >= 0;
+    return mk(r, [r.property_label, utilityOf(r), r.last_posted, r.service_period,
+                  r.service_period_status], disagrees ? 'bad' : 'warn', disagrees ? -1 : 0);
+  }).sort(function (a, b) { return a.sort - b.sort; });
+
+  B.push(block_('Service period missing or wrong', badPeriod,
+    ['Address', 'Utility', 'Last posted', 'Service period', 'Problem'],
+    'The service period is what ties a charge to a period of service, for a resident and ' +
+    'for an audit. Recorded in the ledger but absent from the description is a ' +
+    'documentation gap. A description that disagrees with the ledger is worse — one of ' +
+    'the two is wrong and it looks fine either way.',
+    'util_period', 'utilities', 'Utility_Schedule'));
+
+  // ---- 5. what the scope rules removed ----------------------------------------
+  // Not a worklist — a receipt. Series are now dropped before they reach the schedule:
+  // vendor-only accounts, fewer than three postings, properties we no longer manage,
+  // and single-family homes with no evidence of manual billing. Shown so a missing
+  // property can be explained rather than assumed to be a bug.
+  var droppedRows = readTab_('Utility_Schedule_Dropped').filter(function (r) {
+    return r.property_label;
+  }).map(function (r) {
+    return { days: 0, sort: 0, pm: pmOf_(pm, r.property_id, null),
+      key: String(r.property_label) + ' \u00b7 ' + String(r.utility || ''),
+      src: r,
+      cells: [r.property_label, r.utility || '\u2014', r.provider || '\u2014',
+              num_(r.postings) + ' posting(s)', r.reason, r.detail || ''],
+      sev: 'none' };
+  });
+
+  B.push(block_('Excluded from the schedule', droppedRows,
+    ['Address', 'Utility', 'Provider', 'History', 'Reason', 'Detail'],
+    'Deliberately out of scope, not overdue. The schedule measures tenant charges only, ' +
+    'on active properties, where at least ' + USCHED_SCOPE.MIN_POSTINGS_TO_TRACK +
+    ' postings establish a real cycle. Single-family homes are excluded unless at least ' +
+    USCHED_SCOPE.MIN_MANUAL_POSTINGS_SFH + ' postings carry a hand-typed service period, ' +
+    'which is how a manual entry is recognised. Adjust any of this in USCHED_SCOPE.',
+    'util_dropped', 'utilities', 'Utility_Schedule_Dropped'));
+
+  return B;
+}
+
+// ============================================================ THE PANEL
+
+/**
+ * Summary above the tables. Uses the same .card / .cards / .sc markup as the scorecards
+ * so it matches the rest of the page without new CSS.
+ */
+function utilitySchedulePanel_() {
+  var sched = readTab_('Utility_Schedule');
+
+  if (!sched.length) {
+    return '<section class="card"><h2>Utility billing schedule</h2>' +
+      emptyState_('waiting', {
+        title: 'No schedule built yet',
+        body: 'This is <strong>not</strong> the same as having nothing outstanding \u2014 ' +
+              'the schedule has not been built.',
+        adminAction: 'The <code>Utility_Schedule</code> tab is empty. Run ' +
+          '<code>buildUtilitySchedule()</code>.'
+      }) + '</section>';
+  }
+
+  var s = utilityScheduleSummary_();
+
+  function card(n, label, sub, tone) {
+    return '<div class="sc ' + (tone || '') + '">' +
+      '<span class="sc-n">' + esc_(String(n)) + '</span>' +
+      '<span class="sc-l">' + esc_(label) + '</span>' +
+      '<span class="sc-s">' + esc_(sub) + '</span></div>';
+  }
+
+  var h = ['<section class="card"><h2>Utility billing schedule</h2>'];
+
+  h.push('<p class="note"><strong>Tenant charges only.</strong> Vendor bills and owner ' +
+    'draws are how WeLease pays the provider; this measures what the resident was charged, ' +
+    'to the standard a utility company would be held to. Active properties only, minimum ' +
+    USCHED_SCOPE.MIN_POSTINGS_TO_TRACK + ' postings to establish a cycle, single-family ' +
+    'excluded unless manually billed. What was excluded is listed at the bottom of this view.</p>');
+
+  h.push('<p class="note">Anchored on WeLease\u2019s own last posting date, so this measures ' +
+    'our consistency rather than provider variance. Clock: last posting + the inferred ' +
+    'cycle, then a ' + USCHED.POST_WINDOW_DAYS + '-day window to post, with ' +
+    USCHED.ALERT_GRACE_DAYS + ' days grace before an alert. Calendar days. A late posting ' +
+    'does not push the next deadline out. Water and sewer are one bill; SDG&amp;E gas and ' +
+    'electric are one bill however they were coded.</p>');
+
+  h.push('<div class="cards">');
+  h.push(card(s.overdue, 'Overdue', s.overdue ? 'past grace' : 'clear',
+              s.overdue ? 'bad' : 'clear'));
+  h.push(card(s.past_due, 'Past due', s.past_due ? 'inside grace' : 'clear',
+              s.past_due ? 'warn' : 'clear'));
+  h.push(card(s.due_soon, 'Due soon', 'next ' + USCHED.DUE_SOON_DAYS + ' days',
+              s.due_soon ? 'warn' : 'clear'));
+  h.push(card(s.missing_service_period, 'Service period',
+              s.missing_service_period ? 'missing or wrong' : 'all recorded',
+              s.missing_service_period ? 'warn' : 'clear'));
+  h.push(card(s.on_time_rate_pct === null ? '—' : s.on_time_rate_pct + '%',
+              'On-time posting rate',
+              s.cycles_measured + ' cycles measured', ''));
+  h.push(card(s.accounts_tracked, 'Accounts tracked',
+              s.accounts_exempt + ' exempt as recurring', ''));
+  h.push('</div>');
+
+  // The denominator travels with the rate. Under MIN_N_TO_PUBLISH, no number is shown —
+  // same house rule as every other metric on this dashboard.
+  if (s.on_time_rate_pct === null) {
+    h.push('<p class="note">On-time rate is withheld until at least ' + CFG.MIN_N_TO_PUBLISH +
+      ' completed cycles have been measured — ' + s.cycles_measured + ' so far. ' +
+      'A rate off three cycles would move 33 points on one late bill.</p>');
+  } else {
+    h.push('<p class="note">On-time rate: ' + esc_(s.on_time_rate_display) +
+      '. Exempt recurring charges are excluded from the denominator — they post with ' +
+      'rent and are trivially on time, so counting them would flatter the number.</p>');
+  }
+
+  if (s.anomalies) {
+    h.push('<p class="note">' + s.anomalies + ' data anomal(y/ies) recorded — postings coded ' +
+      'to 6174 Sewer, properties with several providers for one utility, or rows where ' +
+      'resident and vendor postings could not be told apart. See ' +
+      '<code>Utility_Schedule_Anomalies</code>. These do not affect the clock but they do ' +
+      'affect whether you can trust it.</p>');
+  }
+
+  var droppedN = readTab_('Utility_Schedule_Dropped').filter(function (r) {
+    return r.property_label;
+  }).length;
+  if (droppedN) {
+    h.push('<p class="note">' + droppedN + ' series excluded by the scope rules \u2014 ' +
+      'vendor-only, too little history, management ended, or single-family with no manual ' +
+      'billing. Listed at the bottom with a reason each, because an unexplained absence is ' +
+      'indistinguishable from a bug.</p>');
+  }
+
+  h.push('</section>');
+  return h.join('');
+}
