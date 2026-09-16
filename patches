@@ -1,0 +1,489 @@
+/**
+ * WeLease Pipeline — V3 PATCHES  ·  2026-09-16
+ *
+ * Paste-ready. Eight changes, each marked with where it goes. Nothing here replaces an
+ * existing function except where it says REPLACE.
+ *
+ *   1  SNAPSHOT.TABS          export the tabs the pipeline already builds
+ *   2  estimateAwaitingOwner_ stop presenting canceled work as a pending decision
+ *   3  pull_()                one canonical address column on every tab
+ *   4  addr_()                three cosmetic bugs
+ *   5  buildRenewalPipeline   month-to-month instead of "no renewal date"
+ *   6  ownerPackRow_          stop printing raw resident text
+ *   7  buildRentCollection    receipts grouped by property
+ *   8  Owner_Update_Scope     portfolio_id, so entities can be consolidated
+ */
+
+// =====================================================================================
+// 1. SNAPSHOT.TABS — REPLACE the TABS array in the monthly snapshot file.
+//
+// The pipeline builds ~60 tabs and the snapshot exported 21. Everything added below is
+// already rebuilt nightly; it simply never left the workbook. exportMonthlySnapshot skips
+// a missing or empty tab with a warning, so a name that turns out empty costs nothing.
+// =====================================================================================
+
+var SNAPSHOT_TABS_V3 = [
+  ['Portfolio_Summary',    'the month in one row'],
+  ['Rent_Collection',      'receipts by month, cash basis'],
+  ['Rent_Collection_ByProperty', 'receipts by month AND property — see patch 7'],
+  ['Rent_Income_GL',       'rent income from the ledger, accrual'],
+  ['Receivables_Activity', 'every resident receipt, with property_id'],   // NEW
+  ['Collections',          'vendor bills, unpaid bills, stalled approvals'], // NEW
+  ['Rent_Timing',          'when residents paid'],                         // NEW
+  ['Rent_Timing_Current',  'who still owes this month'],                   // NEW
+  ['Rent_Roll',            'every unit, rent, lease dates, status'],
+  ['Delinquency_Aged',     'balances by age bucket'],
+  ['Lease_Expirations',    'lease end dates'],
+  ['Renewal_Pipeline',     'renewals with the 80-day inspection clock'],
+  ['Work_Orders',          'maintenance, open and closed'],
+  ['Inspections',          'inspection records'],
+  ['Insurance_Owner',      'landlord policy status'],
+  ['Insurance_Tenant',     'resident policy status'],
+  ['Insurance_Outreach',   'who to chase'],
+  ['Unit_Vacancy',         'vacant units and days on market'],
+  ['Rent_Market_Variance', 'rent against market, worst first'],
+  ['Properties_Units',     'property detail and owner attribution'],       // NEW
+  ['Properties_All',       'including off-boarded properties'],            // NEW
+  ['Unit_Directory',       'canonical unit addresses'],                    // NEW
+  ['Unit_Directory_All',   'unit addresses including off-boarded'],        // NEW
+  ['Unit_Address_Book',    'the canonical address table'],                 // NEW
+  ['Owners',               'owner contact details'],                       // NEW
+  ['Owner_Update_Scope',   'who is in scope, and under what name'],        // NEW
+  ['Tenant_Tickler',       'move-ins and move-outs'],                      // NEW
+  ['Applications',         'leasing funnel'],                              // NEW
+  ['Renewals',             'renewal paperwork'],                           // NEW
+  ['Leasing_Activity',     'monthly leasing activity'],                    // NEW
+  ['Door_History',         'doors gained and lost by month'],
+  ['Metrics',              'the metric registry, current values'],
+  ['Metrics_History',      'metric values over time'],
+  ['Onboarding_Steps',     'where onboarding time goes'],
+  ['LS_Compliance',        'LeadSimple process adherence'],
+  ['_data_quality',        'field completeness audit'],
+  ['Item_Status_Log',      'what the team did about each item, and when']
+];
+// Then in the snapshot file:  SNAPSHOT.TABS = SNAPSHOT_TABS_V3;
+
+
+// =====================================================================================
+// 2. STALE ESTIMATES — add to Core, and use everywhere an approval is shown to an owner.
+//
+// estimate_approval_status is a leftover, not a state. Of 252 work orders reading
+// "Pending" on this account, 147 are CANCELED and 74 are COMPLETED. Only 31 are genuinely
+// waiting on anybody, and 169 of the stale ones closed more than sixty days ago — the
+// oldest in August 2025.
+//
+// The prototype owner brief asked Ritter-Krutop to approve #11187-3, bathtub caulking at
+// 8937 1/2 Fair Lane. That order was canceled on 6 July 2026. An owner replying "go ahead"
+// would be approving work that cannot happen.
+// =====================================================================================
+
+/** True only when an estimate is genuinely waiting on the owner. */
+function estimateAwaitingOwner_(w) {
+  if (!w) return false;
+  var st = String(w.estimate_approval_status || '').trim().toLowerCase();
+  if (st !== 'pending' && st !== 'requested' && st !== 'sent') return false;
+  if (ymd_(w.completed_on)) return false;          // work is done; nothing left to approve
+  if (ymd_(w.canceled_on)) return false;           // work was called off
+  var s = String(w.status || '').trim().toLowerCase();
+  if (s === 'canceled' || s === 'cancelled' || s === 'completed' ||
+      s === 'completed no need to bill') return false;
+  return true;
+}
+
+/** Stale approvals, for the internal QA sheet — never for an owner. */
+function staleEstimates_(workOrders) {
+  var out = [];
+  (workOrders || []).forEach(function (w) {
+    var st = String(w.estimate_approval_status || '').trim().toLowerCase();
+    if (st !== 'pending' && st !== 'requested' && st !== 'sent') return;
+    var closed = ymd_(w.canceled_on) || ymd_(w.completed_on);
+    if (!closed) return;
+    out.push({
+      work_order_number: w.work_order_number || '',
+      property: w.property_name || '',
+      closed_on: closed,
+      closed_as: ymd_(w.canceled_on) ? 'canceled' : 'completed',
+      days_stale: daysBetween_(closed, ymd_(today_())),
+      estimate_status: w.estimate_approval_status,
+      vendor: w.vendor || ''
+    });
+  });
+  out.sort(function (a, b) { return (b.days_stale || 0) - (a.days_stale || 0); });
+  return out;
+}
+
+
+// =====================================================================================
+// 3. ONE CANONICAL ADDRESS COLUMN — in pull_() and pullWindowed_(), before writeTab_.
+//
+// addr_() already produces street-number-first addresses (324 of 326 on this account).
+// The problem is that Rent_Roll, Work_Orders and Inspections carry no address column, so
+// every consumer re-derives one and each does it differently. Derive it once.
+//
+//   var n = writeTab_(tab, rows);
+// becomes
+//   rows = addAddressColumn_(tab, rows);
+//   var n = writeTab_(tab, rows);
+// =====================================================================================
+
+function addAddressColumn_(tab, rows) {
+  if (!rows || !rows.length) return rows;
+  var r0 = rows[0];
+  var hasStreet = ('property_street' in r0) || ('street' in r0) || ('unit_street' in r0);
+  var needsLookup = !hasStreet && (('unit_id' in r0) || ('property_id' in r0));
+  if (!hasStreet && !needsLookup) return rows;
+
+  var byUnit = {}, byProp = {};
+  if (needsLookup) {
+    ['Unit_Directory_All', 'Unit_Directory'].forEach(function (t) {
+      (readTab_(t) || []).forEach(function (u) {
+        if (u.unit_id && !byUnit[u.unit_id]) byUnit[u.unit_id] = u;
+        if (u.property_id && !byProp[u.property_id]) byProp[u.property_id] = u;
+      });
+    });
+    ['Properties_All', 'Properties_Units'].forEach(function (t) {
+      (readTab_(t) || []).forEach(function (p) {
+        if (p.property_id && !byProp[p.property_id]) byProp[p.property_id] = p;
+      });
+    });
+  }
+
+  var unresolved = 0;
+  var out = rows.map(function (r) {
+    var o = {};
+    Object.keys(r).forEach(function (k) { o[k] = r[k]; });
+    var src = r;
+    if (needsLookup) {
+      var f = (r.unit_id && byUnit[r.unit_id]) || (r.property_id && byProp[r.property_id]);
+      if (f) {
+        src = { property_street: f.property_street || f.unit_street || f.street || '',
+                property_street2: f.property_street2 || f.unit_street2 || f.street2 || '',
+                unit: r.unit || r.unit_name || f.unit_name || '',
+                property_name: r.property_name || f.property_name || '' };
+      } else { unresolved++; }
+    }
+    // ALWAYS set the key, even when blank. writeTab_ takes headers from unionKeys_, which
+    // samples only the first 200 rows — a conditionally-set key can be dropped silently.
+    o.address = '';
+    try { o.address = addrTidyOutput_(addr_(src)); } catch (e) { o.address = ''; }
+    return o;
+  });
+
+  if (unresolved) {
+    logError_('pipeline', 'address',
+      tab + ': ' + unresolved + ' row(s) carry no street field and could not be resolved ' +
+      'from Unit_Directory_All by unit_id or property_id. Their address column is blank ' +
+      'rather than guessed.');
+  }
+  return out;
+}
+
+
+// =====================================================================================
+// 4. addr_() COSMETIC FIXES — three bugs visible in its own output today.
+//
+//   450 W Vermont Ave ##904     24 rows   street2 already held a #, addr_ added another
+//   4195 Marzo St. #Back House  11 rows   full stop left in front of the hash
+//   45129 Via  Quivera           1 row    double space
+//
+// Rather than edit addr_() blind, wrap its output. If you prefer, fold this into addr_()
+// itself as the last line before it returns.
+// =====================================================================================
+
+function addrTidyOutput_(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/#\s*#/g, '#')
+    .replace(/\.\s*#/g, ' #')
+    .replace(/\s{2,}/g, ' ')
+    // "1134 Koe St #1134" — the unit repeats the building number already at the front.
+    .replace(/^(\d+(?:\s+1\/2)?)(\s+.*?)\s+#\s*\1$/, '$1$2')
+    .trim();
+}
+
+
+// =====================================================================================
+// 5. MONTH-TO-MONTH — in buildRenewalPipeline, REPLACE the status block.
+//
+// Frank's rule, 2026-09-16: no lease end date and no renewal means month-to-month, unless
+// a move-out is recorded. lease_expiration_detail already carries notice_given_date, so
+// the "unless" needs no new field.
+//
+// NO RENEWAL DATE is already excluded from `measurable`, so the on-time rate does not move.
+// This is presentation only — but it stops the portfolio brief and the owner report
+// describing the same 40 tenancies in two different vocabularies.
+// =====================================================================================
+
+/*  FIND:
+    if (noDate) {
+      status = 'NO RENEWAL DATE'; sev = 'warn';
+    } else if (thisCycle) {
+
+    REPLACE WITH:                                                                       */
+
+//  if (noDate) {
+//    var notice = ymd_(r.notice_given_date);
+//    if (notice) { status = 'NOTICE GIVEN'; sev = 'warn'; }
+//    else        { status = 'MONTH TO MONTH'; sev = 'none'; }
+//  } else if (thisCycle) {
+
+/*  Then in `rank`, add the two new statuses:
+      var rank = { 'OVERDUE': 0, 'DUE SOON': 1, 'NOTICE GIVEN': 2, 'SCHEDULED': 3,
+                   'DONE LATE': 4, 'NOT YET DUE': 5, 'DONE ON TIME': 6,
+                   'MONTH TO MONTH': 7 };
+
+    And in the summary, rename the field so the brief can read it:
+      month_to_month: n('MONTH TO MONTH'),
+      notice_given:   n('NOTICE GIVEN'),
+
+    And in portfolioBrief_, replace:
+      '- **No lease end date on file: ' + n('NO RENEWAL DATE') + '** — these cannot be clocked'
+    with:
+      '- **Month-to-month: ' + n('MONTH TO MONTH') + '** — no renewal date to clock, which is
+       expected rather than a failure. Excluded from the on-time rate below.'
+
+    Also: RENEWAL.HORIZON_DAYS is 240 but rebuildLeasing pulls lease_expiration_detail with
+    ends_on_to: +120 days. The horizon can never be more than half filled. Make them agree. */
+
+
+// =====================================================================================
+// 6. STOP PRINTING RAW RESIDENT TEXT — in ownerPackRow_.
+//
+// The pack prints raw job_description and raw inspection_name. Measured on the August pull:
+// 76 work orders and 61 inspection names contain a resident's name. Live examples:
+//
+//   "CEILING LEAK: Tenant Jacob called in to report a ceiling leak in their half bathroom"
+//   "Pre-Move out Inspection/ Francisco J. Palma & Anabel Fernandez"
+//   "Move in Inspection Amelia Barnes"
+//
+// The pack's own header says "No resident detail beyond lease and payment facts." The rule
+// is stated at the top of the document and broken 137 times below it. classifyInspection_
+// already exists in Inspections.gs and does exactly this job — it simply is not called here.
+// =====================================================================================
+
+var WORK_CATEGORIES = [
+  [/unit turn|make ready/i,                        'Unit turnover'],
+  [/water heater/i,                                'Water heater'],
+  [/plumb|leak|toilet|drain|faucet|sink|sewer/i,   'Plumbing'],
+  [/electric|outlet|breaker|light|wiring/i,        'Electrical'],
+  [/hvac|furnace|heat|air condition|a\/c|cooling/i,'Heating / cooling'],
+  [/pest|roach|rodent|termite|ant\b|bed bug/i,     'Pest treatment'],
+  [/refrig|stove|oven|dishwasher|washer|dryer|disposal|appliance/i, 'Appliance repair'],
+  [/smoke|detector|carbon monox/i,                 'Smoke detector service'],
+  [/paint|caulk/i,                                 'Painting and sealing'],
+  [/floor|carpet|tile/i,                           'Flooring'],
+  [/roof|gutter/i,                                 'Roofing'],
+  [/window|door|screen/i,                          'Windows and doors'],
+  [/lock|key|rekey/i,                              'Locks and keys'],
+  [/landscap|tree|yard|irrigat|lawn/i,             'Landscaping'],
+  [/gate|fence/i,                                  'Fencing and gates'],
+  [/mold|mildew|moist/i,                           'Moisture'],
+  [/garage/i,                                      'Garage'],
+  [/clean/i,                                       'Cleaning'],
+  [/trash|junk|haul|debris/i,                      'Waste removal'],
+  [/inspect/i,                                     'Inspection follow-up']
+];
+
+/** A neutral category for a work order. NEVER returns source text. */
+function workCategory_(w) {
+  if (!w) return 'General repair';
+  if (String(w.work_order_type || '').trim().toLowerCase() === 'unit turn') return 'Unit turnover';
+  var hay = String(w.vendor_trade || '') + ' ' + String(w.work_order_type || '') + ' ' +
+            String(w.job_description || '');
+  for (var i = 0; i < WORK_CATEGORIES.length; i++) {
+    if (WORK_CATEGORIES[i][0].test(hay)) return WORK_CATEGORIES[i][1];
+  }
+  return 'General repair';
+}
+
+/** A neutral label for an inspection, via the classifier that already exists. */
+var INSPECTION_LABELS = {
+  move_in: 'Move-in inspection', move_out: 'Move-out inspection',
+  pre_move_out: 'Pre-move-out inspection', annual: 'Annual inspection',
+  turnover_completion: 'Turnover inspection', make_ready: 'Make-ready inspection',
+  vacancy_visit: 'Vacancy check', initial: 'Initial inspection',
+  insurance_visit: 'Inspection for insurance records', maintenance_visit: 'Maintenance visit',
+  compliance_visit: 'Compliance visit', follow_up: 'Follow-up visit',
+  ad_hoc: 'Property visit', junk: 'Property visit', unclassified: 'Property inspection'
+};
+
+function inspectionLabel_(name) {
+  var c = (typeof classifyInspection_ === 'function')
+    ? classifyInspection_(name) : { type: 'unclassified' };
+  return INSPECTION_LABELS[c.type] || 'Property inspection';
+}
+
+/*  IN ownerPackRow_, REPLACE the three places that print source text:
+
+    FIND:
+      lines.push('  - ' + (w.work_order_type || 'work order') + ' — ' +
+                 String(w.job_description || '').slice(0, 90) +
+                 (w.vendor ? ' (' + w.vendor + ')' : '') +
+                 ', completed ' + ymd_(w.completed_on));
+    REPLACE:
+      lines.push('  - ' + workCategory_(w) +
+                 (w.vendor ? ' (' + w.vendor + ')' : '') +
+                 ', completed ' + ymd_(w.completed_on));
+
+    FIND:
+      lines.push('  - ' + (i.inspection_name || 'inspection') + ' on ' +
+                 (ymd_(i.inspected_on) || ymd_(i.marked_done_on)));
+    REPLACE:
+      lines.push('  - ' + inspectionLabel_(i.inspection_name) + ' on ' +
+                 (ymd_(i.inspected_on) || ymd_(i.marked_done_on)));
+
+    FIND:
+      lines.push('  - ' + String(w.job_description || 'work order').slice(0, 80) +
+                 (age !== null ? ' — open ' + daySpan_(age) : '') +
+                 (w.vendor ? ', with ' + w.vendor : ', NO VENDOR ASSIGNED'));
+    REPLACE:
+      lines.push('  - ' + workCategory_(w) +
+                 (age !== null ? ' — open ' + daySpan_(age) : '') +
+                 (w.vendor ? ', with ' + w.vendor : ', NO VENDOR ASSIGNED'));
+
+    AND the decision candidate, which currently quotes the description and does not check
+    whether the estimate is still live:
+
+    FIND:
+      if (String(w.estimate_approval_status || '').toLowerCase().indexOf('pend') !== -1) {
+        cand.push('Estimate awaiting approval: ' +
+                  String(w.job_description || 'work order').slice(0, 70) + '.');
+      }
+    REPLACE:
+      if (estimateAwaitingOwner_(w)) {
+        cand.push('Estimate awaiting approval: ' + workCategory_(w) +
+                  (w.vendor ? ' with ' + w.vendor : '') + '.');
+      }                                                                                  */
+
+
+// =====================================================================================
+// 7. RECEIPTS BY PROPERTY — add to buildRentCollection, after the existing loop.
+//
+// Receivables_Activity already carries property_id (see COLS.receivables_activity), so
+// this needs no new AppFolio call. The existing monthly roll-up is untouched.
+// =====================================================================================
+
+function buildRentCollectionByProperty(monthsBack) {
+  var t0 = new Date().getTime();
+  monthsBack = monthsBack || 12;
+  var rec = inScopeIncludingInactive_(readTab_('Receivables_Activity'));
+
+  var agg = {};
+  rec.forEach(function (r) {
+    var m = monthKey_(r.txn_receipt_date);
+    var pid = String(r.property_id || '');
+    var amt = num_(r.txn_amount);
+    if (!m || !pid || amt === null) return;
+    var k = m + '|' + pid;
+    var b = agg[k] || (agg[k] = { month: m, property_id: pid, property_name: r.property_name || '',
+                                  collected: 0, refunds: 0, receipts: 0, households: {} });
+    b.collected += amt;
+    if (amt < 0) b.refunds += amt;
+    if (amt > 0) { b.receipts++; if (r.occupancy_id) b.households[r.occupancy_id] = 1; }
+  });
+
+  // Rent charged per property, so a collection rate can be stated per owner.
+  var chargedByProp = {};
+  dropTPO_(readTab_('Rent_Roll')).forEach(function (r) {
+    if (String(r.status || '').toLowerCase().indexOf('current') === -1) return;
+    var pid = String(r.property_id || '');
+    if (!pid) return;
+    chargedByProp[pid] = (chargedByProp[pid] || 0) + (num_(r.rent) || 0);
+  });
+
+  var thisMonth = monthKey_(ymd_(today_()));
+  var rows = Object.keys(agg).sort().map(function (k) {
+    var b = agg[k];
+    var charged = chargedByProp[b.property_id];
+    return {
+      month: b.month,
+      property_id: b.property_id,
+      property_name: b.property_name,
+      is_partial: (b.month === thisMonth) ? 'YES' : '',
+      rent_charged_now: charged === undefined ? null : round2_(charged),
+      rent_collected: round2_(b.collected),
+      refunds_and_reversals: round2_(b.refunds),
+      receipts: b.receipts,
+      households_paying: Object.keys(b.households).length,
+      // Rent charged is TODAY's rent roll, not the rent in force in that month. Fine for the
+      // current month, unreliable for history — which is why the column says "_now".
+      collected_vs_charged_pct: (b.month === thisMonth || !charged || charged <= 0) ? null
+        : round1_(b.collected / charged * 100),
+      basis: 'collected = every resident receipt on that property, cash basis, not rent only'
+    };
+  });
+
+  writeTab_('Rent_Collection_ByProperty', rows);
+  logRun_('buildRentCollectionByProperty', 'derived', 'Rent_Collection_ByProperty',
+          rows.length, new Date().getTime() - t0,
+          rows.length + ' property-month(s) across ' +
+          Object.keys(chargedByProp).length + ' properties');
+  return { rows: rows.length };
+}
+// Add to buildPortfolio's job list, after rent_collection:
+//   ['rent_collection_by_property', function () { return buildRentCollectionByProperty(12); }]
+
+
+// =====================================================================================
+// 8. PORTFOLIO CONSOLIDATION — Owner_Update_Scope gains one column.
+//
+// owner_key is matched exactly against p.owners, and buildOwnerPacks groups on that raw
+// string. So Engy Said's six LLCs produce six packs, and Ritter-Krutop and Wisdom Holdings
+// produce two. The 12-owner roster cannot be expressed at all.
+//
+// portfolio_id blank means "this entity stands alone", so every existing row keeps working
+// untouched. Fill it in only where entities belong together.
+// =====================================================================================
+
+/*  IN setupOwnerUpdateScope, REPLACE the headers line:
+
+      var headers = ['owner_key', 'doors', 'include', 'preferred_name', 'contact_email',
+                     'prepared_by', 'notes'];
+    WITH:
+      var headers = ['portfolio_id', 'owner_key', 'doors', 'include', 'preferred_name',
+                     'contact_email', 'prepared_by', 'notes'];
+
+    and in the row builder add:   portfolio_id: e.portfolio_id || '',
+
+    IN buildOwnerPacks, REPLACE the scope loop so several owner_keys can share a pack:     */
+
+function ownerPackGroups_(scope) {
+  var groups = {}, order = [];
+  scope.forEach(function (s) {
+    var id = String(s.portfolio_id || '').trim() || String(s.owner_key || '').trim();
+    if (!groups[id]) {
+      groups[id] = { portfolio_id: id, keys: [], preferred_name: '', contact_email: '',
+                     prepared_by: '', notes: '' };
+      order.push(id);
+    }
+    var g = groups[id];
+    g.keys.push(String(s.owner_key || '').trim());
+    // First non-blank wins, so one row carries the display name for the whole portfolio.
+    ['preferred_name', 'contact_email', 'prepared_by', 'notes'].forEach(function (f) {
+      if (!g[f] && s[f]) g[f] = s[f];
+    });
+  });
+  return order.map(function (id) { return groups[id]; });
+}
+
+/*  Then:
+      ownerPackGroups_(scope).forEach(function (g) {
+        var mine = [];
+        g.keys.forEach(function (k) { (byOwner[k] || []).forEach(function (p) { mine.push(p); }); });
+        rows.push(ownerPackRow_(g, g.preferred_name || g.keys[0], mine, month, t, ix));
+      });
+
+    Example rows once the column exists:
+
+      portfolio_id      owner_key                      include  preferred_name
+      ritter_krutop     Ritter-Krutop Family Trust     YES      Ritter-Krutop Family Portfolio
+      ritter_krutop     Wisdom Holdings LLC
+      engy_said         Alicante Olive LLC             YES      Engy Said
+      engy_said         Carnegie Homes LLC
+      engy_said         Euclid Homes LLC
+      engy_said         L Street Homes LLC
+      engy_said         Mass General Homes LLC
+      engy_said         New Jersey Homes LLC
+
+    Ritter-Krutop is kristina@hawthornandalbatross.com and Wisdom Holdings is
+    matt@hawthornandalbatross.com — same domain, different person. Grouping them is a
+    decision, not a lookup, which is exactly why it belongs in a tab a human maintains. */
