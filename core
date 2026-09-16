@@ -1,0 +1,1596 @@
+/**
+ * WeLease Pipeline — CORE  v2.0.0 · 2026-08-04
+ * APPFOLIO-ONLY ACTIVE BUILD
+ *
+ * LeadSimple went live 2026-08-10 (see LeadSimple.gs). ShowMojo remains behind its
+ * SYSTEMS flag with its adapter intact — reconnecting is: set credentials, flip
+ * enabled to true. No code rewrite, no registry surgery.
+ *
+ * REPLACES Core.gs entirely. Delete the old file — do not keep both.
+ *
+ * SCRIPT PROPERTIES (Project Settings):
+ *   Required now:
+ *     APPFOLIO_CLIENT_ID, APPFOLIO_CLIENT_SECRET, REGISTRY_FILE_ID,
+ *     LEADSIMPLE_API_KEY
+ *     SHOWMOJO_API_TOKEN          (ShowMojo went live 2026-08-12)
+ *
+ *   DELETE LS_AUTH_MODE if it exists. LeadSimple.gs always sends the raw
+ *   Authorization header, which is the only scheme that authenticates. Leaving the
+ *   property around invites someone to "fix" it back to a mode that returns 401.
+ */
+
+// ============================================================ SYSTEM REGISTRY
+
+var SYSTEMS = {
+  appfolio: {
+    enabled: true,
+    label: 'AppFolio',
+    base: 'https://welease.appfolio.com/api/v2/reports',
+    sleepMs: 2500,                       // 7 req / 15 sec
+    requiredProps: ['APPFOLIO_CLIENT_ID', 'APPFOLIO_CLIENT_SECRET']
+  },
+  leadsimple: {
+    enabled: true,                       // resolved 2026-08-10
+    label: 'LeadSimple',
+    base: 'https://api.leadsimple.com/rest',
+    // Unused by LeadSimple.gs, which paces on the RECORD counters LeadSimple returns
+    // in every response. A fixed request sleep cannot respect a 1000-records/minute
+    // ceiling — at 200 records a page it would run ten times over it.
+    sleepMs: 1200,
+    requiredProps: ['LEADSIMPLE_API_KEY']
+    // blockedReason removed. It was never the vendor: lsGet_ defaulted LS_AUTH_MODE to
+    // 'x-api-key', and only the raw Authorization header authenticates. Every other
+    // mode returns the exact "Invalid Access Token" string that got recorded here.
+  },
+  showmojo: {
+    enabled: true,                       // resolved 2026-08-12
+    label: 'ShowMojo',
+    base: 'https://showmojo.com',
+    sleepMs: 600,                        // 400-600ms between calls runs clean
+    requiredProps: ['SHOWMOJO_API_TOKEN']
+    // blockedReason removed. It was never the vendor either: smReport_ sent a Bearer
+    // header (ShowMojo returns 401) and read data.results at the top level instead of
+    // unwrapping response.data. Two bugs recorded as "no response".
+  }
+};
+
+function systemEnabled_(name) {
+  return !!(SYSTEMS[name] && SYSTEMS[name].enabled);
+}
+
+
+// ============================================================ CONFIG
+
+var CFG = {
+  TZ: 'America/Los_Angeles',
+  AF_PAGE_LIMIT: 5000,
+  LS_PER_PAGE: 200,
+  MAX_RETRIES: 4,
+  BACKOFF_BASE_MS: 3000,
+
+  // Compliance thresholds — CONFIGURABLE ON PURPOSE.
+  // California Civil Code 1950.5 governs security deposit handling. This is
+  // WeLease's stated operating standard, not a legal determination. Confirm with
+  // counsel. Changing it here changes every downstream number.
+  DEPOSIT_DISPOSITION_DAYS: 21,
+  WORK_ORDER_AGING_DAYS: 14,
+  MIN_N_TO_PUBLISH: 30,
+
+  LOG_TAB: '_refresh_log',
+  ERROR_TAB: '_errors'
+};
+
+var DEPOSIT_GL = {
+  MGMT_HELD:      [12, 13, 15, 132],   // 2100, 2101, 2102, 2108 — WeLease owns the clock
+  OWNER_HELD:     [14, 16, 135],       // 2103, 2104, 2109 — cannot measure, flag only
+  FORFEIT:        [43],                // 4500
+  OWNER_REFUNDED: [134, 107],          // 4300, 2106
+  DEPOSIT_CASH:   [3]                  // 1160
+};
+
+function prop_(key, required) {
+  var v = PropertiesService.getScriptProperties().getProperty(key);
+  if (!v && required !== false) throw new Error('Missing Script Property: ' + key);
+  return v;
+}
+
+// ============================================================ APPFOLIO ADAPTER
+
+/**
+ * POST an AppFolio report. Trust the SLUG, never the AppFolio UI title —
+ * they frequently disagree.
+ */
+/**
+ * AppFolio returns next_page_url as a PATH, not an absolute URL. Passing it
+ * straight to UrlFetchApp produces "http:///api/v2/..." — empty host, bad request.
+ * Any report large enough to paginate hits this.
+ */
+function afOrigin_() {
+  var m = String(SYSTEMS.appfolio.base).match(/^(https?:\/\/[^\/]+)/);
+  return m ? m[1] : 'https://welease.appfolio.com';
+}
+
+function afAbsUrl_(u, basePath) {
+  if (!u) return null;
+  u = String(u).trim();
+  if (/^https?:\/\/[^\/]/.test(u)) return u;              // already absolute with a host
+  u = u.replace(/^https?:\/\/+/, '/');                     // "http:///path" -> "/path"
+  if (u.indexOf('//') === 0) return 'https:' + u;           // protocol-relative
+
+  // QUERY-ONLY next_page_url — "?metadata_id=bill_detail_...&page=1" with no path at all.
+  // Some reports return it this way, and pasting it onto the origin gave
+  // "https://host/?metadata_id=..." — the account root, not the report, hence a 404 and
+  // zero vendor bills every night. The path has to come from the report we asked for.
+  if (u.charAt(0) === '?') {
+    if (!basePath) return null;                             // no path to hang it on
+    return (/^https?:\/\//.test(basePath) ? basePath : afOrigin_() + basePath) + u;
+  }
+
+  return afOrigin_() + (u.charAt(0) === '/' ? u : '/' + u);
+}
+
+/**
+ * The query half of a URL, as an object. Used to carry pagination params from a
+ * next_page_url into a POST body.
+ */
+function afQueryParams_(url) {
+  var q = String(url || '');
+  var i = q.indexOf('?');
+  if (i === -1) return {};
+  var out = {};
+  q.slice(i + 1).split('&').forEach(function (pair) {
+    if (!pair) return;
+    var eq = pair.indexOf('=');
+    var k = decodeURIComponent(eq === -1 ? pair : pair.slice(0, eq)).replace(/\+/g, ' ');
+    var v = eq === -1 ? '' : decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, ' '));
+    if (k) out[k] = v;
+  });
+  return out;
+}
+
+function afReport_(slug, body, opts) {
+  opts = opts || {};
+  var maxPages = opts.maxPages || 50;
+  var payload = body || {};
+  if (opts.paginate === false) payload.paginate_results = false;
+
+  var maxRows = opts.maxRows || 60000;
+  var reportUrl = SYSTEMS.appfolio.base + '/' + slug + '.json';
+  var rows = [], page = 0, next = null;
+  // If the POST fallback below is ignored by the server it will hand back page 1 again,
+  // with the same next_page_url — and this loop would happily re-fetch it until maxPages,
+  // producing 20 copies of the same 5,000 rows. A repeated URL means no progress, so stop.
+  var seenNext = {};
+  while (page < maxPages) {
+    var resp;
+    if (page === 0) {
+      resp = afCall_('post', reportUrl, payload);          // page 1 failing is a real failure
+    } else {
+      // A later page failing should cost that page, not the whole report. bill_detail
+      // returned page 1 fine and 404'd on page 2, and the throw discarded everything —
+      // so a pagination bug looked exactly like "this account has no vendor bills".
+      try {
+        resp = afCall_('get', next, null);
+      } catch (eGet) {
+        // A GET on a report route returns 404. These endpoints are POST-only, and
+        // bill_detail is simply the first report big enough to ever ask for a second page
+        // — so this path had never actually run. The pagination params live in the
+        // next_page_url's query string; carry them into a POST body instead.
+        var retryPayload = null;
+        try {
+          retryPayload = afQueryParams_(next);
+          Object.keys(payload).forEach(function (k) {
+            if (!(k in retryPayload)) retryPayload[k] = payload[k];
+          });
+          resp = afCall_('post', reportUrl, retryPayload);
+          if (page === 1) {
+            logRun_('afReport_', 'appfolio', slug, 0, 0,
+              'Pagination fell back to POST — GET on the report route returns 404. ' +
+              'Expected, not a fault.');
+          }
+        } catch (ePost) {
+          logError_('appfolio', slug,
+            'Page ' + (page + 1) + ' failed as a GET (' + eGet.message.split('\n')[0] + ') ' +
+            'and as a POST (' + ePost.message.split('\n')[0] + '). Keeping the ' +
+            rows.length + ' row(s) already fetched — treat this report as INCOMPLETE. ' +
+            'Params tried: ' + JSON.stringify(retryPayload || afQueryParams_(next)));
+          break;
+        }
+      }
+    }
+
+    var data = resp.parsed;
+    rows = rows.concat(data.results || (Array.isArray(data) ? data : []));
+    // reportUrl is passed so a query-only next_page_url has a path to attach to.
+    next = afAbsUrl_(data.next_page_url, reportUrl);
+    if (!next) break;
+    if (seenNext[next]) {
+      logError_('appfolio', slug,
+        'Pagination stopped making progress — the server returned the same next page twice ' +
+        '(' + next + '). Kept ' + rows.length + ' row(s); this report is INCOMPLETE. Narrow ' +
+        'the date range so it fits in one page.');
+      break;
+    }
+    seenNext[next] = 1;
+    if (rows.length >= maxRows) {
+      logError_('appfolio', slug, 'Stopped at maxRows (' + maxRows + '). Narrow the date range or add filters.');
+      break;
+    }
+    page++;
+    Utilities.sleep(SYSTEMS.appfolio.sleepMs);
+  }
+  if (page >= maxPages) logError_('appfolio', slug, 'Hit maxPages — data may be truncated.');
+  return rows;
+}
+
+
+/**
+ * A date-ranged report pulled in windows, so pagination never has to work.
+ *
+ * bill_detail over a 400-day lookback is well past the 5,000-row page limit, and paging it
+ * depends on the server accepting a second request the way we send it. Splitting the range
+ * up front does not — each window is its own page-one POST, which is the request shape that
+ * has always worked.
+ *
+ * A window that comes back at the row cap is split in half and retried, because a full page
+ * means the window was too wide and rows were silently dropped off the end.
+ *
+ *   slug     report name
+ *   body     the usual filters, WITHOUT the two date keys
+ *   fromKey  e.g. 'occurred_on_from'      toKey  e.g. 'occurred_on_to'
+ *   from,to  'yyyy-MM-dd'
+ */
+function afReportWindowed_(slug, body, fromKey, toKey, from, to, opts) {
+  opts = opts || {};
+  var windowDays = opts.windowDays || 90;
+  var pageCap = opts.pageCap || 5000;
+  var minDays = 2;                       // below this, splitting cannot help
+  var out = [], windows = 0;
+
+  function pull(a, b, depth) {
+    var payload = {};
+    Object.keys(body || {}).forEach(function (k) { payload[k] = body[k]; });
+    payload[fromKey] = a;
+    payload[toKey] = b;
+
+    var rows = afReport_(slug, payload, { maxPages: opts.maxPages || 3,
+                                          maxRows: opts.maxRows || 60000 });
+    windows++;
+
+    var span = daysBetween_(a, b);
+    if (rows.length >= pageCap && span !== null && span > minDays && depth < 6) {
+      // The window filled a page exactly. Assume it was truncated and halve it.
+      var mid = ymd_(addDays_(parseDate_(a), Math.floor(span / 2)));
+      // rows from this attempt are dropped, not merged — the two halves re-fetch them.
+      pull(a, mid, depth + 1);
+      pull(ymd_(addDays_(parseDate_(mid), 1)), b, depth + 1);
+      return;
+    }
+    out = out.concat(rows);
+    sleepFor_('appfolio');
+  }
+
+  var cur = parseDate_(from), stop = parseDate_(to);
+  if (!cur || !stop) {
+    logError_('appfolio', slug, 'Unreadable window ' + from + '..' + to + ' — pulling ' +
+              'the whole range in one call instead.');
+    var p = {}; Object.keys(body || {}).forEach(function (k) { p[k] = body[k]; });
+    p[fromKey] = from; p[toKey] = to;
+    return afReport_(slug, p, opts);
+  }
+
+  var guard = 0;
+  while (cur.getTime() <= stop.getTime() && guard++ < 40) {
+    var end = addDays_(cur, windowDays - 1);
+    if (end.getTime() > stop.getTime()) end = stop;
+    pull(ymd_(cur), ymd_(end), 0);
+    cur = addDays_(end, 1);
+  }
+
+  logRun_('afReportWindowed_', 'appfolio', slug, out.length, 0,
+          from + ' to ' + to + ' in ' + windows + ' window(s) of ' + windowDays + ' days');
+  return out;
+}
+
+function afCall_(method, url, payload) {
+  var auth = 'Basic ' + Utilities.base64Encode(
+    prop_('APPFOLIO_CLIENT_ID') + ':' + prop_('APPFOLIO_CLIENT_SECRET'));
+  var options = {
+    method: method,
+    headers: { 'Authorization': auth, 'Accept': 'application/json' },
+    muteHttpExceptions: true
+  };
+  // AppFolio returns HTTP 406 without this. Do not remove.
+  if (method === 'post') {
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify(payload || {});
+  }
+  return httpWithRetry_(url, options, 'appfolio');
+}
+
+// ============================================================ DORMANT ADAPTERS
+// Intact and tested-by-shape. Guarded so they cannot run while disabled.
+
+function lsGet_(path, params, opts) {
+  // Retired, not deleted, so the failure names itself. This adapter slept a fixed
+  // 1200 ms between requests, which says nothing about the 1000 records/minute
+  // ceiling LeadSimple actually enforces — the sixth consecutive 200-record page
+  // returns 429. LeadSimple.gs paces on the record counters instead.
+  throw new Error('lsGet_ is retired. Use lsPaged_ / lsGet2_ in LeadSimple.gs — the old ' +
+                  'adapter paced on requests, not records, and exceeded the account limit.');
+}
+
+var LS_OUT_OF_SCOPE = ['/properties', '/units', '/property_groups', '/contacts',
+  '/conversations', '/text_messages', '/calls', '/notes', '/uploaded_files',
+  '/webhook_subscriptions', '/accounts'];
+
+function lsAssertInScope_(path) {
+  LS_OUT_OF_SCOPE.forEach(function (p) {
+    if (path.indexOf(p) === 0) {
+      throw new Error('OutOfScope: ' + path + ' — AppFolio is the system of record for that data.');
+    }
+  });
+}
+
+/** ShowMojo: form-urlencoded (NOT JSON), and no pagination — always bound by date. */
+function smReport_(reportName, startDate, endDate, opts) {
+  // Retired, not deleted, so the failure names itself rather than 401-ing quietly.
+  //
+  // Two bugs, both verified 2026-08-12:
+  //   1. Sent 'Bearer <token>'. ShowMojo requires  Token token="<token>"  and returns
+  //      401 for anything else.
+  //   2. Read data.results / data.data at the top level. Every ShowMojo response wraps
+  //      results as {"response":{"status":..,"data":[..]}}, so this found nothing even
+  //      when the call succeeded.
+  //
+  // ShowMojo.gs does it correctly. This is the same shape of mistake as LeadSimple's
+  // LS_AUTH_MODE default — a one-line auth error recorded as a vendor problem.
+  throw new Error('smReport_ is retired. Use smFetch_ in ShowMojo.gs — this adapter ' +
+                  'sent a Bearer header and never unwrapped the response envelope.');
+}
+
+function httpWithRetry_(url, options, system) {
+  var attempt = 0, lastErr = null;
+  while (attempt <= CFG.MAX_RETRIES) {
+    var resp;
+    try { resp = UrlFetchApp.fetch(url, options); }
+    catch (e) {
+      lastErr = e;
+      Utilities.sleep(CFG.BACKOFF_BASE_MS * Math.pow(2, attempt++));
+      continue;
+    }
+    var code = resp.getResponseCode(), text = resp.getContentText();
+
+    if (code >= 200 && code < 300) {
+      try { return { code: code, parsed: JSON.parse(text), raw: text }; }
+      catch (e) { throw new Error(system + ' returned non-JSON (HTTP ' + code + '): ' + text.slice(0, 300)); }
+    }
+    if (code === 429) {
+      // attempt++ used to live in the FALSE branch of the ternary only. When the API
+      // sends a retry-after header — which is exactly when a real 429 happens — the
+      // counter never moved and `while (attempt <= MAX_RETRIES)` never terminated. It
+      // did not give up after four tries; it spun until Apps Script killed the
+      // execution at six minutes, with no partial result and no readable error.
+      // Applies to every API here, AppFolio included.
+      var h = resp.getAllHeaders();
+      var wait = parseInt(h['X-RateLimit-Retry-After'] || h['x-ratelimit-retry-after'] || 0, 10);
+      attempt++;
+      Utilities.sleep(wait > 0 ? wait * 1000 : CFG.BACKOFF_BASE_MS * Math.pow(2, attempt));
+      continue;
+    }
+    if (code >= 500) {
+      lastErr = new Error(system + ' HTTP ' + code + ': ' + text.slice(0, 200));
+      Utilities.sleep(CFG.BACKOFF_BASE_MS * Math.pow(2, attempt++));
+      continue;
+    }
+    // 4xx other than 429 — not retryable. Fail loudly: AppFolio 400 bodies name
+    // the exact filter combination that broke.
+    throw new Error(system + ' HTTP ' + code + ' — ' + url + '\n' + text.slice(0, 500));
+  }
+  throw lastErr || new Error(system + ': exhausted retries for ' + url);
+}
+
+function buildQuery_(obj) {
+  return Object.keys(obj).filter(function (k) {
+    return obj[k] !== null && obj[k] !== undefined && obj[k] !== '';
+  }).map(function (k) {
+    return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k]);
+  }).join('&');
+}
+
+// ============================================================ SHEET I/O
+
+/** Empty dates write as null, never '' — empty strings break Looker type detection. */
+function writeTab_(tabName, rows, opts) {
+  opts = opts || {};
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
+
+  if (!rows || !rows.length) {
+    sh.clear();
+    sh.getRange(1, 1).setValue('No rows returned ' + nowStamp_());
+    return 0;
+  }
+  var headers = opts.headers || unionKeys_(rows);
+  var out = [headers];
+  rows.forEach(function (r) {
+    out.push(headers.map(function (h) {
+      var v = r[h];
+      if (v === undefined || v === '' || v === null) return null;
+      return (typeof v === 'object') ? JSON.stringify(v) : v;
+    }));
+  });
+  sh.clear();
+  // Plain-text format on month columns BEFORE the values land. '2026-08' is a date-like
+  // string, so Sheets stores it as a real date and readTab_ hands back a Date — which is
+  // how an August figure came to be labelled July on the rent tile. monthNorm_ repairs it
+  // on read; this stops it happening. Applied to any column named month or *_month.
+  var monthCols = [];
+  headers.forEach(function (h, i) {
+    if (/^month$|_month$|^month_/.test(String(h))) monthCols.push(i + 1);
+  });
+  monthCols.forEach(function (c) {
+    try { sh.getRange(2, c, Math.max(1, out.length - 1), 1).setNumberFormat('@'); } catch (e) {}
+  });
+
+  sh.getRange(1, 1, out.length, headers.length).setValues(out);
+  sh.setFrozenRows(1);
+  sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  try { invalidateTab_(tabName); } catch (e) {}
+  return rows.length;
+}
+
+/**
+ * Append rows to a tab, keeping to whatever header row the sheet already has.
+ *
+ * WHY THIS READS THE SHEET'S OWN HEADER. The old version wrote a header only when the tab
+ * was empty, then wrote every subsequent batch positionally against the headers the CALLER
+ * computed. The moment a builder gained a field, the two disagreed and every value after
+ * the new one landed one column to the left of its heading — silently, in a tab that had
+ * been correct for months.
+ *
+ * That is exactly what adding `view` to the Throughput ledger did: `view` went into the
+ * `open_now` column, `open_now` into `added`, and so on down the row. Nothing errored.
+ * The Throughput panel simply started reading a tab name where it expected a count.
+ *
+ * So the sheet's header row is now the authority. A key the sheet has never seen is added
+ * as a NEW column at the end, which is safe for readers (they key by name) and reversible.
+ * A key the caller omits writes blank rather than shifting the row.
+ */
+function appendTab_(tabName, rows, headers) {
+  if (!rows || !rows.length) return 0;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
+  headers = headers || unionKeys_(rows);
+
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  } else {
+    // Reconcile against what is actually on the sheet.
+    var live = sh.getRange(1, 1, 1, Math.max(1, sh.getLastColumn())).getValues()[0]
+      .map(function (h) { return String(h === null || h === undefined ? '' : h).trim(); });
+    while (live.length && !live[live.length - 1]) live.pop();
+
+    if (live.length) {
+      var have = {};
+      live.forEach(function (h) { have[h] = true; });
+      // Any key on the incoming rows that the sheet has no column for.
+      var extra = [];
+      var wanted = unionKeys_(rows);
+      headers.concat(wanted).forEach(function (h) {
+        if (h && !have[h] && extra.indexOf(h) === -1) extra.push(h);
+      });
+      if (extra.length) {
+        sh.getRange(1, live.length + 1, 1, extra.length)
+          .setValues([extra]).setFontWeight('bold');
+        // Guarded: logError_ appends, so logging a header change on the ERROR tab itself
+        // would call back into here. Silence there rather than risk the loop.
+        if (tabName !== CFG.ERROR_TAB) {
+          logError_('core', 'appendTab_',
+            tabName + ': added column' + (extra.length > 1 ? 's' : '') + ' ' + extra.join(', ') +
+            ' to match the data. Rows written before now hold no value there.');
+        }
+      }
+      headers = live.concat(extra);
+    }
+  }
+
+  var out = rows.map(function (r) {
+    return headers.map(function (h) {
+      var v = r[h];
+      // typeof null === 'object', so the old one-liner sent null to JSON.stringify and
+      // wrote the literal text "null" into the cell. Every tab written through here
+      // carries those — Metrics_History, LS_Tasks_Completed, the lot — and they read
+      // back as a four-character string rather than an empty cell. writeTab_ always
+      // checked for null; this did not.
+      if (v === undefined || v === '' || v === null) return null;
+      return (typeof v === 'object') ? JSON.stringify(v) : v;
+    });
+  });
+  sh.getRange(sh.getLastRow() + 1, 1, out.length, headers.length).setValues(out);
+  try { invalidateTab_(tabName); } catch (e) {}
+  return out.length;
+}
+
+function unionKeys_(rows) {
+  var seen = {}, keys = [];
+  for (var i = 0; i < Math.min(rows.length, 200); i++) {
+    for (var k in rows[i]) if (!seen[k]) { seen[k] = true; keys.push(k); }
+  }
+  return keys;
+}
+
+/**
+ * NEITHER OF THESE MAY THROW. This is not defensive tidiness — it is the difference
+ * between a degraded panel and a blank page.
+ *
+ * Since the web app runs as "User accessing the web app", the spreadsheet is opened as
+ * the VISITOR. Anyone without edit access cannot append a row, so every one of these
+ * calls throws for them. Nineteen of them sit inside catch blocks in the render path:
+ *
+ *     try { h.push(somePanel_()); }
+ *     catch (e) { logError_('dashboard', 'somePanel_', e.message); }   // <- throws again
+ *
+ * A throw from inside the handler escapes the catch and takes the whole page with it. So
+ * a panel failing gracefully for the owner became a white screen for a viewer, and the
+ * error log — the one place that would have explained it — is exactly what could not be
+ * written. Swallowing here is the correct behaviour.
+ *
+ * The failure is not lost: writability is probed once per execution and reported on the
+ * page, so a read-only visitor is told why nothing they do is saving.
+ */
+var _canWrite = null;
+
+/** Can this visitor write to the workbook at all? Probed once, cheaply. */
+function canWrite_() {
+  if (_canWrite !== null) return _canWrite;
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    // getEditors() throws for a viewer, and touches no data. Cheaper and safer than
+    // writing a probe row and having to remember to remove it.
+    ss.getEditors();
+    _canWrite = true;
+  } catch (e) {
+    _canWrite = false;
+  }
+  return _canWrite;
+}
+
+function logRun_(job, system, tab, count, ms, note) {
+  try {
+    appendTab_(CFG.LOG_TAB, [{ run_at: nowStamp_(), job: job, system: system, tab: tab,
+      rows: count, duration_sec: Math.round(ms / 1000), note: note || null }],
+      ['run_at', 'job', 'system', 'tab', 'rows', 'duration_sec', 'note']);
+  } catch (e) {
+    _canWrite = false;
+    try { Logger.log('logRun_ could not write: ' + e.message); } catch (e2) {}
+  }
+}
+
+function logError_(system, context, message) {
+  try {
+    appendTab_(CFG.ERROR_TAB, [{ run_at: nowStamp_(), system: system, context: context,
+      message: String(message).slice(0, 500) }],
+      ['run_at', 'system', 'context', 'message']);
+  } catch (e) {
+    // Remembered rather than swallowed silently, so the page can say so once.
+    _canWrite = false;
+    try { Logger.log('logError_ could not write: ' + system + '/' + context + ': ' + message); }
+    catch (e2) {}
+  }
+}
+
+/**
+ * WHO WE ARE, TO PEOPLE OUTSIDE WELEASE.
+ *
+ * Frank, 2026-08-24: no personal address appears in anything a landlord or a resident sees.
+ * Owners are written to from owners@weleaseusa.com, residents from residents@weleaseusa.com.
+ * Personal addresses are for internal work only.
+ *
+ * There are two good reasons beyond preference. A reply to a personal address sits in one
+ * inbox while that person is on leave; a reply to the shared one is seen by whoever is
+ * covering. And an owner who has a personal address treats it as a private line, which is
+ * how commitments get made outside the record.
+ *
+ * INTERNAL ATTRIBUTION IS DIFFERENT AND STAYS PERSONAL. The status log records who changed
+ * what — "yuliana set this to Vendor" — and replacing that with a shared mailbox would
+ * destroy an audit trail to satisfy a rule about external correspondence. The distinction
+ * is audience, not address.
+ */
+// ============================================================ WHO SEES THE PLUMBING
+/**
+ * ADMIN VISIBILITY.
+ *
+ * The dashboard carries two kinds of note and they have been mixed together since the
+ * start:
+ *
+ *   INTERPRETATION — "September is still running", "TPO properties are excluded",
+ *   "paying early counts as early". These change how a number should be READ. Everyone
+ *   needs them. Hiding them would leave the team confidently misreading the page, which
+ *   is worse than any amount of clutter.
+ *
+ *   MAINTENANCE — "run buildRenewalPipeline()", "the Foo tab is empty", "set the script
+ *   property NOTICE_TOOL_URL", "this is a code defect". These are instructions to whoever
+ *   maintains the thing. To everybody else they are noise that reads as breakage, and
+ *   fifteen of them across the page is how a working dashboard comes to look broken.
+ *
+ * Only the second kind is gated. That distinction is the whole design.
+ *
+ * WHO COUNTS AS AN ADMIN lives in a script property, not in this file, so the list can
+ * change without a deploy: Project Settings -> Script Properties -> DASHBOARD_ADMINS,
+ * comma separated. OWNERS is seeded below so the dashboard is never left with nobody
+ * able to see its own maintenance notes.
+ */
+var ADMIN = {
+  PROP: 'DASHBOARD_ADMINS',
+  // The floor. Anyone here is an admin whether or not the property is set.
+  ALWAYS: ['frank@weleaseusa.com'],
+  // When the visitor cannot be identified at all, is everybody an admin or nobody?
+  // NOBODY, deliberately — the whole point of this is that the team stops seeing
+  // maintenance chatter, and a failure that quietly shows it to all fifteen people again
+  // would be indistinguishable from not having built this. Admins get a one-line notice
+  // instead, so it is never silent.
+  FALLBACK_ADMIN: false
+};
+
+var _adminCache = null;
+
+/**
+ * FORCES A PARTICULAR AUDIENCE'S RENDER, whoever is running.
+ *
+ *   null     decide from the admin list, which is what a live page load does
+ *   'team'   no maintenance notes
+ *   'admin'  maintenance notes
+ *
+ * THIS IS WHY THE GATE DID NOT WORK, ORIGINALLY. The nightly job renders Needs Attention
+ * and caches the HTML, and doGet serves that file. The job runs on a trigger, so it runs
+ * as the OWNER — which means the cached page was an admin render handed to all fifteen
+ * people. No amount of identity fixing could have helped, and changing the deployment's
+ * execution mode did not touch it either, because triggers still run as their owner.
+ *
+ * BOTH audiences are now cached, which is the other half of the same problem. Serving the
+ * admin a live render kept the notes correct and made the page slow for the one person who
+ * opens it most — so the job renders twice, nightly, and everybody gets a cached page.
+ */
+var _renderAs = null;
+
+/**
+ * Set from the URL, once, at the top of doGet.
+ *   null   nothing said — the admin list decides
+ *   false  ?maint=0 — hide the notes, so a maintainer can see the team's page
+ *
+ * IT CAN ONLY EVER SHOW LESS. No value grants the maintenance notes to somebody the admin
+ * list does not already include, which is why it needs no secret — and why the team's link
+ * never changes. Their URL is the plain one, exactly as it was shared.
+ *
+ * It exists for verification. Adding ?maint=0 to your own bookmark shows you precisely
+ * what your colleagues see, in one second. That is the check that would have caught the
+ * cached page serving an admin render on the first round rather than the third.
+ */
+var _maintOverride = null;
+
+/** Reads ?maint= off the request. Called once, from doGet. */
+function applyMaintParam_(e) {
+  _maintOverride = null;
+  var v = e && e.parameter && e.parameter.maint;
+  if (v === undefined || v === null || v === '') return;
+  v = String(v).trim().toLowerCase();
+  if (v === '0' || v === 'team' || v === 'false') _maintOverride = false;
+  // Anything else is ignored. Nothing here can grant access, only remove it.
+}
+
+/** The signed-in visitor, or '' when Apps Script will not say. */
+function currentUserEmail_() {
+  try {
+    var e = Session.getActiveUser().getEmail();
+    if (e) return String(e).toLowerCase().trim();
+  } catch (err) { /* no scope, or an anonymous visitor */ }
+  return '';
+}
+
+/** Is the person looking at this page one of the maintainers? */
+function isAdmin_() {
+  // Order matters, and it is: the cache build wins over everything, then the URL, then
+  // identity. The cache is served to people who never asked for it, so nothing a single
+  // visitor says may change what goes into it.
+  if (_renderAs !== null) return _renderAs === 'admin';
+  if (_maintOverride !== null) return _maintOverride;
+  if (_adminCache !== null) return _adminCache;
+  var me = currentUserEmail_();
+  if (!me) { _adminCache = ADMIN.FALLBACK_ADMIN; return _adminCache; }
+
+  var list = ADMIN.ALWAYS.slice();
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(ADMIN.PROP) || '';
+    raw.split(/[,;\s]+/).forEach(function (x) {
+      x = String(x).toLowerCase().trim();
+      if (x && list.indexOf(x) === -1) list.push(x);
+    });
+  } catch (e) { /* properties unavailable — fall back to the floor list */ }
+
+  _adminCache = list.indexOf(me) > -1;
+  return _adminCache;
+}
+
+/** True when Apps Script would not tell us who is looking. */
+function identityUnavailable_() { return currentUserEmail_() === ''; }
+
+/**
+ * Run this from the editor. It reports who you are and what you can reach.
+ *
+ * As of 2026-09-05 the web app is deployed as "User accessing the web app", so the page
+ * runs as whoever opened it. That makes identity reliable — and it makes ACCESS the thing
+ * that varies, which is what this now checks.
+ */
+function whoAmI() {
+  var me = currentUserEmail_();
+  var eff = '';
+  try { eff = Session.getEffectiveUser().getEmail() || ''; } catch (e) { eff = '(unavailable)'; }
+  var out = [
+    'Signed in as (active user) : ' + (me || '(BLANK — identity is not reaching the script)'),
+    'Running as (effective user): ' + eff,
+    'Treated as an admin        : ' + (isAdmin_() ? 'YES' : 'no'),
+    'Can write to the workbook  : ' + (canWrite_() ? 'yes' : 'NO — read only'),
+    '',
+    'Admin list in force:'
+  ];
+  var list = ADMIN.ALWAYS.slice();
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(ADMIN.PROP) || '';
+    if (raw) out.push('  ' + ADMIN.PROP + ' = ' + raw);
+    else out.push('  ' + ADMIN.PROP + ' is not set — only the built-in list applies.');
+    raw.split(/[,;\s]+/).forEach(function (x) {
+      x = String(x).toLowerCase().trim();
+      if (x && list.indexOf(x) === -1) list.push(x);
+    });
+  } catch (e) { out.push('  (script properties unavailable)'); }
+  list.forEach(function (x) { out.push('  ' + x); });
+  // BOTH CASES, not just the current one. The setting can be changed back, and a second
+  // deployment of the same project can differ from the first — so this reports what it
+  // observes rather than restating what somebody intended.
+  if (me && eff && me === eff) {
+    out.push('', 'Active and effective match, so this deployment runs as the visitor.',
+             'That is "User accessing the web app", which is the current setting.',
+             'Identity is reliable here; ACCESS is the thing that now varies — run',
+             'verifyTeamAccess() to see what a colleague can actually reach.');
+  } else if (me && eff) {
+    out.push('', 'Active and effective differ, so this deployment runs as its OWNER.',
+             'That is "Execute as: Me". The admin gate still works — it reads the active',
+             'user, which is you — and the team needs no access to the workbook.');
+  }
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+/**
+ * WHAT THE TEAM CAN ACTUALLY REACH. Run this after changing the deployment or the
+ * sharing, and it will tell you what a colleague will experience before they tell you.
+ *
+ * Under "execute as user" the dashboard opens the workbook, the cache file and the
+ * notice feed as the VISITOR. Each one has its own sharing, each fails differently, and
+ * two of the three fail quietly:
+ *
+ *   workbook not shared      -> the page does not render at all. Loud, at least.
+ *   workbook view-only       -> the page renders and nothing saves. Silent.
+ *   cache file not shared    -> every load becomes a live render. Silent, and slow.
+ */
+function verifyTeamAccess() {
+  var out = ['--- WHAT A VISITOR CAN REACH ---', ''];
+  var ok = function (label, fn) {
+    try { out.push('OK    ' + label + ' — ' + fn()); return true; }
+    catch (e) { out.push('FAIL  ' + label + ' — ' + e.message); return false; }
+  };
+
+  ok('The workbook opens', function () {
+    return SpreadsheetApp.getActiveSpreadsheet().getName();
+  });
+  out.push((canWrite_() ? 'OK    ' : 'READ  ') + 'Write access — ' +
+    (canWrite_() ? 'yes, statuses and notes will save'
+                 : 'NO. The page renders, and nothing anyone types is saved.'));
+
+  // Both copies. The admin one is why the maintainer is not the only person on a slow
+  // page, so a missing admin cache is worth reporting rather than shrugging at.
+  [[DASH_CACHE_PROP, 'team'], [DASH_CACHE_PROP_ADMIN, 'maintainer']].forEach(function (pair) {
+    var id = null;
+    try { id = PropertiesService.getScriptProperties().getProperty(pair[0]); } catch (e) {}
+    if (!id) {
+      out.push('TODO  Cached page (' + pair[1] + ') — not built yet. ' +
+               'Run rebuildDashboardCache().');
+      return;
+    }
+    ok('Cached page (' + pair[1] + ') is readable', function () {
+      var f = DriveApp.getFileById(id);
+      var acc = String(f.getSharingAccess());
+      return Math.round(f.getSize() / 1024) + ' KB, shared: ' + acc +
+        (acc === 'PRIVATE'
+          ? '  <-- PRIVATE. Only you can read it; everyone else silently falls back to a ' +
+            'live render, which is slow. Run rebuildDashboardCache() to re-share it.'
+          : '');
+    });
+  });
+
+  out.push('');
+  var me = currentUserEmail_(), eff = '';
+  try { eff = Session.getEffectiveUser().getEmail() || ''; } catch (e) {}
+  if (me && eff && me === eff) {
+    out.push('DEPLOYMENT: "User accessing the web app" — the current setting.');
+    out.push('  Identity is reliable here, so the admin list is what decides who sees the');
+    out.push('  maintenance notes. Everyone needs EDITOR on the workbook to save a status,');
+    out.push('  a note, an insurance chase or feedback — which you have already granted.');
+  } else {
+    out.push('DEPLOYMENT: "Execute as: Me".');
+    out.push('  The script reads and writes as its owner, so nobody needs access to the');
+    out.push('  workbook. Identity for the admin list usually resolves in-domain; if the');
+    out.push('  active user above is blank, it is not resolving here.');
+  }
+  out.push('');
+  out.push('To see exactly what the team sees, add ?maint=0 to your dashboard URL.');
+  out.push('Their link is unchanged and needs no parameter.');
+  out.push('');
+  out.push('Either way: the admin gate hides maintenance notes on the PAGE. It is not a');
+  out.push('permission boundary and was never meant to be one.');
+
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+var WELEASE_CONTACT = {
+  OWNERS: 'owners@weleaseusa.com',
+  RESIDENTS: 'residents@weleaseusa.com',
+  GENERAL: 'owners@weleaseusa.com',
+
+  // Any weleaseusa.com address that is not one of the shared boxes is a personal one.
+  SHARED: ['owners@weleaseusa.com', 'residents@weleaseusa.com', 'info@weleaseusa.com',
+           'maintenance@weleaseusa.com', 'accounting@weleaseusa.com'],
+  ANY_WELEASE: /[A-Za-z0-9._%+-]+@weleaseusa\.com/gi
+};
+
+/** The address to show a given audience. Defaults to the owners box. */
+function weleaseContact_(audience) {
+  var a = String(audience || '').toLowerCase();
+  if (a.indexOf('resident') !== -1 || a.indexOf('tenant') !== -1) {
+    return WELEASE_CONTACT.RESIDENTS;
+  }
+  return WELEASE_CONTACT.OWNERS;
+}
+
+function isSharedMailbox_(email) {
+  var e = String(email || '').trim().toLowerCase();
+  if (!e) return false;
+  for (var i = 0; i < WELEASE_CONTACT.SHARED.length; i++) {
+    if (WELEASE_CONTACT.SHARED[i] === e) return true;
+  }
+  return false;
+}
+
+/**
+ * Replaces any personal WeLease address in outward-facing text with the shared mailbox.
+ *
+ * Enforced in code rather than left as a convention, because a convention survives exactly
+ * as long as the person who remembers it. Anything written into an owner pack, an owner
+ * report or a resident reminder passes through here.
+ *
+ * Returns the text and a count, so the caller can say what it changed rather than silently
+ * rewriting somebody's contact details.
+ */
+function scrubPersonalEmails_(text, audience) {
+  var shared = weleaseContact_(audience);
+  var n = 0;
+  var out = String(text === null || text === undefined ? '' : text)
+    .replace(WELEASE_CONTACT.ANY_WELEASE, function (m) {
+      if (isSharedMailbox_(m)) return m;
+      n++;
+      return shared;
+    });
+  return { text: out, replaced: n, shared: shared };
+}
+
+function nowStamp_() { return Utilities.formatDate(new Date(), CFG.TZ, 'yyyy-MM-dd HH:mm:ss'); }
+
+// ============================================================ REGISTRY
+
+var _registryCache = null;
+
+function loadRegistry_() {
+  if (_registryCache) return _registryCache;
+  var r = JSON.parse(DriveApp.getFileById(prop_('REGISTRY_FILE_ID')).getBlob().getDataAsString());
+  if (!Array.isArray(r.metrics)) {
+    throw new Error('REGISTRY_FILE_ID points at the wrong file — no metrics array. ' +
+                    'Top keys: ' + Object.keys(r).slice(0, 8).join(', '));
+  }
+  _registryCache = r;
+  return r;
+}
+
+/** Only metrics whose source system is currently enabled. */
+function activeMetrics_() {
+  return loadRegistry_().metrics.filter(function (m) {
+    var root = String(m.system).split('+')[0];
+    return systemEnabled_(root) && m.status !== 'deferred';
+  });
+}
+
+function deferredMetrics_() {
+  return loadRegistry_().metrics.filter(function (m) { return m.status === 'deferred'; });
+}
+
+
+// ============================================================ FOUNDATION
+//
+// Helpers every module depends on. They previously lived in Discover_v2.gs (a
+// DIAGNOSTICS file that someone will eventually delete), in Metrics.gs, and in
+// Dashboard.gs. readTab_ alone was called 84 times from nine files while being defined
+// in the metrics module. Deleting a diagnostics file should never break the pipeline,
+// so anything foundational lives here.
+
+/**
+ * Rate-limit pacing. Null-safe by design: a missing or renamed constant should
+ * slow us down, never abort a run mid-discovery. (This is exactly what broke the
+ * 2026-08-05 run — Utilities.sleep(undefined) throws.)
+ * Lives here for now; moves to Core when Core is next reissued.
+ */
+function sleepFor_(systemName) {
+  var ms = (SYSTEMS[systemName] && SYSTEMS[systemName].sleepMs) || 2500;
+  Utilities.sleep(ms);
+}
+
+function finding_(out, system, question, answer, action) {
+  out.push({ system: system, question: question, answer: String(answer).slice(0, 900),
+             action_required: action || null, discovered_at: nowStamp_() });
+}
+
+function distinctWithCounts_(rows, field, limit) {
+  var counts = {};
+  rows.forEach(function (r) {
+    var v = r[field];
+    if (v === null || v === undefined || v === '') v = '(null)';
+    counts[v] = (counts[v] || 0) + 1;
+  });
+  return Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; })
+    .slice(0, limit || 40).map(function (k) { return k + ' (' + counts[k] + ')'; }).join(' \u00b7 ');
+}
+
+function fillRate_(rows, field) {
+  if (!rows.length) return '0/0';
+  var f = rows.filter(function (r) {
+    return r[field] !== null && r[field] !== undefined && r[field] !== '';
+  }).length;
+  return f + '/' + rows.length + ' (' + Math.round(f / rows.length * 100) + '%)';
+}
+
+/**
+ * Reads a tab into objects, MEMOISED for the life of the execution.
+ *
+ * Without the cache the dashboard re-read the same sheets a dozen times — Work_Orders
+ * and Rent_Roll run to thousands of rows, and getDataRange().getValues() is the
+ * expensive call in Apps Script. That is what pushed page rendering past the timeout.
+ */
+/**
+ * Read-through cache for tab reads.
+ *
+ * Lived in Metrics.gs, which meant every readTab_ call in the project depended on a
+ * variable declared in an unrelated file — delete or fail to paste that one file and
+ * the whole pipeline throws. It belongs with the function that uses it.
+ */
+var _tabCache = {};
+
+function readTab_(name) {
+  if (name in _tabCache) return _tabCache[name];
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sh || sh.getLastRow() < 2) { _tabCache[name] = []; return _tabCache[name]; }
+  var vals = sh.getDataRange().getValues();
+  var hdr = vals[0];
+  _tabCache[name] = vals.slice(1).map(function (row) {
+    var o = {};
+    for (var i = 0; i < hdr.length; i++) {
+      var v = row[i];
+      // Sheets coerces anything date-shaped into a Date, which stringifies as
+      // "Aug 31 2025 23:00:00 GMT-0700 (Pacific Daylight Time)" when rendered.
+      // Normalise on the way in so nothing downstream has to care.
+      if (v instanceof Date) v = Utilities.formatDate(v, CFG.TZ, 'yyyy-MM-dd');
+      o[hdr[i]] = (v === '') ? null : v;
+    }
+    return o;
+  });
+  return _tabCache[name];
+}
+
+/** Jobs that rewrite a tab must clear it, or later reads in the same run go stale. */
+/**
+ * Empty a tab without the "No rows returned" sentinel.
+ *
+ * writeTab_(tab, []) clears the sheet and writes a placeholder string into A1, which is
+ * right for a report that legitimately returned nothing and very wrong for a scratch tab
+ * you are just draining. Using it on the Metrics tab destroyed a full set of metrics.
+ */
+function clearTabRows_(tabName) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(tabName);
+  if (!sh) return 0;
+  sh.clear();
+  try { invalidateTab_(tabName); } catch (e) {}
+  return 0;
+}
+
+function invalidateTab_(name) {
+  if (name) delete _tabCache[name]; else _tabCache = {};
+}
+
+function round1_(x) { return x === null || x === undefined ? null : Math.round(x * 10) / 10; }
+
+function round2_(x) { return x === null || x === undefined ? null : Math.round(x * 100) / 100; }
+
+/**
+ * Rounding applied to every number published to the Metrics tab.
+ *
+ * median_ averages the two middle values when n is even, and a plain / 2 in binary
+ * floating point produces 1.2650000000000001. That went straight into the sheet and
+ * onto the dashboard. It is not specific to renewal increases — any metric built on
+ * a median or a raw division can leak it, so this is applied once at the boundary
+ * rather than patched into individual calculations.
+ *
+ * Four decimal places: enough to keep a rate meaningful, short enough that the
+ * artefact cannot survive it.
+ */
+var PUBLISH_DP = 4;
+
+function publishNum_(x) {
+  if (x === null || x === undefined || x === '') return x;
+  var n = Number(x);
+  if (typeof x === 'boolean' || !isFinite(n)) return x;
+  if (typeof x === 'string' && String(n) !== x.trim()) return x;   // real text, leave alone
+  var f = Math.pow(10, PUBLISH_DP);
+  return Math.round(n * f) / f;
+}
+
+function esc_(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function money_(v) {
+  var n = num_(v);
+  if (n === null) return '\u2014';
+  return '$' + Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// ============================================================ DATES + MATH
+
+function today_() { return new Date(); }
+
+function ymd_(d) {
+  if (!d) return null;
+  d = parseDate_(d);
+  return (!d || isNaN(d.getTime())) ? null : Utilities.formatDate(d, CFG.TZ, 'yyyy-MM-dd');
+}
+
+/**
+ * Parses the date formats AppFolio actually returns.
+ *
+ * PREVIOUS BUG: this appended 'T00:00:00' to ANY 10-character string so that ISO dates
+ * read at local midnight rather than UTC. A zero-padded US date is also 10 characters,
+ * so '06/12/2026' became '06/12/2026T00:00:00' and returned NULL — silently, and
+ * indistinguishably from a date that was simply absent. Padded slash dates appear in
+ * charge descriptions, which is exactly where the utility service periods live.
+ *
+ * Now the ISO fixup is applied only to strings that are actually ISO.
+ */
+function parseDate_(s) {
+  if (!s) return null;
+  if (s instanceof Date) return s;
+  s = String(s).trim();
+  if (!s) return null;
+  var iso = /^\d{4}-\d{2}-\d{2}$/.test(s);
+  var d = new Date(iso ? s + 'T00:00:00' : s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function daysBetween_(a, b) {
+  a = parseDate_(a); b = parseDate_(b);
+  return (!a || !b) ? null : Math.round((b - a) / 86400000);
+}
+
+/**
+ * Human day label. ONE implementation, used by every list.
+ *
+ * "in 21 days" and "21 days ago" instead of "21d". The abbreviation saved four
+ * characters and cost a beat of translation on every row, on a page people read
+ * dozens of times a day.
+ *
+ * Positive is the future, negative is the past. Singular is handled, so nothing
+ * ever reads "in 1 days".
+ */
+function dayLabel_(days) {
+  if (days === null || days === undefined || days === '') return '';
+  var n = Math.round(Number(days));
+  if (!isFinite(n)) return '';
+  if (n === 0)  return 'today';
+  if (n === 1)  return 'tomorrow';
+  if (n === -1) return 'yesterday';
+  var abs = Math.abs(n), unit = abs === 1 ? 'day' : 'days';
+  return n > 0 ? 'in ' + abs + ' ' + unit : abs + ' ' + unit + ' ago';
+}
+
+/**
+ * Elapsed duration, with no direction implied — for "open 34 days", "vacant 61
+ * days", where the number is an age rather than a countdown.
+ */
+function daySpan_(days) {
+  if (days === null || days === undefined || days === '') return '';
+  var n = Math.round(Number(days));
+  if (!isFinite(n)) return '';
+  return n + (Math.abs(n) === 1 ? ' day' : ' days');
+}
+
+/**
+ * Overdue phrasing, for a deadline that has already passed.
+ * Falls through to dayLabel_ while the deadline is still ahead.
+ */
+function dayOverdue_(days) {
+  if (days === null || days === undefined || days === '') return '';
+  var n = Math.round(Number(days));
+  if (!isFinite(n)) return '';
+  if (n >= 0) return dayLabel_(n);
+  var abs = Math.abs(n);
+  return abs + (abs === 1 ? ' day' : ' days') + ' overdue';
+}
+
+function addDays_(d, n) {
+  var x = new Date(parseDate_(d).getTime());
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+function monthKey_(d) {
+  d = parseDate_(d);
+  return d ? Utilities.formatDate(d, CFG.TZ, 'yyyy-MM') : null;
+}
+
+/**
+ * A month cell, back to 'yyyy-MM', whatever the sheet handed us.
+ *
+ * monthKey_ writes the string '2026-08'. Sheets sees a date-like string and stores a real
+ * date, so readTab_ can hand back a Date object instead — and Date(2026-08-01 00:00 UTC)
+ * read in America/Los_Angeles is July 31st at 5pm. Anything that then asked the Date which
+ * month it was got JULY for an AUGUST row. That is how $315,152 of August money came to sit
+ * under a "July 2026 · last complete month" label on the rent tile.
+ *
+ * Every read of a month column goes through here. Strings pass straight through, so this is
+ * free when Sheets behaves.
+ */
+function monthNorm_(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (typeof v === 'string') {
+    var m = v.match(/^(\d{4})-(\d{2})/);
+    if (m) return m[1] + '-' + m[2];
+  }
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    // The Date's OWN calendar fields, not a re-format through a timezone. Apps Script builds
+    // a Date from a sheet cell in the script's timezone already, so getFullYear/getMonth are
+    // the month the sheet displays. Re-formatting through CFG.TZ would apply a second offset
+    // to a value that had already been converted once, which is the shift, not the fix.
+    return v.getFullYear() + '-' + ('0' + (v.getMonth() + 1)).slice(-2);
+  }
+  return monthKey_(v) || String(v);
+}
+
+function num_(v) {
+  if (v === null || v === undefined || v === '') return null;
+  var n = parseFloat(String(v).replace(/[$,]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+function median_(arr) {
+  var a = arr.filter(function (x) { return x !== null && x !== undefined && !isNaN(x); })
+             .sort(function (x, y) { return x - y; });
+  if (!a.length) return null;
+  var m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+function p90_(arr) {
+  var a = arr.filter(function (x) { return x !== null && x !== undefined && !isNaN(x); })
+             .sort(function (x, y) { return x - y; });
+  return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * 0.9))] : null;
+}
+
+/**
+ * Direction-aware benchmark comparison.
+ * Five metrics are INVERTED — the three renewal lead times, resolved-without-dispatch,
+ * and units-per-team-member are better when HIGHER. Hardcoding the operator reports
+ * the business backwards. Always read direction from the registry.
+ */
+function vsBenchmark_(value, benchmark, direction) {
+  if (value === null || !benchmark) return null;
+  var med = benchmark.median, top = benchmark.top_25_pct;
+  if (direction === 'higher_is_better') {
+    if (value >= top) return 'top_quartile';
+    if (value >= med) return 'at_benchmark';
+    return 'below_benchmark';
+  }
+  if (value <= top) return 'top_quartile';
+  if (value <= med) return 'at_benchmark';
+  return 'below_benchmark';
+}
+
+function groupBy_(rows, keyFn) {
+  var out = {};
+  rows.forEach(function (r) {
+    var k = keyFn(r);
+    if (k === null || k === undefined) return;
+    (out[k] = out[k] || []).push(r);
+  });
+  return out;
+}
+
+function indexBy_(rows, key) {
+  var out = {};
+  rows.forEach(function (r) { if (r[key] !== undefined && r[key] !== null) out[r[key]] = r; });
+  return out;
+}
+
+// ============================================================ DEPOSIT COMPLIANCE
+
+/**
+ * Security deposit disposition clock. AppFolio only — no workflow system needed.
+ *
+ * START: tenant_tickler.move_out_date, keyed on occupancy_id
+ * STOP:  earliest general_ledger post_date of a DEBIT to a management-held deposit
+ *        liability for that occupancy, on or after move-out
+ *
+ * Owner-held deposits are flagged CANNOT_MEASURE — those funds never touch WeLease's
+ * trust account, so the disposition may never post here. Never counted compliant,
+ * never counted late.
+ *
+ * CALIFORNIA: Civil Code 1950.5 governs. CFG.DEPOSIT_DISPOSITION_DAYS is WeLease's
+ * stated standard, not a legal determination. This REPORTS. It must never trigger a
+ * notice, a fee, or any resident communication.
+ */
+function buildDepositCompliance(fromDate, toDate) {
+  var t0 = new Date().getTime();
+  fromDate = fromDate || ymd_(addDays_(today_(), -400));
+  toDate = toDate || ymd_(today_());
+
+  var ticklers = afReport_('tenant_tickler', { occurred_on_from: fromDate, occurred_on_to: toDate });
+  Utilities.sleep(SYSTEMS.appfolio.sleepMs);
+
+  var moveOuts = getMoveOuts_(ticklers);   // shared matcher — defined in Inspections.gs
+
+  var allGl = DEPOSIT_GL.MGMT_HELD.concat(DEPOSIT_GL.OWNER_HELD, DEPOSIT_GL.FORFEIT,
+                                          DEPOSIT_GL.OWNER_REFUNDED, DEPOSIT_GL.DEPOSIT_CASH);
+  var gl = afReport_('general_ledger', {
+    posted_on_from: fromDate,
+    posted_on_to: ymd_(addDays_(today_(), 1)),
+    gl_account_ids: allGl
+  });
+
+  // party_type === 'Occupancy' means party_id === occupancy_id
+  var byOcc = {};
+  gl.forEach(function (e) {
+    if (String(e.party_type || '') !== 'Occupancy') return;
+    if (e.party_id === null || e.party_id === undefined) return;
+    (byOcc[e.party_id] = byOcc[e.party_id] || []).push(e);
+  });
+
+  var threshold = CFG.DEPOSIT_DISPOSITION_DAYS;
+  var out = moveOuts.map(function (mo) {
+    var moveOut = ymd_(mo.move_out_date);
+    var entries = (byOcc[mo.occupancy_id] || []).filter(function (e) {
+      var pd = ymd_(e.post_date);
+      return pd && moveOut && pd >= moveOut;
+    });
+    var ownerHeld = entries.some(function (e) { return DEPOSIT_GL.OWNER_HELD.indexOf(e.account_id) !== -1; });
+    var disp = entries.filter(function (e) {
+      return DEPOSIT_GL.MGMT_HELD.indexOf(e.account_id) !== -1 && num_(e.debit) > 0;
+    }).sort(function (a, b) { return ymd_(a.post_date) < ymd_(b.post_date) ? -1 : 1; });
+
+    var dispDate = disp.length ? ymd_(disp[0].post_date) : null;
+    var elapsed = daysBetween_(moveOut, dispDate || ymd_(today_()));
+    var held = num_(mo.deposit);
+
+    // A resident with no deposit on file and no deposit-account activity is outside
+    // the metric entirely. Counting them as compliant would inflate the rate;
+    // counting them as late would be wrong. They get their own bucket.
+    var noDeposit = (!held || held === 0) && entries.length === 0;
+
+    var status = noDeposit ? 'NO_DEPOSIT_HELD'
+      : (ownerHeld && !disp.length) ? 'CANNOT_MEASURE_OWNER_HELD'
+      : dispDate ? (elapsed <= threshold ? 'WITHIN_THRESHOLD' : 'EXCEEDED_THRESHOLD')
+      : (elapsed <= threshold ? 'OPEN_WITHIN_THRESHOLD' : 'OPEN_EXCEEDED_THRESHOLD');
+
+    function sumWhere(ids, field) {
+      return entries.filter(function (e) { return ids.indexOf(e.account_id) !== -1; })
+                    .reduce(function (s, e) { return s + (num_(e[field]) || 0); }, 0);
+    }
+
+    return {
+      occupancy_id: mo.occupancy_id, tenant: mo.tenant || null,
+      property_id: mo.property_id || null, property_name: mo.property_name || null,
+      property_street: mo.property_street || null, property_street2: mo.property_street2 || null,
+      unit: mo.unit || null, tenant_id: mo.tenant_id || null,
+      unit_id: mo.unit_id || null, move_out_date: moveOut,
+      move_out_reason: mo.move_out_reason || null,
+      deposit_on_file: num_(mo.deposit), disposition_date: dispDate,
+      days_elapsed: elapsed, threshold_days: threshold, status: status,
+      owner_held: ownerHeld || null,
+      amount_disposed: disp.length ? num_(disp[0].debit) : null,
+      disposition_account: disp.length ? disp[0].account_name : null,
+      disposition_txn_type: disp.length ? disp[0].type : null,
+      disposition_entries: disp.length,
+      amount_forfeited: sumWhere(DEPOSIT_GL.FORFEIT, 'credit') || null,
+      owner_refunded: sumWhere(DEPOSIT_GL.OWNER_REFUNDED, 'credit') || null,
+      gl_entries_found: entries.length,
+      review_required: (status === 'EXCEEDED_THRESHOLD' || status === 'OPEN_EXCEEDED_THRESHOLD' ||
+                        status === 'CANNOT_MEASURE_OWNER_HELD') ? 'YES' : null
+    };
+  }).sort(function (a, b) { return (b.days_elapsed || 0) - (a.days_elapsed || 0); });
+
+  var n = writeTab_('Deposit_Compliance', out);
+  logRun_('buildDepositCompliance', 'appfolio', 'Deposit_Compliance', n,
+          new Date().getTime() - t0,
+          'threshold=' + threshold + 'd · move-outs=' + moveOuts.length + ' · GL rows=' + gl.length);
+
+  function countBy(s) { return out.filter(function (r) { return r.status === s; }).length; }
+  var measured = out.filter(function (r) {
+    return r.status === 'WITHIN_THRESHOLD' || r.status === 'EXCEEDED_THRESHOLD';
+  });
+  var days = measured.map(function (r) { return r.days_elapsed; });
+
+  var summary = {
+    run_date: nowStamp_(),
+    metric: 'moveout_deposit_disposition',
+    period: fromDate + ' to ' + toDate,
+    threshold_days: threshold,
+    move_outs_total: out.length,
+    measured_n: measured.length,
+    within_threshold: countBy('WITHIN_THRESHOLD'),
+    exceeded_threshold: countBy('EXCEEDED_THRESHOLD'),
+    still_open_within: countBy('OPEN_WITHIN_THRESHOLD'),
+    still_open_exceeded: countBy('OPEN_EXCEEDED_THRESHOLD'),
+    no_deposit_held: countBy('NO_DEPOSIT_HELD'),
+    cannot_measure_owner_held: countBy('CANNOT_MEASURE_OWNER_HELD'),
+    compliance_rate_pct: measured.length
+      ? Math.round(countBy('WITHIN_THRESHOLD') / measured.length * 100) : null,
+    median_days: median_(days),
+    p90_days: p90_(days),
+    publishable: measured.length >= CFG.MIN_N_TO_PUBLISH
+      ? 'YES' : 'NO — n below ' + CFG.MIN_N_TO_PUBLISH
+  };
+  appendTab_('Metrics_History', [summary]);
+
+  var breaches = out.filter(function (r) { return r.review_required === 'YES'; }).length;
+  if (breaches) {
+    logError_('compliance', 'deposit_disposition', breaches +
+      ' move-outs need review (past threshold, or owner-held and unmeasurable). ' +
+      'REPORTING ONLY — escalate to a human. Never auto-notify a resident or assess a fee from this.');
+  }
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
+
+// ============================================================ SETUP
+
+var TABS_ACTIVE = [
+  'Properties_Units', 'Tenants', 'Owners', 'Unit_Directory', '_unit_variance',
+  'Properties_All', 'Unit_Directory_All', '_metrics_partial', '_metric_timing',
+  'Team_Roster',
+  // Financials_IS and Financials_CF were registered but nothing ever wrote or read
+  // them — setupSheets was creating two empty tabs on every fresh install.
+  'Delinquency_Aged', 'Receivables_Activity', 'Rent_Income_GL',
+  'Applications', 'Renewals', 'Unit_Vacancy', 'Rent_Roll',
+  // Pulled by rebuildAll / rebuildLeasing but never registered, so setupSheets left
+  // them to be created on first write.
+  'PM_Groups', 'Lease_Expirations', 'Insurance_Followups', '_feedback',
+  'Owner_Update_Scope', 'Owner_Packs', '_drive_exports',
+  'Weekly_Report', 'Weekly_Report_History',
+  'Inspections', 'Renewal_Pipeline', 'Work_Orders', 'Tenant_Tickler', 'Deposit_Compliance',
+  'Metrics', 'Metrics_History',
+  'Utility_Schedule', 'Utility_Schedule_Overrides', 'Utility_Schedule_History',
+  'Utility_Schedule_Anomalies', 'Utility_Schedule_Dropped',
+  'Item_Status', 'Item_Status_Log', 'Suppressed_Items', 'Data_Flags',
+  'Collections', 'Collections_History', 'Throughput', '_throughput_snapshot',
+  'Master_Units', 'Master_Tenancies',
+  'Rent_Market_Variance', 'Insurance_Owner', 'Insurance_Tenant', 'Insurance_Outreach',
+  'Insurance_History',
+  'Unit_Address_Book', 'Rent_Timing', 'Rent_Timing_Current', 'Rent_Collection', 'Portfolio_Summary', 'Portfolio_Summary_History', 'Portfolio_By_Group',
+  'Door_History', 'Leasing_Activity', 'Rent_To_Market', 'MoveOut_Assessment',
+  '_acknowledgments', '_excluded_properties', '_excluded_tenancies',
+  CFG.LOG_TAB, CFG.ERROR_TAB
+];
+
+// Created only when their system is re-enabled.
+var TABS_DEFERRED = {
+  // LS_Stage_Timings is NOT buildable from the REST payload — there is no
+  // stage-entered timestamp to derive a duration from, only created_at/updated_at.
+  // It needs the process/changed_stage webhook. Left out rather than created empty
+  // and mistaken for a job that failed.
+  // LS_Tasks removed with the upcoming-only pull; LS_Tasks_All supersedes it.
+  leadsimple: ['LS_Processes', 'LS_Tasks_All', 'LS_Deals', 'LS_Leads', 'LS_Deal_Review', 'LS_Compliance', 'LS_Workload',
+               'Onboarding_Steps',
+               'LS_Owners_Funnel', 'Lead_To_MoveIn', '_ls_join_exceptions'],
+  showmojo:   ['SM_High_Level', 'SM_High_Level_History', 'SM_Listing_Performance',
+               'SM_Listings', 'SM_Showings', 'SM_Listing_Showing', 'SM_Prospects',
+               'SM_Listing_Funnel', 'SM_Unit_Join', '_sm_join_exceptions']
+};
+
+function setupSheets() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet(), made = [], failed = [];
+  var tabs = TABS_ACTIVE.slice();
+  Object.keys(TABS_DEFERRED).forEach(function (s) {
+    if (systemEnabled_(s)) tabs = tabs.concat(TABS_DEFERRED[s]);
+  });
+
+  // ONE call to list the sheets, not one per tab.
+  //
+  // This used to run ss.getSheetByName() inside the loop — around seventy round trips to the
+  // Spreadsheet service on a file that now holds sixty-odd tabs of real data, and on
+  // 2026-08-17 it timed out. Reading the names once and comparing in memory turns that into
+  // a single call plus one insert per genuinely missing tab, which on a normal run is zero.
+  var existing = {};
+  ss.getSheets().forEach(function (sh) { existing[sh.getName()] = true; });
+
+  var missing = tabs.filter(function (t) { return !existing[t]; });
+  missing.forEach(function (t, i) {
+    // Per-tab try/catch: if the service does time out part way, we keep the record of what
+    // was created rather than losing the whole run and not knowing where it stopped.
+    try {
+      ss.insertSheet(t);
+      made.push(t);
+      // Flush every few inserts so the work is committed incrementally.
+      if (i % 5 === 4) SpreadsheetApp.flush();
+    } catch (e) {
+      failed.push(t + ' (' + String(e.message).slice(0, 60) + ')');
+    }
+  });
+  if (failed.length) {
+    logError_('setup', 'setupSheets',
+      failed.length + ' tab(s) could not be created: ' + failed.join(', ') +
+      '. Re-run setupSheets() — it only creates what is missing, so running it again is safe ' +
+      'and picks up where this stopped.');
+  }
+  try { setupAcknowledgments(); } catch (e) { logError_('setup', 'acknowledgments', e.message); }
+  try { setupExclusions(); } catch (e) { logError_('setup', 'exclusions', e.message); }
+  try { setupExcludedTenancies(); } catch (e) { logError_('setup', 'tenancies', e.message); }
+  try { if (typeof setupItemStatus === 'function') setupItemStatus(); }
+  catch (e) { logError_('setup', 'item status', e.message); }
+  try { if (typeof setupMasterScope === 'function') setupMasterScope(); }
+  catch (e) { logError_('setup', 'master scope', e.message); }
+  try { setupTeamRoster(); } catch (e) { logError_('setup', 'team roster', e.message); }
+  try { if (typeof setupOwnerUpdateScope === 'function') setupOwnerUpdateScope(); }
+  catch (e) { logError_('setup', 'owner update scope', e.message); }
+  try { if (typeof setupDealReview === 'function') setupDealReview(); }
+  catch (e) { logError_('setup', 'deal review', e.message); }
+  logRun_('setupSheets', 'system', '-', made.length, 0,
+          tabs.length + ' expected · ' + missing.length + ' missing · created: ' +
+          (made.join(', ') || 'none') + (failed.length ? ' · FAILED: ' + failed.join(', ') : ''));
+  return made;
+}
+
+/**
+ * The one number no API can supply.
+ *
+ * units_per_team_member needs a headcount. Inferring it from who has open work would
+ * drop anyone having a quiet week, so it is a tab a person maintains.
+ */
+function setupTeamRoster() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('Team_Roster') || ss.insertSheet('Team_Roster');
+  if (sh.getLastRow() > 0) return 'already exists';
+  sh.getRange(1, 1, 1, 4).setValues([['name', 'role', 'fte', 'counts_toward_ratio']])
+    .setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.getRange(3, 1).setValue(
+    'One row per person. fte blank counts as 1; use 0.5 for half time. Set ' +
+    'counts_toward_ratio to NO for anyone who does not carry doors (bookkeeping, ' +
+    'marketing). Only units_per_team_member reads this tab.');
+  return 'created';
+}
+
+function verifyConnections() {
+  var r = [];
+  Object.keys(SYSTEMS).forEach(function (name) {
+    var s = SYSTEMS[name];
+    if (!s.enabled) { r.push(s.label + ' DISABLED — ' + (s.blockedReason || 'not configured')); return; }
+    try {
+      if (name === 'appfolio') {
+        r.push('AppFolio OK — property_directory returned ' +
+               afReport_('property_directory', {}, { maxPages: 1 }).length + ' rows');
+      } else if (name === 'leadsimple') {
+        // lsGet2_, not lsGet_. The retired adapter was still wired in here, so this check
+        // reported "LeadSimple FAILED" every time while LeadSimple was working fine — a
+        // verifier that lies is worse than no verifier, because it sends you debugging a
+        // connection that was never down.
+        var acct = (lsGet2_('/info/account', {}, 1) || {}).data || {};
+        r.push('LeadSimple OK — account "' + (acct.name || '?') + '" (id ' + (acct.id || '?') + ')');
+      } else if (name === 'showmojo') {
+        // smFetch_, not smReport_ — same reason.
+        r.push('ShowMojo OK — high_level_metrics returned ' +
+               smFetch_('high_level_metrics', ymd_(addDays_(today_(), -7)), ymd_(today_())).length +
+               ' rows');
+      }
+    } catch (e) { r.push(s.label + ' FAILED — ' + e.message.slice(0, 250)); }
+  });
+
+  try {
+    var reg = loadRegistry_();
+    var act = activeMetrics_(), def = deferredMetrics_();
+    r.push('Registry OK — v' + reg.version + ' · ' + reg.metrics.length + ' total · ' +
+           act.length + ' active · ' + def.length + ' deferred · ' +
+           act.filter(function (m) { return m.status === 'tracked'; }).length + ' shippable');
+  } catch (e) { r.push('Registry FAILED — ' + e.message.slice(0, 250)); }
+
+  Logger.log(r.join('\n'));
+  logRun_('verifyConnections', 'system', '-', r.length, 0, r.join(' | '));
+  return r;
+}
+
+/**
+ * The nightly schedule, in one place.
+ *
+ * installTriggers() creates these and verifyTriggers() checks them against what is
+ * actually installed. They used to be separate lists, which is how a schedule drifts
+ * from the thing that is supposed to verify it.
+ */
+function expectedTriggers_() {
+  var jobs = [
+    { fn: 'rebuildAll', h: 2, m: 0 },
+    { fn: 'rebuildFinancials', h: 2, m: 30 },
+    { fn: 'rebuildLeasing', h: 3, m: 0 },
+    { fn: 'rebuildCompliance', h: 3, m: 30 },
+    { fn: 'rebuildCollections', h: 3, m: 45 },
+    { fn: 'rebuildPortfolio', h: 4, m: 0 },
+    { fn: 'rebuildMasterScope', h: 4, m: 10 },
+    { fn: 'buildUtilitySchedule', h: 4, m: 15 },
+    { fn: 'rebuildLeadSimple', h: 4, m: 20 },
+    { fn: 'rebuildShowMojo', h: 4, m: 25 },
+    { fn: 'computeMetrics', h: 4, m: 30 },
+    { fn: 'rebuildDataQuality', h: 4, m: 45 },
+    { fn: 'rebuildThroughput', h: 4, m: 50 },
+    // The notice filler reads this. It runs before the cache rather than after, so that a
+    // morning notice is filled from the same pull the dashboard is showing.
+    { fn: 'buildNoticeMergeFeed', h: 4, m: 55 },
+    { fn: 'rebuildDashboardCache', h: 5, m: 0 },
+    // MONTHLY, not daily. The snapshot freezes a closed month for the review; running it
+    // nightly would overwrite the thing whose whole value is that it does not change.
+    // The 15th matches the renewal process cadence the team already works to.
+    { fn: 'exportMonthlySnapshot', h: 6, m: 0, dayOfMonth: 15 },
+    // DAILY, at 05:30 — after rebuildDashboardCache at 05:00, which is the last of the
+    // nightly chain. The export copies the tabs those jobs just rebuilt; running it before
+    // them would ship yesterday's numbers under today's date.
+    { fn: 'exportDailySnapshot', h: 5, m: 30 },
+    // The weekly roll-up, Monday morning, so it is on the screen before Tuesday's meeting.
+    { fn: 'buildWeeklyReport', h: 6, m: 30, weekDay: 'MONDAY' }
+  ];
+  return jobs.filter(function (j) {
+    if (j.fn === 'rebuildLeadSimple') return systemEnabled_('leadsimple');
+    if (j.fn === 'rebuildShowMojo') return systemEnabled_('showmojo');
+    var ok = false;
+    try { ok = typeof eval(j.fn) === 'function'; } catch (e) {}
+    return ok;
+  });
+}
+
+function installTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
+  var jobs = expectedTriggers_();
+  jobs.forEach(function (j) {
+    var b = ScriptApp.newTrigger(j.fn).timeBased().atHour(j.h).nearMinute(j.m);
+    // onMonthDay, onWeekDay and everyDays are mutually exclusive — calling two throws.
+    if (j.dayOfMonth) b.onMonthDay(j.dayOfMonth);
+    else if (j.weekDay) b.onWeekDay(ScriptApp.WeekDay[j.weekDay]);
+    else b.everyDays(1);
+    b.inTimezone(CFG.TZ).create();
+  });
+  logRun_('installTriggers', 'system', '-', jobs.length, 0,
+          jobs.map(function (j) { return j.fn; }).join(', '));
+  Logger.log(jobs.length + ' trigger(s) installed:\n' +
+    jobs.map(function (j) {
+      return '  ' + String(j.h).padStart(2, '0') + ':' + String(j.m).padStart(2, '0') + '  ' +
+             j.fn + (j.dayOfMonth ? '   (monthly, on the ' + j.dayOfMonth + 'th)'
+                   : j.weekDay ? '   (weekly, ' + j.weekDay.toLowerCase() + ')' : '');
+    }).join('\n') +
+    '\n\nEvery previous trigger was deleted first, including any continuation from a ' +
+    'resumable job. If a seed or a refresh was mid-flight, restart it.');
+  return jobs.map(function (j) { return j.fn; });
+}
