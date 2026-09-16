@@ -1,0 +1,476 @@
+/**
+ * MONTHLY OWNER UPDATE — the data pack
+ *
+ * WHAT THIS IS, AND DELIBERATELY IS NOT.
+ *
+ * The handoff document has a team member gather Section 4 — rent roll, delinquency, lease
+ * expirations, work orders, inspections, leasing activity, statements — and paste it into a
+ * Claude project that writes the report. The gathering is the labour. The dashboard already
+ * pulls every one of those things every night.
+ *
+ * So this produces the PACK, not the prose: one complete, sourced facts sheet per owner,
+ * ready to paste. Claude still writes the report, which is right, because the project's own
+ * rules forbid inventing anything and require judgement about what needs a decision. A
+ * template can guarantee the first; it cannot do the second, and prose assembled from
+ * fixed sentences reads like it was.
+ *
+ * WHAT IT WILL NOT DO
+ *   - No law, notice period, rent cap, fee or lease term. Not one. Those come from the
+ *     lease and from counsel, and the pack says so where a topic gets close.
+ *   - No resident detail beyond lease and payment facts. No household composition, no
+ *     circumstances, nothing that could touch a protected characteristic.
+ *   - No estimate, average or filled gap. Missing inputs are LISTED AS MISSING at the foot
+ *     of every pack, which is what the project instructions ask for.
+ */
+
+var OWNER_UPDATE = {
+  SCOPE_TAB: 'Owner_Update_Scope',
+  OUT_TAB: 'Owner_Packs',
+  LOOKAHEAD_DAYS: 90,        // "what's coming in the next 30-90 days"
+  EXPIRY_HORIZON: 120        // lease expirations worth naming
+};
+
+/**
+ * The scope sheet. Frank maintains it; nothing infers who is in scope.
+ *
+ * owner_key must match the owners string on the property record, because that is the only
+ * link between a property and an owner in the data we hold. The setup routine pre-fills it
+ * with every owner and their door count so it is a tick-box exercise, not typing.
+ */
+function setupOwnerUpdateScope() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(OWNER_UPDATE.SCOPE_TAB);
+  // prepared_by is a NAME and a title — "Frank Dominguez, Principal". Not an address:
+  // the reply-to on an owner report is always WELEASE_CONTACT.OWNERS, and a personal one
+  // typed here would be scrubbed out of the pack anyway.
+  var headers = ['owner_key', 'doors', 'include', 'preferred_name', 'contact_email',
+                 'prepared_by', 'notes'];
+
+  var doors = {};
+  dropTPO_(readTab_('Properties_Units')).forEach(function (p) {
+    var k = String(p.owners || '').trim();
+    if (!k) return;
+    doors[k] = (doors[k] || 0) + (num_(p.units) || 1);
+  });
+
+  if (!sh) {
+    sh = ss.insertSheet(OWNER_UPDATE.SCOPE_TAB);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+
+  // Existing choices are preserved. Re-running adds owners who have appeared since and
+  // leaves every include flag exactly as it was — otherwise nobody would run it twice.
+  var existing = {};
+  readTab_(OWNER_UPDATE.SCOPE_TAB).forEach(function (r) {
+    if (r.owner_key) existing[String(r.owner_key).trim()] = r;
+  });
+
+  var rows = Object.keys(doors).sort(function (a, b) { return doors[b] - doors[a]; })
+    .map(function (k) {
+      var e = existing[k] || {};
+      return {
+        owner_key: k,
+        doors: doors[k],
+        include: e.include || '',
+        preferred_name: e.preferred_name || '',
+        contact_email: e.contact_email || '',
+        prepared_by: e.prepared_by || '',
+        notes: e.notes || ''
+      };
+    });
+
+  writeTab_(OWNER_UPDATE.SCOPE_TAB, rows, { headers: headers });
+  logRun_('setupOwnerUpdateScope', 'derived', OWNER_UPDATE.SCOPE_TAB, rows.length, 0,
+          rows.length + ' owner(s) listed, ' +
+          rows.filter(function (r) { return r.include; }).length + ' marked include');
+  return rows.length;
+}
+
+/**
+ * Does AppFolio expose an owner statement through the Reports API?
+ *
+ * Frank asked to pull it rather than re-derive it, which is the right instinct — a
+ * re-derived owner statement that disagrees with the one the owner already received is
+ * worse than no statement at all. But v2 may simply not have the endpoint, and guessing a
+ * slug that 404s tells us nothing useful.
+ *
+ * This tries the plausible names and reports what came back, so the answer is evidence.
+ */
+function probeOwnerStatement() {
+  var from = ymd_(addDays_(today_(), -60)), to = ymd_(today_());
+  var candidates = [
+    ['owner_statement', { from_date: from, to_date: to }],
+    ['owner_statement', { occurred_on_from: from, occurred_on_to: to }],
+    ['owner_statement_detail', { occurred_on_from: from, occurred_on_to: to }],
+    ['owner_statement_summary', { occurred_on_from: from, occurred_on_to: to }],
+    ['owner_directory_statement', {}],
+    ['cash_flow', { occurred_on_from: from, occurred_on_to: to }],
+    ['income_statement', { occurred_on_from: from, occurred_on_to: to }],
+    ['owner_draw', { occurred_on_from: from, occurred_on_to: to }],
+    ['management_fees', { occurred_on_from: from, occurred_on_to: to }]
+  ];
+
+  var out = ['--- OWNER STATEMENT PROBE, ' + from + ' to ' + to + ' ---', ''];
+  var found = [];
+  candidates.forEach(function (c) {
+    var slug = c[0];
+    try {
+      var rows = afReport_(slug, c[1], { maxPages: 1, maxRows: 200 });
+      var cols = rows.length ? Object.keys(rows[0]) : [];
+      out.push('  ' + slug.padEnd(28) + 'OK   ' + rows.length + ' row(s)');
+      if (cols.length) out.push('      columns: ' + cols.slice(0, 18).join(', ') +
+                                (cols.length > 18 ? ' ...' : ''));
+      if (rows.length) found.push(slug);
+    } catch (e) {
+      out.push('  ' + slug.padEnd(28) + 'no   ' + String(e.message).slice(0, 70));
+    }
+    sleepFor_('appfolio');
+  });
+
+  out.push('');
+  out.push(found.length
+    ? 'USABLE: ' + found.join(', ') + '. Send me the column list for whichever carries ' +
+      'income, expenses and net disbursement per owner and I will wire it into the pack.'
+    : 'None returned rows. Owner financials stay OUT of the pack and get attached from ' +
+      'AppFolio separately — which is the safe answer, because a re-derived statement that ' +
+      'disagrees with the one the owner already has is worse than no statement.');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+/**
+ * One pack per owner marked include. Written to Owner_Packs, one row each, ready to copy.
+ */
+function buildOwnerPacks(monthKey) {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+  var month = monthNorm_(monthKey || ymd_(addDays_(parseDate_(t.slice(0, 8) + '01'), -1)));
+  var scope = readTab_(OWNER_UPDATE.SCOPE_TAB)
+    .filter(function (r) { return String(r.include || '').trim(); });
+
+  if (!scope.length) {
+    writeTab_(OWNER_UPDATE.OUT_TAB, [{
+      note: 'No owner is marked include in ' + OWNER_UPDATE.SCOPE_TAB + '. Run ' +
+            'setupOwnerUpdateScope() to list every owner by door count, then put YES in ' +
+            'the include column for the ones you want.' }]);
+    return { owners: 0 };
+  }
+
+  // ---- index the portfolio once, not once per owner ----
+  var props = dropTPO_(readTab_('Properties_Units'));
+  var byOwner = {};
+  props.forEach(function (p) {
+    var k = String(p.owners || '').trim();
+    if (!k) return;
+    (byOwner[k] = byOwner[k] || []).push(p);
+  });
+
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+  var rrByProp = groupBy_(rr, function (r) { return String(r.property_id || ''); });
+  var delByProp = groupBy_(dropTPO_(readTab_('Delinquency_Aged')),
+                           function (r) { return String(r.property_id || ''); });
+  var renewals = readTab_('Renewal_Pipeline').filter(function (r) { return r.address; });
+  var renByProp = groupBy_(renewals, function (r) { return String(r.property_id || ''); });
+  var woByProp = groupBy_(dropTPO_(readTab_('Work_Orders')),
+                          function (r) { return String(r.property_id || ''); });
+  var inspByProp = groupBy_(readTab_('Inspections'),
+                            function (r) { return String(r.property_id || ''); });
+  var insByProp = {};
+  readTab_('Insurance_Owner').forEach(function (r) {
+    if (r.property_id) insByProp[String(r.property_id)] = r;
+  });
+  var mktByUnit = {};
+  readTab_('Rent_Market_Variance').forEach(function (r) {
+    if (r.unit_id) mktByUnit[String(r.unit_id)] = r;
+  });
+  var vacByProp = groupBy_(dropTPO_(readTab_('Unit_Vacancy')),
+                           function (r) { return String(r.property_id || ''); });
+
+  var rows = [];
+  scope.forEach(function (s) {
+    var key = String(s.owner_key || '').trim();
+    var mine = byOwner[key] || [];
+    rows.push(ownerPackRow_(s, key, mine, month, t, {
+      rrByProp: rrByProp, delByProp: delByProp, renByProp: renByProp, woByProp: woByProp,
+      inspByProp: inspByProp, insByProp: insByProp, mktByUnit: mktByUnit, vacByProp: vacByProp
+    }));
+  });
+
+  writeTab_(OWNER_UPDATE.OUT_TAB, rows);
+  logRun_('buildOwnerPacks', 'derived', OWNER_UPDATE.OUT_TAB, rows.length,
+          new Date().getTime() - t0,
+          rows.length + ' pack(s) for ' + month + ' · ' +
+          rows.reduce(function (a, r) { return a + (num_(r.doors) || 0); }, 0) + ' doors');
+  return { owners: rows.length, month: month };
+}
+
+/** Everything one owner's pack needs, assembled and rendered. */
+function ownerPackRow_(s, key, mine, month, t, ix) {
+  var name = String(s.preferred_name || key).trim();
+  var lines = [];
+  var gaps = [];
+  var doors = 0, occupied = 0, vacant = 0, gsr = 0, balance = 0;
+
+  var propIds = mine.map(function (p) { return String(p.property_id || ''); });
+
+  lines.push('# Monthly owner update pack — ' + name);
+  lines.push('');
+  lines.push('Reporting month: ' + monthLabel_(month));
+  lines.push('Prepared by: ' + (s.prepared_by || '[not set in ' + OWNER_UPDATE.SCOPE_TAB + ']'));
+  // The reply-to on anything an owner sees. Shared mailbox, never a personal address —
+  // see WELEASE_CONTACT in Core_v2.gs for why.
+  lines.push('WeLease contact: ' + WELEASE_CONTACT.OWNERS);
+  lines.push('Owner contact: ' + (s.contact_email || '[no email on file]'));
+  lines.push('Generated: ' + t + ' from AppFolio, LeadSimple and ShowMojo.');
+  lines.push('');
+  lines.push('EVERY FIGURE BELOW COMES FROM THE DATA. Nothing is estimated. Anything we do ' +
+             'not hold is listed under "Gaps" at the end — do not fill those in.');
+  lines.push('');
+
+  // ---- 2. portfolio snapshot ----
+  var unitRows = [];
+  mine.forEach(function (p) {
+    (ix.rrByProp[String(p.property_id)] || []).forEach(function (u) { unitRows.push(u); });
+  });
+  unitRows.forEach(function (u) {
+    doors++;
+    var cur = String(u.status || '').toLowerCase().indexOf('current') !== -1;
+    if (cur) { occupied++; gsr += (num_(u.rent) || 0); } else { vacant++; }
+  });
+  propIds.forEach(function (pid) {
+    (ix.delByProp[pid] || []).forEach(function (d) {
+      balance += (num_(d.amount_receivable) || 0);
+    });
+  });
+
+  lines.push('## 2. Portfolio snapshot');
+  lines.push('- Properties managed: ' + mine.length);
+  lines.push('- Doors: ' + doors + '  (occupied ' + occupied + ', vacant ' + vacant + ')');
+  lines.push('- Gross scheduled rent, occupied units: ' + money_(Math.round(gsr)) + ' per month');
+  lines.push('- Outstanding resident balances: ' + money_(Math.round(balance)));
+  lines.push('- Rent collected this month: [NOT IN THIS PACK — see Gaps]');
+  lines.push('');
+
+  // ---- 3. property by property ----
+  lines.push('## 3. Property by property');
+  mine.forEach(function (p) {
+    var pid = String(p.property_id || '');
+    lines.push('');
+    lines.push('### ' + addr_(p));
+    var units = ix.rrByProp[pid] || [];
+    if (!units.length) { lines.push('- No unit on the rent roll for this property.'); return; }
+    units.forEach(function (u) {
+      var mkt = ix.mktByUnit[String(u.unit_id)] || {};
+      var bits = [];
+      bits.push('rent ' + money_(num_(u.rent)));
+      if (num_(mkt.market_rent)) bits.push('market ' + money_(num_(mkt.market_rent)));
+      bits.push('lease ' + (ymd_(u.lease_from) || 'not recorded') + ' to ' +
+                (ymd_(u.lease_to) || 'NOT RECORDED'));
+      bits.push('status ' + (u.status || 'unknown'));
+      var due = num_(u.past_due) || 0;
+      // Lease and payment facts only. Nothing else about the resident goes in this pack.
+      bits.push(due > 0 ? 'balance ' + money_(due) : 'balance clear');
+      lines.push('- ' + (u.unit ? 'Unit ' + u.unit + ' — ' : '') + bits.join(' · '));
+      if (!ymd_(u.lease_to)) {
+        gaps.push('Lease end date missing for ' + addr_(p) + (u.unit ? ' unit ' + u.unit : '') +
+                  ' — no renewal date can be stated.');
+      }
+      if (!num_(mkt.market_rent)) {
+        gaps.push('Market rent not on file for ' + addr_(p) +
+                  (u.unit ? ' unit ' + u.unit : '') + ' — do not quote a market figure.');
+      }
+    });
+    var ins = ix.insByProp[pid];
+    if (ins) {
+      lines.push('- Property insurance: ' + (ins.placed_by || ins.status) +
+                 (ins.expires ? ', expires ' + ins.expires : '') +
+                 (ins.status === 'EXPIRED' || ins.status === 'NO RECORD'
+                   ? '  <-- worth raising with the owner' : ''));
+    }
+    var vac = ix.vacByProp[pid] || [];
+    vac.forEach(function (v) {
+      if (num_(v.days_vacant)) {
+        lines.push('- Vacant ' + daySpan_(num_(v.days_vacant)) +
+                   (v.advertised_rent ? ', advertised at ' + money_(num_(v.advertised_rent)) : ''));
+      }
+    });
+  });
+  lines.push('');
+
+  // ---- 4. what we handled this month ----
+  lines.push('## 4. What we handled this month (' + monthLabel_(month) + ')');
+  var woDone = [], woOpen = [], inspDone = [];
+  propIds.forEach(function (pid) {
+    (ix.woByProp[pid] || []).forEach(function (w) {
+      var done = ymd_(w.completed_on);
+      if (done && monthNorm_(done) === month) woDone.push(w);
+      else if (!done && !ymd_(w.canceled_on)) woOpen.push(w);
+    });
+    (ix.inspByProp[pid] || []).forEach(function (i) {
+      var d = ymd_(i.inspected_on) || ymd_(i.marked_done_on);
+      if (d && monthNorm_(d) === month) inspDone.push(i);
+    });
+  });
+  lines.push('- Work orders completed: ' + woDone.length);
+  woDone.slice(0, 12).forEach(function (w) {
+    lines.push('  - ' + (w.work_order_type || 'work order') + ' — ' +
+               String(w.job_description || '').slice(0, 90) +
+               (w.vendor ? ' (' + w.vendor + ')' : '') +
+               ', completed ' + ymd_(w.completed_on));
+  });
+  lines.push('- Inspections performed: ' + inspDone.length);
+  inspDone.slice(0, 8).forEach(function (i) {
+    lines.push('  - ' + (i.inspection_name || 'inspection') + ' on ' +
+               (ymd_(i.inspected_on) || ymd_(i.marked_done_on)));
+  });
+  lines.push('- Work orders still open: ' + woOpen.length);
+  woOpen.slice(0, 10).forEach(function (w) {
+    var age = daysBetween_(ymd_(w.created_at), t);
+    lines.push('  - ' + String(w.job_description || 'work order').slice(0, 80) +
+               (age !== null ? ' — open ' + daySpan_(age) : '') +
+               (w.vendor ? ', with ' + w.vendor : ', NO VENDOR ASSIGNED'));
+  });
+  if (woDone.length) gaps.push('Work order COSTS are not in our data feed — add them from ' +
+                               'AppFolio if the report should show what was spent.');
+  lines.push('');
+
+  // ---- 5. what's coming ----
+  lines.push('## 5. What is coming in the next 30 to 90 days');
+  var upcoming = [];
+  propIds.forEach(function (pid) {
+    (ix.renByProp[pid] || []).forEach(function (r) { upcoming.push(r); });
+  });
+  upcoming.sort(function (a, b) {
+    return (num_(a.days_to_renewal) === null ? 9999 : num_(a.days_to_renewal)) -
+           (num_(b.days_to_renewal) === null ? 9999 : num_(b.days_to_renewal));
+  });
+  if (!upcoming.length) {
+    lines.push('- No lease on these properties renews inside the tracked horizon.');
+  }
+  upcoming.forEach(function (r) {
+    if (!r.renewal_date) {
+      lines.push('- ' + r.address + ' — no lease end date on file, so no renewal window ' +
+                 'can be stated. Confirm whether this tenancy is month-to-month.');
+      return;
+    }
+    lines.push('- ' + r.address + ' — lease ends ' + r.renewal_date + ' (' +
+               dayLabel_(num_(r.days_to_renewal)) + '). Annual inspection: ' +
+               String(r.inspection_status).toLowerCase() +
+               (r.inspection_due_by ? ', due by ' + r.inspection_due_by : '') + '.');
+  });
+  lines.push('');
+  lines.push('Seasonal work, warranty expiries, permits and planned capital items are NOT ' +
+             'tracked in our data — see Gaps.');
+  lines.push('');
+
+  // ---- 6. decisions ----
+  lines.push('## 6. Candidate items for the owner to decide');
+  lines.push('Facts only. Which of these is genuinely a decision, what the options are and ' +
+             'what we recommend is a judgement for the person writing the report.');
+  var cand = [];
+  upcoming.forEach(function (r) {
+    if (r.inspection_status === 'OVERDUE' || r.inspection_status === 'DUE SOON') {
+      cand.push('Annual inspection at ' + r.address + ' is ' +
+                String(r.inspection_status).toLowerCase() +
+                (r.inspection_due_by ? ' (due by ' + r.inspection_due_by + ')' : '') + '.');
+    }
+    if (r.renewal_date && num_(r.current_rent) && num_(r.market_rent) &&
+        num_(r.market_rent) > num_(r.current_rent)) {
+      cand.push('Renewal at ' + r.address + ' on ' + r.renewal_date + ': current rent ' +
+                money_(num_(r.current_rent)) + ', market on file ' +
+                money_(num_(r.market_rent)) + '. Any rent adjustment is governed by ' +
+                'statute, local ordinance and the lease — confirm with the WeLease team ' +
+                'before acting.');
+    }
+  });
+  woOpen.forEach(function (w) {
+    if (String(w.estimate_approval_status || '').toLowerCase().indexOf('pend') !== -1) {
+      cand.push('Estimate awaiting approval: ' +
+                String(w.job_description || 'work order').slice(0, 70) + '.');
+    }
+  });
+  propIds.forEach(function (pid) {
+    var ins = ix.insByProp[pid];
+    if (ins && (ins.status === 'EXPIRED' || ins.status === 'NO RECORD')) {
+      cand.push('Property insurance at ' + ins.address + ' shows as ' +
+                String(ins.status).toLowerCase() + '. Confirm current coverage.');
+    }
+  });
+  if (!cand.length) lines.push('- Nothing outstanding in the data.');
+  cand.forEach(function (c) { lines.push('- ' + c); });
+  lines.push('');
+
+  // ---- gaps ----
+  gaps.push('Owner statement totals — income, expenses, net disbursement — are not in this ' +
+            'pack. Attach the AppFolio owner statement rather than restating the numbers.');
+  gaps.push('Planned or recommended capital items are not tracked anywhere we read.');
+  gaps.push('Rent comps and submarket data are not held. Skip the market section entirely ' +
+            'unless comps are supplied separately, with source and date.');
+
+  var seen = {}, uniq = [];
+  gaps.forEach(function (g) { if (!seen[g]) { seen[g] = 1; uniq.push(g); } });
+
+  lines.push('## Gaps — ask for these, do not fill them in');
+  uniq.forEach(function (g) { lines.push('- ' + g); });
+  lines.push('');
+  lines.push('## Rules for whoever writes this up');
+  lines.push('- State no law, notice period, rent cap, allowable fee, deposit rule or lease ' +
+             'term. None appears above, and none should appear in the report.');
+  lines.push('- Describe residents only by lease and payment facts. Nothing about household ' +
+             'composition or personal circumstances.');
+  lines.push('- Anything touching notices, rent increases, screening, habitability or ' +
+             'deposits gets flagged for team review, not written as a statement.');
+  lines.push('- The WeLease contact address on any owner report is ' +
+             WELEASE_CONTACT.OWNERS + '. Never a personal address — a reply to a personal ' +
+             'inbox is invisible to whoever is covering, and an owner treats it as a ' +
+             'private line.');
+
+  // Enforced, not just stated. Anything a landlord reads goes through the scrubber, so a
+  // personal address that reached the pack from a scope sheet or a note cannot survive
+  // into the report.
+  var scrubbed = scrubPersonalEmails_(lines.join('\n'), 'owner');
+  if (scrubbed.replaced) {
+    logRun_('ownerPackRow_', 'derived', OWNER_UPDATE.OUT_TAB, 0, 0,
+            'Replaced ' + scrubbed.replaced + ' personal WeLease address(es) with ' +
+            scrubbed.shared + ' in ' + name + '\u2019s pack.');
+  }
+
+  return {
+    owner: key,
+    preferred_name: name,
+    month: month,
+    properties: mine.length,
+    doors: doors,
+    occupied: occupied,
+    vacant: vacant,
+    gross_scheduled_rent: round2_(gsr),
+    outstanding_balance: round2_(balance),
+    open_work_orders: woOpen.length,
+    completed_this_month: woDone.length,
+    renewals_in_horizon: upcoming.length,
+    decision_candidates: cand.length,
+    gaps: uniq.length,
+    contact_email: s.contact_email || '',
+    welease_contact: WELEASE_CONTACT.OWNERS,
+    personal_emails_replaced: scrubbed.replaced,
+    pack: scrubbed.text
+  };
+}
+
+/** One owner's pack in the log, so it can be copied straight out. */
+function ownerPackFor(ownerKey) {
+  var want = String(ownerKey || '').trim().toLowerCase();
+  var rows = readTab_(OWNER_UPDATE.OUT_TAB).filter(function (r) { return r.pack; });
+  if (!rows.length) return 'No packs yet. Run buildOwnerPacks().';
+  var hit = rows.filter(function (r) {
+    return String(r.owner || '').toLowerCase().indexOf(want) !== -1 ||
+           String(r.preferred_name || '').toLowerCase().indexOf(want) !== -1;
+  })[0];
+  if (!hit) {
+    return 'No pack matches "' + ownerKey + '". Available: ' +
+           rows.map(function (r) { return r.owner; }).join(' | ');
+  }
+  Logger.log(hit.pack);
+  return hit.pack;
+}
