@@ -1,0 +1,630 @@
+/**
+ * WeLease Pipeline — INSPECTIONS  v1.0.0 · 2026-08-05
+ * Requires Core_v2.gs.
+ *
+ * DESIGN DECISION, and it matters:
+ * Move-out assessment speed does NOT depend on what someone typed in the inspection
+ * title. It uses DATE LOGIC — the first inspection recorded on or after the resident's
+ * move-out date, joined on occupancy_id. Whatever it was called, that visit is the
+ * assessment.
+ *
+ * Why: inspection_name is uncontrolled free text. The live data holds hundreds of
+ * spellings for a handful of real things, plus addresses, staff names, and records
+ * titled "Please ERASE" and "STEPHANIE UPLOAD PHOTOS HERE". A KPI that depends on
+ * that string is a KPI that breaks the first time someone types differently.
+ *
+ * Name classification is kept as a CROSS-CHECK and as a data-quality report, not as
+ * the source of truth.
+ */
+
+// ============================================================ CLASSIFIER
+
+/**
+ * Returns { type, confidence }. Tested against ~200 live values: 88% classified,
+ * and every remaining unknown is an address or a person's name — not an inspection.
+ *
+ * ORDER IS LOad-BEARING. pre_move_out must resolve before move_out; a pre-MOI happens
+ * at notice, before the resident vacates. Treating one as a move-out assessment would
+ * make deposit timing look materially better than it is.
+ */
+function classifyInspection_(name) {
+  if (!name) return { type: 'unclassified', confidence: 'none' };
+  var n = String(name).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  var has = function (s) { return n.indexOf(s) !== -1; };
+  var code = function (c) {
+    return n === c || n.indexOf(c + ' ') === 0 || n.indexOf(' ' + c) === n.length - c.length - 1;
+  };
+  var flat = n.replace(/ /g, '');
+
+  // T0 — junk, tests, placeholders. Excluded from every metric and surfaced for cleanup.
+  if (/\b(erase|delete|deleted|disregard|untitled|tbd|test inspection|upload photo|upload photos|do not share)\b/.test(n)
+      || /^(tt|yn|tr|ii|ai|mi|mo|check|photos|pictures|notices|parking|exterior|complex|visit|inspection)$/.test(n)) {
+    return { type: 'junk', confidence: 'high' };
+  }
+
+  // T1 — system-generated compound tokens
+  if (/moveininspection/.test(flat))                    return { type: 'move_in',  confidence: 'high' };
+  if (/moveoutinspection|moveoutins/.test(flat))        return { type: 'move_out', confidence: 'high' };
+
+  // T2 — pre-move-out BEFORE move-out
+  if (/\bpmoi\b|\bpremoi\b|\bp moi\b/.test(n) ||
+      (has('pre') && (has('move out') || has('moveout') || /\bmoi\b/.test(n)))) {
+    return { type: 'pre_move_out', confidence: 'high' };
+  }
+
+  // T3 — spelled-out keywords
+  var isMoveOut = has('move out') || has('moveout') || /\bmoi\b/.test(n);
+  var isMoveIn  = has('move in')  || has('movein')  || /\bmii+\b/.test(n);
+  if (/ann?ua?l/.test(n))                               return { type: 'annual', confidence: 'high' };
+  if (has('turnover') || has('turn over') || has('turn work') || has('turn complete'))
+                                                        return { type: 'turnover_completion', confidence: 'high' };
+  if (has('rent ready') || has('make ready') || has('show ready') || has('showings ready') || has('ready to market'))
+                                                        return { type: 'make_ready', confidence: 'high' };
+  if (has('vacancy') || has('vacant'))                  return { type: 'vacancy_visit', confidence: 'high' };
+  if (has('initial') || has('onboarding'))              return { type: 'initial', confidence: 'high' };
+  if (isMoveOut)                                        return { type: 'move_out', confidence: 'high' };
+  if (isMoveIn)                                         return { type: 'move_in', confidence: 'high' };
+
+  // T4 — internal two-letter codes, usually followed by an address
+  if (code('ii') || has('tpo ii'))                      return { type: 'initial',      confidence: 'medium' };
+  if (code('ai'))                                       return { type: 'annual',       confidence: 'medium' };
+  if (code('mi'))                                       return { type: 'move_in',      confidence: 'medium' };
+  if (code('mo'))                                       return { type: 'move_out',     confidence: 'medium' };
+  if (code('poi'))                                      return { type: 'pre_move_out', confidence: 'low' };
+
+  // T5 — operational visits, not KPI inspections
+  if (has('insurance'))                                 return { type: 'insurance_visit', confidence: 'high' };
+  if (has('ad hoc') || has('adhoc') || has('as hoc'))   return { type: 'ad_hoc', confidence: 'high' };
+  if (/\b(violation|trespass|tresspass|eviction|lockout|section 8|military|hoa)\b/.test(n))
+                                                        return { type: 'compliance_visit', confidence: 'medium' };
+  if (/\b(landscape|pest|pool|trash|carpet|cleaning|clean|repair|repairs|leak|mildew|mold|water|plumbing|electrical|hvac|blinds|window|appliance|washer|construction|mitigation|remediation|chairlift)\b/.test(n))
+                                                        return { type: 'maintenance_visit', confidence: 'medium' };
+  if (/\b(re inspection|reinspection|re visit|revised|follow up|check in|checkin|check on|progress|missed)\b/.test(n))
+                                                        return { type: 'follow_up', confidence: 'medium' };
+  if (/\b(visit|walkthrough|walk through|walthrough|photo|photos|picture|pictures|inspect|inspection|site|work completed|work completion)\b/.test(n))
+                                                        return { type: 'ad_hoc', confidence: 'low' };
+  return { type: 'unclassified', confidence: 'none' };
+}
+
+// ============================================================ MOVE-OUT EXTRACTION
+// Single source of truth. Three functions previously each re-implemented this
+// filter against the literal string "move out" — which returned ZERO rows on
+// 2026-08-05 because the real event value is punctuated differently.
+
+/**
+ * True if a tenant_tickler row represents an actual move-out.
+ * Normalises punctuation, so "Move-Out", "Move Out", "MoveOut", and "MOVE_OUT"
+ * all match. Explicitly EXCLUDES notice events — a notice to vacate is not a
+ * move-out, and counting it as one would start the deposit clock weeks early.
+ */
+function isMoveOutEvent_(row) {
+  var e = String(row.event || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (!e) return false;
+  if (e.indexOf('notice') !== -1) return false;
+  return e.indexOf('moveout') !== -1;
+}
+
+/**
+ * Move-outs from a tenant_tickler pull.
+ * Falls back to date-presence if no row matches on event, so a naming change in
+ * AppFolio degrades the result rather than silently returning nothing.
+ * Any fallback is logged loudly — a silent fallback is worse than a failure.
+ */
+function getMoveOuts_(ticklerRows) {
+  var byEvent = ticklerRows.filter(function (r) {
+    return r.move_out_date && isMoveOutEvent_(r);
+  });
+  if (byEvent.length) return byEvent;
+
+  var byDate = ticklerRows.filter(function (r) { return r.move_out_date; });
+  if (byDate.length) {
+    logError_('appfolio', 'getMoveOuts_',
+      'FALLBACK ENGAGED: no row matched on event, using move_out_date presence instead (' +
+      byDate.length + ' rows). Run diagnoseTicklerEvents() and update isMoveOutEvent_().');
+  }
+  return byDate;
+}
+
+/**
+ * Shows the real tenant_tickler event values. Run this first when move-out counts
+ * look wrong.
+ */
+function diagnoseTicklerEvents(days) {
+  days = days || 365;
+  var from = ymd_(addDays_(today_(), -days)), to = ymd_(today_());
+  var rows = afReport_('tenant_tickler', { occurred_on_from: from, occurred_on_to: to });
+  var out = [];
+
+  finding_(out, 'tenant_tickler', 'Rows returned', rows.length + ' (' + from + ' to ' + to + ')', null);
+  finding_(out, 'tenant_tickler', 'event — DISTINCT VALUES', distinctWithCounts_(rows, 'event', 40),
+    'THIS IS THE ANSWER. Whatever spelling appears here is what isMoveOutEvent_() must match.');
+  finding_(out, 'tenant_tickler', 'move_out_date fill rate', fillRate_(rows, 'move_out_date'), null);
+  finding_(out, 'tenant_tickler', 'move_in_date fill rate', fillRate_(rows, 'move_in_date'), null);
+  finding_(out, 'tenant_tickler', 'move_out_reason — DISTINCT VALUES',
+    distinctWithCounts_(rows, 'move_out_reason', 30),
+    'Feeds moveout_trigger_mix. Classify each as controllable or not.');
+  finding_(out, 'tenant_tickler', 'occupancy_id fill rate', fillRate_(rows, 'occupancy_id'),
+    'Must be near 100% — it is the join key to general_ledger and inspection_detail.');
+
+  var matched = rows.filter(isMoveOutEvent_).length;
+  var dated = rows.filter(function (r) { return r.move_out_date; }).length;
+  finding_(out, 'tenant_tickler', 'Matcher check',
+    'isMoveOutEvent_ matched ' + matched + ' · rows with a move_out_date: ' + dated,
+    matched === 0 ? 'MATCHER IS WRONG — see the distinct event values above.'
+                  : (matched < dated * 0.5 ? 'Matcher may be too narrow. Compare against the event values.'
+                                           : 'Matcher looks correct.'));
+
+  var sample = rows.slice(0, 3).map(function (r) {
+    return { event: r.event, move_out_date: r.move_out_date, move_in_date: r.move_in_date,
+             occurred_date: r.occurred_date, occupancy_id: r.occupancy_id,
+             tenant_status: r.tenant_status, move_out_reason: r.move_out_reason };
+  });
+  finding_(out, 'tenant_tickler', 'Sample rows', JSON.stringify(sample), null);
+
+  writeTab_('_tickler_diagnostic', out, { headers: ['system','question','answer','action_required','discovered_at'] });
+  Logger.log(JSON.stringify(out, null, 1));
+  return out;
+}
+
+// ============================================================ MOVE-OUT ASSESSMENT
+
+/**
+ * Speed to Move-Out Assessment — date-driven, name-independent.
+ *
+ * For each move-out: the first inspection with inspected_on >= move_out_date for the
+ * same occupancy_id. Name classification rides along as a confidence signal only.
+ *
+ * KPI guide benchmark: median 1 day / top quartile 1 day.
+ */
+function buildMoveOutAssessment(fromDate, toDate) {
+  var t0 = new Date().getTime();
+  fromDate = fromDate || ymd_(addDays_(today_(), -365));
+  toDate   = toDate   || ymd_(today_());
+
+  var tick = afReport_('tenant_tickler', { occurred_on_from: fromDate, occurred_on_to: toDate });
+  sleepFor_('appfolio');
+  var moveOuts = getMoveOuts_(tick);
+
+  var insp = afReport_('inspection_detail', { inspected_on_from: fromDate, inspected_on_to: toDate });
+
+  // occupancy_id -> inspections, oldest first
+  var byOcc = {};
+  insp.forEach(function (r) {
+    if (r.occupancy_id === null || r.occupancy_id === undefined) return;
+    (byOcc[r.occupancy_id] = byOcc[r.occupancy_id] || []).push(r);
+  });
+  Object.keys(byOcc).forEach(function (k) {
+    byOcc[k].sort(function (a, b) { return ymd_(a.inspected_on) < ymd_(b.inspected_on) ? -1 : 1; });
+  });
+
+  var rows = moveOuts.map(function (mo) {
+    var moDate = ymd_(mo.move_out_date);
+    var after = (byOcc[mo.occupancy_id] || []).filter(function (r) {
+      var d = ymd_(r.inspected_on);
+      return d && moDate && d >= moDate;
+    });
+    var first = after[0] || null;
+    var cls = first ? classifyInspection_(first.inspection_name) : null;
+    var days = first ? daysBetween_(moDate, ymd_(first.inspected_on)) : null;
+
+    return {
+      occupancy_id: mo.occupancy_id,
+      tenant: mo.tenant || null,
+      property_id: mo.property_id || null,
+      property_name: mo.property_name || null,
+      unit_id: mo.unit_id || null,
+      move_out_date: moDate,
+      move_out_reason: mo.move_out_reason || null,
+      assessment_date: first ? ymd_(first.inspected_on) : null,
+      days_to_assessment: (days !== null && days >= 0 && days <= 60) ? days : null,
+      raw_days: days,
+      inspection_name: first ? first.inspection_name : null,
+      name_classification: cls ? cls.type : null,
+      name_confidence: cls ? cls.confidence : null,
+      // A name that classifies as move_out corroborates the date logic. Anything else
+      // is worth a human glance before this row is trusted.
+      corroborated: (cls && cls.type === 'move_out') ? 'YES' : null,
+      inspections_after_moveout: after.length,
+      status: !first ? 'NO_INSPECTION_FOUND'
+            : (days < 0) ? 'DATA_ERROR_NEGATIVE'
+            : (days > 60) ? 'OUTLIER_OVER_60D'
+            : 'OK'
+    };
+  }).sort(function (a, b) { return (a.move_out_date < b.move_out_date) ? 1 : -1; });
+
+  var usable = rows.filter(function (r) { return r.status === 'OK'; });
+  var vals = usable.map(function (r) { return r.days_to_assessment; });
+  var corrob = usable.filter(function (r) { return r.corroborated === 'YES'; }).length;
+
+  writeTab_('MoveOut_Assessment', rows);
+
+  var summary = {
+    metric: 'moveout_assessment_speed',
+    period: fromDate + ' to ' + toDate,
+    move_outs: moveOuts.length,
+    usable_n: usable.length,
+    no_inspection_found: rows.filter(function (r) { return r.status === 'NO_INSPECTION_FOUND'; }).length,
+    outliers_over_60d: rows.filter(function (r) { return r.status === 'OUTLIER_OVER_60D'; }).length,
+    median_days: median_(vals),
+    p90_days: p90_(vals),
+    benchmark_median: 1,
+    benchmark_top25: 1,
+    vs_benchmark: vsBenchmark_(median_(vals), { median: 1, top_25_pct: 1 }, 'lower_is_better'),
+    name_corroboration_rate: usable.length ? Math.round(corrob / usable.length * 100) + '%' : null,
+    publishable: usable.length >= CFG.MIN_N_TO_PUBLISH ? 'YES' : 'NO — n below ' + CFG.MIN_N_TO_PUBLISH
+  };
+  appendTab_('Metrics_History', [Object.assign({ run_date: nowStamp_() }, summary)]);
+  logRun_('buildMoveOutAssessment', 'appfolio', 'MoveOut_Assessment', rows.length,
+          new Date().getTime() - t0,
+          'median=' + summary.median_days + 'd · n=' + usable.length +
+          ' · corroboration=' + summary.name_corroboration_rate);
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
+
+// ============================================================ DATA QUALITY
+
+
+// ============================================================ RENEWAL PIPELINE
+
+/**
+ * The renewal pipeline, with the annual inspection on its own clock.
+ *
+ * THE RULE, from Frank, 2026-08-17: the annual inspection must be COMPLETED at least 80 days
+ * before the renewal date. That is a WeLease operating standard — not a statute, not a lease
+ * term, and nothing here issues a notice, a fee, or a resident communication.
+ *
+ * WHY THIS TAB EXISTS. The team has been running renewals out of a workbook where, of 266
+ * rows for 2026, only 34 carried a completed inspection and 209 were blank. A spreadsheet
+ * cannot tell you an inspection is late, because it does not know today's date against a
+ * deadline it never computed. This does exactly that one thing.
+ *
+ * WHAT COUNTS AS THIS CYCLE'S INSPECTION. An inspection recorded inside the 365 days before
+ * the renewal date. Anything older belongs to a previous cycle, and counting it would let a
+ * unit inspected two years ago read as compliant.
+ */
+var RENEWAL = {
+  INSPECTION_LEAD_DAYS: 80,   // WeLease standard: inspection done this far before renewal
+  DUE_SOON_DAYS: 30,          // how far ahead of the inspection deadline to start warning
+  HORIZON_DAYS: 240,          // renewals worth showing — the process starts ~3.5 months out
+  CYCLE_WINDOW_DAYS: 365,     // an inspection older than this belongs to a previous cycle
+
+  // WHICH INSPECTIONS COUNT — a POSITIVE match on the name, which is how Frank does it.
+  //
+  // My first version had this backwards. It excluded anything that looked like another event
+  // and counted the rest, on the theory that requiring the word "annual" would fail on typos.
+  // Frank's own export settles it: of 2,653 inspection records, 572 say annual or AI. The
+  // negative filter would have accepted 453 more — 17% of every inspection on the account —
+  // on names that never mention an annual inspection at all:
+  //
+  //     MII walkthrough  21     Ad Hoc visit  13     MOI  5     Pre-MOI  7     Visit  3
+  //
+  // MII and MOI are move-in and move-out inspections. Counting those as the annual would
+  // report a unit as compliant that nobody inspected for the renewal — a false pass, which
+  // is the one direction this must never fail in. An overdue row is a task; a false pass is
+  // silence.
+  //
+  // "AI" is WeLease's own abbreviation for Annual Inspection and appears on 22 records.
+  // Matched as a whole word only, so it cannot fire inside another word.
+  ANNUAL_NAME: /annual|\bai\b|\ba\.i\.?\b/i,
+
+  // Still excluded even if the name also says annual, because the event decides, not the
+  // label — e.g. a move-out walkthrough somebody titled "Annual/Move Out".
+  NOT_ANNUAL: /move.?in|move.?out|\bmii\b|\bmoi\b|turn|make.?ready|vacan|pre.?move|erase|delete|dummy/i,
+
+  // WHEN IT COUNTS AS DONE. Of the 572 annual records, all 572 carry an inspection date but
+  // only 104 carry "marked done on", and 419 sit at OUT FOR SIGNING or IN PROGRESS.
+  // Requiring the paperwork would discard 82% of real inspections. The VISIT is the control;
+  // the signature is administration, and it is reported separately rather than used as a gate.
+  SIGNED_STATUSES: /signed|done|complete/i
+};
+
+function buildRenewalPipeline() {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+  var pm = pmLookup_();
+  var live = liveTenancy_();
+
+  // ---- inspections, by unit, newest first ----
+  var inspByUnit = {};
+  var inspTotal = 0, inspNotAnnual = 0, inspAnnual = 0, inspFuture = 0, inspUnsigned = 0;
+  readTab_('Inspections').forEach(function (r) {
+    if (!r.unit_id) return;
+    var name = String(r.inspection_name || '');
+    inspTotal++;
+
+    // POSITIVE match. The name has to say annual or AI, and must not name another event.
+    if (!RENEWAL.ANNUAL_NAME.test(name) || RENEWAL.NOT_ANNUAL.test(name)) {
+      inspNotAnnual++;
+      return;
+    }
+    inspAnnual++;
+
+    var when = ymd_(r.inspected_on) || ymd_(r.marked_done_on);
+    var b = inspByUnit[r.unit_id] || (inspByUnit[r.unit_id] = { done: [], scheduled: [] });
+    if (!when) { b.scheduled.push({ status: r.status || '', name: name }); return; }
+
+    if (when > t) {
+      // Dated in the future: booked, not done.
+      inspFuture++;
+      b.scheduled.push({ status: r.status || 'scheduled', name: name, date: when });
+      return;
+    }
+    var signed = RENEWAL.SIGNED_STATUSES.test(String(r.status || ''));
+    if (!signed) inspUnsigned++;
+    b.done.push({ date: when, name: name, status: r.status || '', signed: signed });
+  });
+  Object.keys(inspByUnit).forEach(function (k) {
+    inspByUnit[k].done.sort(function (a, b) { return a.date < b.date ? 1 : -1; });
+  });
+
+  // ---- rent, for the renewal conversation ----
+  var rentByOcc = {}, rentByUnit = {};
+  dropTPO_(readTab_('Rent_Roll')).forEach(function (r) {
+    var rec = { rent: num_(r.rent), market: num_(r.market_rent) || num_(r.computed_market_rent),
+                last_increase: ymd_(r.last_rent_increase) };
+    if (r.occupancy_id) rentByOcc[r.occupancy_id] = rec;
+    if (r.unit_id) rentByUnit[r.unit_id] = rec;
+  });
+
+  // ---- LeadSimple renewal processes, matched by address ----
+  //
+  // A LeadSimple process carries a LeadSimple property id, which cannot be joined to an
+  // AppFolio one. Address is the only shared key, and the two systems record it at
+  // DIFFERENT GRAIN: AppFolio gives a unit address ("1042 Grand Ave #3"), LeadSimple gives
+  // the property ("1042 Grand Ave") with the unit, when it has one, in its own field.
+  //
+  // So matching the two strings exactly fails on every multi-unit building, and matching on
+  // the property alone would attach one building's renewal process to all four of its units.
+  // Two keys, in order:
+  //   1. property + unit, when LeadSimple carries a unit — unambiguous.
+  //   2. property alone, but ONLY where that property has exactly one renewal in the
+  //      horizon. Where it has more, the row is left empty and logged, because a wrong
+  //      process link sends someone to another resident's renewal.
+  var lsProcs = readTab_('LS_Processes').filter(function (r) {
+    return /renewal/i.test(String(r.process_type || '')) && r.property_address;
+  });
+  var lsByPropUnit = {}, lsByProp = {}, lsPropCount = {};
+  lsProcs.forEach(function (r) {
+    var prop = norm_(String(r.property_address || ''));
+    if (!prop) return;
+    var better = function (prev) {
+      // Prefer an open process; between two open ones prefer the more recently touched.
+      return !prev || (r.is_open === 'YES' && prev.is_open !== 'YES');
+    };
+    if (r.unit) {
+      var pu = prop + ' # ' + norm_(String(r.unit));
+      if (better(lsByPropUnit[pu])) lsByPropUnit[pu] = r;
+    }
+    if (better(lsByProp[prop])) lsByProp[prop] = r;
+    lsPropCount[prop] = (lsPropCount[prop] || 0) + 1;
+  });
+
+  // How many renewals in the horizon sit on each property — the ambiguity guard for key 2.
+  var renewalsPerProp = {};
+  var lsJoinExceptions = [];
+
+  // ---- renewal paperwork status ----
+  var renByOcc = {};
+  dropTPO_(readTab_('Renewals')).forEach(function (r) {
+    if (r.occupancy_id) renByOcc[r.occupancy_id] = r;
+  });
+
+  var candidates = dropTPO_(readTab_('Lease_Expirations')).filter(function (r) {
+    return isActiveTenancy_(r, live);
+  });
+  candidates.forEach(function (r) {
+    var pid = String(r.property_id || '');
+    if (pid) renewalsPerProp[pid] = (renewalsPerProp[pid] || 0) + 1;
+  });
+
+  var rows = [];
+  candidates.forEach(function (r) {
+    var expiry = ymd_(r.lease_expires);
+    var toExpiry = expiry ? daysBetween_(t, expiry) : null;
+
+    // No expiry date means no renewal date, so no inspection deadline can be computed.
+    // These are kept, flagged, and counted — they are real tenancies, and roughly half of
+    // lease_expiration_detail arrives this way.
+    var noDate = !expiry;
+    if (!noDate && (toExpiry === null || toExpiry > RENEWAL.HORIZON_DAYS)) return;
+
+    var inspDue = expiry ? ymd_(addDays_(parseDate_(expiry), -RENEWAL.INSPECTION_LEAD_DAYS)) : null;
+    var cycleFrom = expiry ? ymd_(addDays_(parseDate_(expiry), -RENEWAL.CYCLE_WINDOW_DAYS)) : null;
+
+    var b = inspByUnit[r.unit_id] || { done: [], scheduled: [] };
+    var lastAny = b.done.length ? b.done[0].date : null;
+    // This cycle's inspection: inside the 365 days before renewal, and not after it.
+    var thisCycle = null, thisCycleName = '', thisCycleSigned = false;
+    for (var i = 0; i < b.done.length; i++) {
+      var d = b.done[i].date;
+      if (cycleFrom && d >= cycleFrom && (!expiry || d <= expiry)) {
+        thisCycle = d; thisCycleName = b.done[i].name; thisCycleSigned = !!b.done[i].signed;
+        break;
+      }
+    }
+    // Independently of the renewal cycle: when was this unit last inspected at all?
+    // Frank's second priority — anything not seen in over a year, renewal or no renewal.
+    var lastAnnual = b.done.length ? b.done[0].date : null;
+    var monthsSince = lastAnnual ? Math.round(daysBetween_(lastAnnual, t) / 30.44) : null;
+
+    var slack = (inspDue && thisCycle) ? daysBetween_(thisCycle, inspDue) : null;  // +ve = early
+    var daysToDue = inspDue ? daysBetween_(t, inspDue) : null;                      // +ve = ahead
+
+    var status, sev;
+    if (noDate) {
+      status = 'NO RENEWAL DATE'; sev = 'warn';
+    } else if (thisCycle) {
+      if (slack !== null && slack >= 0) { status = 'DONE ON TIME'; sev = 'good'; }
+      else { status = 'DONE LATE'; sev = 'warn'; }
+    } else if (daysToDue !== null && daysToDue < 0) {
+      status = 'OVERDUE'; sev = 'bad';
+    } else if (b.scheduled.length) {
+      status = 'SCHEDULED'; sev = 'ok';
+    } else if (daysToDue !== null && daysToDue <= RENEWAL.DUE_SOON_DAYS) {
+      status = 'DUE SOON'; sev = 'warn';
+    } else {
+      status = 'NOT YET DUE'; sev = 'none';
+    }
+
+    // AppFolio's unit address, split back into property and unit so it can meet LeadSimple
+    // at the grain LeadSimple records.
+    var full = norm_(addr_(r));
+    var unitPart = norm_(String(r.unit || ''));
+    var propPart = full;
+    if (unitPart) {
+      // addr_ appends " #<unit>"; strip that suffix rather than the unit number wherever it
+      // happens to appear, so "778 Palm St #7" does not become "78 Palm St".
+      propPart = norm_(String(addr_(r)).replace(/\s*#\s*[^#]*$/, ''));
+    }
+
+    var ls = null, lsMatch = '';
+    if (unitPart && lsByPropUnit[propPart + ' # ' + unitPart]) {
+      ls = lsByPropUnit[propPart + ' # ' + unitPart];
+      lsMatch = 'property and unit';
+    } else if (lsByProp[propPart]) {
+      var renewalsHere = renewalsPerProp[String(r.property_id || '')] || 1;
+      if (renewalsHere === 1 && (lsPropCount[propPart] || 1) === 1) {
+        ls = lsByProp[propPart];
+        lsMatch = 'property (the only renewal there)';
+      } else {
+        lsJoinExceptions.push({
+          source: 'renewal_pipeline', address: addr_(r), property_id: r.property_id || '',
+          reason: 'A renewal process exists for this property but ' + renewalsHere +
+                  ' units there are up for renewal and LeadSimple carries no unit — ' +
+                  'left unlinked rather than pointed at the wrong resident.',
+          checked_on: t
+        });
+      }
+    }
+    var ren = renByOcc[r.occupancy_id] || null;
+    var money = rentByOcc[r.occupancy_id] || rentByUnit[r.unit_id] || {};
+
+    rows.push({
+      inspection_status: status,
+      severity: sev,
+      address: addr_(r),
+      unit: r.unit || '',
+      resident: r.tenant_name || '',
+      pm_group: pmOf_(pm, r.property_id, r.unit_id),
+      renewal_date: expiry || '',
+      days_to_renewal: toExpiry,
+      inspection_due_by: inspDue || '',
+      days_to_inspection_due: daysToDue,
+      inspection_completed: thisCycle || '',
+      inspection_name: thisCycleName,
+      // Every counted inspection now says annual or AI by definition, so this is always YES
+      // when one was found. Kept as a column so the rule is legible in the tab itself.
+      inspection_name_confirms_annual: thisCycle ? 'YES' : '',
+      // The visit is the control; the signature is administration. An unsigned report does
+      // not make a unit un-inspected, but it is real follow-up work and belongs on a list.
+      report_signed: thisCycle ? (thisCycleSigned ? 'YES' : '') : '',
+      last_annual_inspection: lastAnnual || '',
+      months_since_last_annual: monthsSince,
+      over_a_year_since_inspected: (monthsSince === null || monthsSince > 12) ? 'YES' : '',
+      days_early: slack,
+      last_inspection_any_cycle: lastAny || '',
+      // Renewal paperwork, so the two clocks sit side by side.
+      renewal_sent: ren ? (ymd_(ren.renewal_sent_date) || '') : '',
+      countersigned: ren ? (ymd_(ren.countersigned_date) || '') : '',
+      renewal_status: ren ? (ren.status || '') : '',
+      // LeadSimple, where the work actually happens.
+      ls_process_id: ls ? ls.process_id : '',
+      ls_matched_on: lsMatch,
+      ls_stage: ls ? (ls.stage || '') : '',
+      ls_owner: ls ? (ls.owner || '') : '',
+      ls_open: ls ? (ls.is_open === 'YES' ? 'YES' : '') : '',
+      ls_days_overdue: ls ? num_(ls.days_overdue) : null,
+      current_rent: money.rent === undefined ? null : money.rent,
+      market_rent: money.market === undefined ? null : money.market,
+      last_rent_increase: money.last_increase || '',
+      occupancy_id: r.occupancy_id || '',
+      unit_id: r.unit_id || '',
+      property_id: r.property_id || ''
+    });
+  });
+
+  var rank = { 'OVERDUE': 0, 'DUE SOON': 1, 'NO RENEWAL DATE': 2, 'SCHEDULED': 3,
+               'DONE LATE': 4, 'NOT YET DUE': 5, 'DONE ON TIME': 6 };
+  rows.sort(function (a, b) {
+    return (rank[a.inspection_status] - rank[b.inspection_status]) ||
+           ((a.days_to_inspection_due === null ? 9999 : a.days_to_inspection_due) -
+            (b.days_to_inspection_due === null ? 9999 : b.days_to_inspection_due));
+  });
+
+  writeTab_('Renewal_Pipeline', rows.length ? rows
+    : [{ note: 'No active lease renews within ' + RENEWAL.HORIZON_DAYS + ' days.' }]);
+
+  if (lsJoinExceptions.length) {
+    var prior = readTab_('_ls_join_exceptions').filter(function (x) {
+      return x.source !== 'renewal_pipeline';
+    });
+    writeTab_('_ls_join_exceptions', prior.concat(lsJoinExceptions));
+  }
+
+  function n(st) { return rows.filter(function (r) { return r.inspection_status === st; }).length; }
+  var done = n('DONE ON TIME'), late = n('DONE LATE');
+  var measurable = rows.filter(function (r) {
+    return r.inspection_status !== 'NO RENEWAL DATE' && r.inspection_status !== 'NOT YET DUE';
+  }).length;
+
+  var summary = {
+    run_date: nowStamp_(),
+    metric: 'renewal_inspection_compliance',
+    lead_days_standard: RENEWAL.INSPECTION_LEAD_DAYS,
+    renewals_in_horizon: rows.length,
+    done_on_time: done,
+    done_late: late,
+    overdue: n('OVERDUE'),
+    due_soon: n('DUE SOON'),
+    scheduled: n('SCHEDULED'),
+    not_yet_due: n('NOT YET DUE'),
+    no_renewal_date: n('NO RENEWAL DATE'),
+    // On-time rate is measured only against renewals whose deadline has arrived. A renewal
+    // six months out is not late, and putting it in the denominator would flatter the number.
+    on_time_rate_pct: measurable ? round1_(done / measurable * 100) : null,
+    measured_against: measurable,
+    // How much of the compliance figure rests on a name that says "annual", and how much on
+    // one that simply is not obviously something else.
+    inspection_records_read: inspTotal,
+    inspection_records_excluded_as_other_events: inspNotAnnual,
+    inspection_records_named_annual: inspAnnual,
+    inspection_records_dated_in_the_future: inspFuture,
+    inspection_reports_unsigned: inspUnsigned,
+    counted_with_an_annual_name: rows.filter(function (r) {
+      return r.inspection_name_confirms_annual === 'YES'; }).length,
+    // Frank's second priority, independent of any renewal date.
+    units_not_inspected_in_over_a_year: rows.filter(function (r) {
+      return r.over_a_year_since_inspected === 'YES'; }).length,
+    reports_awaiting_signature: rows.filter(function (r) {
+      return r.inspection_completed && r.report_signed !== 'YES'; }).length,
+    with_a_leadsimple_process: rows.filter(function (r) { return r.ls_process_id; }).length,
+    matched_on_property_and_unit: rows.filter(function (r) {
+      return r.ls_matched_on === 'property and unit'; }).length,
+    left_unlinked_as_ambiguous: lsJoinExceptions.length
+  };
+  appendTab_('Metrics_History', [summary]);
+
+  logRun_('buildRenewalPipeline', 'derived', 'Renewal_Pipeline', rows.length,
+          new Date().getTime() - t0,
+          'on time ' + done + ' · late ' + late + ' · overdue ' + summary.overdue +
+          ' · due soon ' + summary.due_soon + ' · no date ' + summary.no_renewal_date +
+          ' · on-time rate ' + summary.on_time_rate_pct + '% of ' + measurable);
+
+  if (inspTotal > 20 && !inspAnnual) {
+    logError_('portfolio', 'renewal inspections',
+      'None of ' + inspTotal + ' inspection records has a name containing "annual" or "AI", ' +
+      'so no unit can satisfy the ' + RENEWAL.INSPECTION_LEAD_DAYS + '-day standard. Either ' +
+      'annual inspections are titled differently on this account, or the pull is returning ' +
+      'the wrong window — check RENEWAL.ANNUAL_NAME in Inspections.gs.');
+  }
+
+  if (summary.overdue > 0) {
+    logError_('portfolio', 'renewal inspections',
+      summary.overdue + ' renewal(s) are past the ' + RENEWAL.INSPECTION_LEAD_DAYS +
+      '-day inspection deadline with no inspection recorded for this cycle. See ' +
+      'Renewal_Pipeline, sorted worst first.');
+  }
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
