@@ -1,0 +1,257 @@
+/**
+ * WeLease Pipeline — MASTER SCOPE  v1.0.0 · 2026-08-06
+ * Requires Core_v2.gs, Shared.gs, Metrics.gs.
+ *
+ * Two sheets YOU own, that decide what the dashboard counts:
+ *   Master_Units       one row per unit
+ *   Master_Tenancies   one row per household (occupancy)
+ *
+ * WHY THESE EXIST. Detecting "no longer managed" from AppFolio has failed repeatedly.
+ * management_end_date is largely unpopulated — which is precisely why the team encodes
+ * closures in the property NAME with a leading "z". Inference from an unmaintained field
+ * will keep producing wrong answers, so the decision moves to a sheet where a human
+ * settles it once.
+ *
+ * THE PART THAT MATTERS: these are SEEDED and REFRESHED, never overwritten. The job
+ * adds rows for anything new and updates the signal columns, but your `manage` column is
+ * copied forward untouched. A master list that gets clobbered on refresh is worse than
+ * no master list, because you stop trusting it.
+ *
+ *   manage = NO      excluded everywhere except Performance history
+ *   manage = YES     included, overriding every automatic signal
+ *   manage = blank   follow `suggested`, which the signals compute for you
+ *
+ * So you review exceptions, not 404 rows. Sort by `suggested` = EXCLUDE, confirm the
+ * ones you agree with, and leave the rest alone.
+ */
+
+var MASTER = {
+  UNITS_TAB: 'Master_Units',
+  TENANCIES_TAB: 'Master_Tenancies',
+  // No ledger or work-order activity in this long, and no live tenancy -> likely gone.
+  DORMANT_DAYS: 400
+};
+
+// ============================================================ READ SIDE
+
+var _masterUnits = null, _masterTen = null;
+
+function masterUnits_() {
+  if (_masterUnits) return _masterUnits;
+  _masterUnits = {};
+  readTab_(MASTER.UNITS_TAB).forEach(function (r) {
+    if (!r.unit_id) return;
+    var m = String(r.manage || '').trim().toUpperCase();
+    var decided = (m === 'NO') ? false : (m === 'YES') ? true : null;
+    _masterUnits[String(r.unit_id)] = {
+      decided: decided,
+      suggested: String(r.suggested || '').toUpperCase() !== 'EXCLUDE',
+      property_id: r.property_id
+    };
+  });
+  return _masterUnits;
+}
+
+function masterTenancies_() {
+  if (_masterTen) return _masterTen;
+  _masterTen = {};
+  readTab_(MASTER.TENANCIES_TAB).forEach(function (r) {
+    if (!r.occupancy_id) return;
+    var m = String(r.manage || '').trim().toUpperCase();
+    var decided = (m === 'NO') ? false : (m === 'YES') ? true : null;
+    _masterTen[String(r.occupancy_id)] = {
+      decided: decided,
+      suggested: String(r.suggested || '').toUpperCase() !== 'EXCLUDE'
+    };
+  });
+  return _masterTen;
+}
+
+/**
+ * Is this row in scope? Explicit decision first, suggestion second, in-scope by default.
+ *
+ * Defaults to IN scope on purpose: a unit missing from the master (added to AppFolio
+ * since the last seed) should appear and be noticed, not silently vanish.
+ */
+function inMasterScope_(r) {
+  if (r.occupancy_id) {
+    var t = masterTenancies_()[String(r.occupancy_id)];
+    if (t) {
+      if (t.decided === false) return false;
+      if (t.decided === true) return true;
+      if (!t.suggested) return false;
+    }
+  }
+  if (r.unit_id) {
+    var u = masterUnits_()[String(r.unit_id)];
+    if (u) {
+      if (u.decided === false) return false;
+      if (u.decided === true) return true;
+      return u.suggested;
+    }
+  }
+  return true;
+}
+
+// ============================================================ BUILD / REFRESH
+
+/**
+ * Seeds both sheets and refreshes their signals. Safe to run nightly — decisions survive.
+ */
+function buildMasterScope() {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+  var dormantBefore = ymd_(addDays_(today_(), -MASTER.DORMANT_DAYS));
+  var pm = pmLookup_();
+
+  var units = readTab_('Unit_Directory');
+  var props = indexBy_(readTab_('Properties_Units'), 'property_id');
+  var rr = readTab_('Rent_Roll');
+  var tick = readTab_('Tenant_Tickler');
+  var wo = readTab_('Work_Orders');
+
+  // last sign of life per unit, from anything dated
+  var lastSeen = {};
+  function bump(uid, d) {
+    if (!uid || !d) return;
+    var k = String(uid);
+    if (!lastSeen[k] || d > lastSeen[k]) lastSeen[k] = d;
+  }
+  rr.forEach(function (r) { bump(r.unit_id, ymd_(r.lease_to) || ymd_(r.move_in)); });
+  tick.forEach(function (r) { bump(r.unit_id, ymd_(r.occurred_date) || ymd_(r.move_out_date)); });
+  wo.forEach(function (r) { bump(r.unit_id, ymd_(r.created_at)); });
+
+  var liveOcc = {};
+  rr.forEach(function (r) {
+    var st = String(r.status || '').toLowerCase();
+    if ((st.indexOf('current') !== -1 || st.indexOf('notice') !== -1) && r.occupancy_id) {
+      liveOcc[String(r.occupancy_id)] = r;
+    }
+  });
+  var liveUnits = {};
+  Object.keys(liveOcc).forEach(function (k) { liveUnits[String(liveOcc[k].unit_id)] = true; });
+
+  // ---- units ----
+  var prevU = {};
+  readTab_(MASTER.UNITS_TAB).forEach(function (r) {
+    if (r.unit_id) prevU[String(r.unit_id)] = r;
+  });
+
+  var unitRows = units.map(function (u) {
+    var p = props[String(u.property_id)] || {};
+    var end = ymd_(p.management_end_date);
+    var zFlag = endingMgmt_(p.property_name ? p : u);
+    var tpo = isTPO_(u) || isTPO_(p);
+    var seen = lastSeen[String(u.unit_id)] || null;
+    var hasLive = !!liveUnits[String(u.unit_id)];
+
+    var signals = [];
+    if (end && end <= t) signals.push('management ended ' + end);
+    if (zFlag) signals.push('z-prefix' + (zFlag.date ? ' (' + zFlag.date + ')' : ''));
+    if (tpo) signals.push('TPO');
+    if (!hasLive && seen && seen < dormantBefore) signals.push('no activity since ' + seen);
+    if (!hasLive && !seen) signals.push('no activity on record');
+
+    // A live tenancy outranks everything — we plainly still manage it.
+    var suggest = hasLive ? 'INCLUDE' : (signals.length ? 'EXCLUDE' : 'INCLUDE');
+
+    var prev = prevU[String(u.unit_id)] || {};
+    return {
+      manage: prev.manage || '',                       // YOUR column — never overwritten
+      suggested: suggest,
+      address: addr_(u),
+      pm_group: pmOf_(pm, u.property_id, u.unit_id),
+      has_active_tenancy: hasLive ? 'Yes' : 'No',
+      last_activity: seen,
+      signals: signals.join(' · ') || 'none',
+      property_name: p.property_name || u.property_name || '',
+      unit_id: u.unit_id, property_id: u.property_id,
+      decided_by: prev.decided_by || '', decided_on: prev.decided_on || '',
+      note: prev.note || ''
+    };
+  }).sort(function (a, b) {
+    // Anything suggested for exclusion, and not yet decided, floats to the top.
+    var ap = (a.suggested === 'EXCLUDE' && !a.manage) ? 0 : (a.suggested === 'EXCLUDE' ? 1 : 2);
+    var bp = (b.suggested === 'EXCLUDE' && !b.manage) ? 0 : (b.suggested === 'EXCLUDE' ? 1 : 2);
+    return ap - bp || String(a.address).localeCompare(String(b.address));
+  });
+  writeTab_(MASTER.UNITS_TAB, unitRows);
+
+  // ---- tenancies ----
+  var prevT = {};
+  readTab_(MASTER.TENANCIES_TAB).forEach(function (r) {
+    if (r.occupancy_id) prevT[String(r.occupancy_id)] = r;
+  });
+
+  var occSeen = {};
+  var tenRows = [];
+  function addOcc(occ, row, moveOut) {
+    var k = String(occ);
+    if (!k || k === 'null' || occSeen[k]) return;
+    occSeen[k] = true;
+    var isLive = !!liveOcc[k];
+    var sig = [];
+    if (moveOut && moveOut <= t) sig.push('moved out ' + moveOut);
+    if (!isLive && !moveOut) sig.push('not on the rent roll as current or notice');
+    var prev = prevT[k] || {};
+    tenRows.push({
+      manage: prev.manage || '',
+      suggested: isLive ? 'INCLUDE' : 'EXCLUDE',
+      address: addr_(row),
+      resident: row.tenant || row.tenant_name || row.name || '',
+      status: row.status || row.tenant_status || '',
+      move_out_date: moveOut || null,
+      signals: sig.join(' · ') || 'active tenancy',
+      pm_group: pmOf_(pm, row.property_id, row.unit_id),
+      occupancy_id: occ, unit_id: row.unit_id || null,
+      decided_by: prev.decided_by || '', decided_on: prev.decided_on || '',
+      note: prev.note || ''
+    });
+  }
+
+  var moveOutBy = {};
+  tick.forEach(function (r) {
+    if (isMoveOutEvent_(r) && r.occupancy_id) moveOutBy[String(r.occupancy_id)] = ymd_(r.move_out_date);
+  });
+  rr.forEach(function (r) { addOcc(r.occupancy_id, r, moveOutBy[String(r.occupancy_id)]); });
+  tick.forEach(function (r) { addOcc(r.occupancy_id, r, moveOutBy[String(r.occupancy_id)]); });
+
+  tenRows.sort(function (a, b) {
+    var ap = (a.suggested === 'EXCLUDE' && !a.manage) ? 0 : (a.suggested === 'EXCLUDE' ? 1 : 2);
+    var bp = (b.suggested === 'EXCLUDE' && !b.manage) ? 0 : (b.suggested === 'EXCLUDE' ? 1 : 2);
+    return ap - bp || String(a.address).localeCompare(String(b.address));
+  });
+  writeTab_(MASTER.TENANCIES_TAB, tenRows);
+
+  _masterUnits = null; _masterTen = null;
+
+  function count(rows, f) { return rows.filter(f).length; }
+  var stats = {
+    units_total: unitRows.length,
+    units_suggested_exclude: count(unitRows, function (r) { return r.suggested === 'EXCLUDE'; }),
+    units_decided: count(unitRows, function (r) { return r.manage; }),
+    units_awaiting_review: count(unitRows, function (r) {
+      return r.suggested === 'EXCLUDE' && !r.manage; }),
+    tenancies_total: tenRows.length,
+    tenancies_suggested_exclude: count(tenRows, function (r) { return r.suggested === 'EXCLUDE'; }),
+    tenancies_decided: count(tenRows, function (r) { return r.manage; }),
+    tenancies_awaiting_review: count(tenRows, function (r) {
+      return r.suggested === 'EXCLUDE' && !r.manage; })
+  };
+  logRun_('buildMasterScope', 'derived', MASTER.UNITS_TAB,
+          unitRows.length + tenRows.length, new Date().getTime() - t0,
+          JSON.stringify(stats));
+  Logger.log(JSON.stringify(stats, null, 1));
+  Logger.log('Review rows where suggested = EXCLUDE and manage is blank. ' +
+             'Set manage to NO to confirm, YES to keep. Blank follows the suggestion.');
+  return stats;
+}
+
+/** Headers and guidance on first run. */
+function setupMasterScope() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  [MASTER.UNITS_TAB, MASTER.TENANCIES_TAB].forEach(function (t) {
+    if (!ss.getSheetByName(t)) ss.insertSheet(t);
+  });
+  return 'ready — run buildMasterScope() to seed';
+}
