@@ -1,0 +1,587 @@
+/**
+ * MONTHLY SNAPSHOT TO DRIVE
+ *
+ * WHY FILES RATHER THAN A PASTE.
+ *
+ * A pasted pack can only describe this month. A folder per month can be compared against
+ * the one before it, and almost all the useful judgement in a monthly review lives in the
+ * comparison — collections dipped, this renewal has slipped twice, that work order was open
+ * last month too. So each month is FROZEN in its own folder and never rewritten. Re-running
+ * a month replaces its files; it does not touch any other month.
+ *
+ * WHAT GOES IN
+ *   README.md            what this folder is, what is in it, and what is sensitive
+ *   00-portfolio.md      the month on one page
+ *   owners/*.md          one pack per owner marked include
+ *   data/*.csv           the supporting tables, so a reviewer can re-cut the numbers
+ *
+ * The CSVs are the point of the exercise. Without them a reviewer can only re-read the
+ * summary; with them they can ask why.
+ *
+ * SHARING. Frank's decision, 2026-08-19: shared with the WeLease domain. That means anyone
+ * with a weleaseusa.com account can open resident names, balances and owner contact
+ * details. It is his company's data and his call — the README states plainly what is
+ * inside so nobody opens it expecting something tamer.
+ *
+ * SCOPE NOTE. This is the first thing in the project to touch DriveApp, so Apps Script will
+ * ask for Drive authorisation the first time it runs. That is expected, not an error.
+ */
+
+var SNAPSHOT = {
+  ROOT: 'WeLease Monthly Snapshots',
+  // DOMAIN, per Frank. Change to PRIVATE here and re-run to lock it down instead.
+  SHARING: 'DOMAIN',
+  // Apps Script stops at six minutes. Stop early and say what is left rather than dying
+  // half way and leaving a folder that looks complete.
+  BUDGET_MS: 280000,
+  MAX_ROWS_PER_CSV: 20000,
+
+  // The tables worth freezing. Order matters only for the log.
+  TABS: [
+    ['Portfolio_Summary',   'the month in one row'],
+    ['Rent_Collection',     'receipts by month, cash basis'],
+    ['Rent_Income_GL',      'rent income from the ledger, accrual'],
+    ['Rent_Roll',           'every unit, rent, lease dates, status'],
+    ['Delinquency_Aged',    'balances by age bucket'],
+    ['Lease_Expirations',   'lease end dates'],
+    ['Renewal_Pipeline',    'renewals with the 80-day inspection clock'],
+    ['Work_Orders',         'maintenance, open and closed'],
+    ['Inspections',         'inspection records'],
+    ['Insurance_Owner',     'landlord policy status'],
+    ['Insurance_Tenant',    'resident policy status'],
+    ['Insurance_Outreach',  'who to chase'],
+    ['Unit_Vacancy',        'vacant units and days on market'],
+    ['Rent_Market_Variance','rent against market, worst first'],
+    ['Door_History',        'doors gained and lost by month'],
+    ['Metrics',             'the metric registry, current values'],
+    ['Metrics_History',     'metric values over time'],
+    ['Onboarding_Steps',    'where onboarding time goes'],
+    ['LS_Compliance',       'LeadSimple process adherence'],
+    ['_data_quality',       'field completeness audit'],
+    ['Item_Status_Log',     'what the team did about each item, and when']
+  ]
+};
+
+/** yyyy-MM for the last CLOSED month, which is what a review on the 15th is reviewing. */
+function lastClosedMonth_() {
+  var d = parseDate_(ymd_(today_()).slice(0, 8) + '01');
+  return monthNorm_(ymd_(addDays_(d, -1)));
+}
+
+function snapshotFolder_(month) {
+  var root;
+  var it = DriveApp.getFoldersByName(SNAPSHOT.ROOT);
+  root = it.hasNext() ? it.next() : DriveApp.createFolder(SNAPSHOT.ROOT);
+
+  var sub;
+  var si = root.getFoldersByName(month);
+  sub = si.hasNext() ? si.next() : root.createFolder(month);
+
+  try {
+    if (SNAPSHOT.SHARING === 'DOMAIN') {
+      root.setSharing(DriveApp.Access.DOMAIN, DriveApp.Permission.VIEW);
+      sub.setSharing(DriveApp.Access.DOMAIN, DriveApp.Permission.VIEW);
+    }
+  } catch (e) {
+    // A Workspace policy can forbid domain sharing. Better to have the files and no
+    // sharing than to lose the export over a permission setting.
+    logError_('drive', 'sharing',
+      'Could not set domain sharing on the snapshot folder (' + e.message + '). The files ' +
+      'are written and private to the script owner — share them by hand, or set ' +
+      'SNAPSHOT.SHARING to PRIVATE to stop trying.');
+  }
+  return { root: root, month: sub };
+}
+
+/**
+ * NOTHING WE WRITE MAY CONTAIN THE WORD "undefined".
+ *
+ * A blank cell is honest. The literal text "undefined", "null", "NaN" or "[object Object]"
+ * is a bug that reads as a fact — and the July snapshot shipped a brief saying "undefined
+ * through the RBP" to anyone who opened it.
+ *
+ * This is the last line of defence, not the fix: the fix is that the caller counted from the
+ * wrong place. But a guard that catches the class stops the next one reaching a reader.
+ */
+function guardPlaceholders_(name, content) {
+  var bad = String(content).match(/\b(undefined|NaN)\b|\[object Object\]/g);
+  if (!bad || !bad.length) return content;
+  logError_('drive', 'snapshot',
+    name + ' contained ' + bad.length + ' placeholder value(s) (' +
+    bad.slice(0, 4).join(', ') + '). They have been blanked in the written file, but the ' +
+    'code that produced them is reading a field that is not there — fix that, do not rely ' +
+    'on this.');
+  return String(content).replace(/\b(undefined|NaN)\b/g, '').replace(/\[object Object\]/g, '');
+}
+
+/** Replaces a file of the same name rather than piling up duplicates. */
+function putFile_(folder, name, content, mime) {
+  content = guardPlaceholders_(name, content);
+  var it = folder.getFilesByName(name);
+  while (it.hasNext()) it.next().setTrashed(true);
+  return folder.createFile(name, content, mime || MimeType.PLAIN_TEXT);
+}
+
+/**
+ * Rows to CSV. Quoting matters more than it looks — an address with a comma, a note with a
+ * line break, or a description containing a quote will each break a naive join, and the
+ * reviewer would see a shifted column rather than an error.
+ */
+function toCsv_(rows, cap) {
+  if (!rows || !rows.length) return '';
+  var headers = unionKeys_(rows);
+  var out = [headers.map(csvCell_).join(',')];
+  rows.slice(0, cap || SNAPSHOT.MAX_ROWS_PER_CSV).forEach(function (r) {
+    out.push(headers.map(function (h) { return csvCell_(r[h]); }).join(','));
+  });
+  return out.join('\n');
+}
+
+function csvCell_(v) {
+  if (v === null || v === undefined) return '';
+  var s = (typeof v === 'object' && !(v instanceof Date)) ? JSON.stringify(v) : String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+/** The month on one page — what a reviewer reads before opening anything else. */
+function portfolioBrief_(month) {
+  var L = [];
+  var ps = readTab_('Portfolio_Summary')[0] || {};
+  var rc = readTab_('Rent_Collection');
+  var gl = readTab_('Rent_Income_GL');
+  var byKey = function (rows, k) {
+    var hit = rows.filter(function (r) { return monthNorm_(r.month) === k; })[0];
+    return hit || null;
+  };
+  var thisRc = byKey(rc, month), thisGl = byKey(gl, month);
+  var prev = monthNorm_(ymd_(addDays_(parseDate_(month + '-01'), -1)));
+  var prevRc = byKey(rc, prev);
+
+  L.push('# ' + monthLabel_(month) + ' — portfolio brief');
+  L.push('');
+  L.push('Generated ' + nowStamp_() + ' from AppFolio, LeadSimple and ShowMojo.');
+  L.push('Every figure traces to a pull. Nothing is estimated. Where we hold no data the ' +
+         'line says so rather than showing a zero.');
+  L.push('');
+
+  L.push('## Money');
+  L.push('| | ' + monthLabel_(month) + ' | ' + monthLabel_(prev) + ' |');
+  L.push('|---|---|---|');
+  var row = function (label, a, b) {
+    L.push('| ' + label + ' | ' + (a === null || a === undefined ? 'not held' : a) + ' | ' +
+           (b === null || b === undefined ? 'not held' : b) + ' |');
+  };
+  row('Rent income (GL 4100+4105, accrual)',
+      thisGl ? money_(num_(thisGl.rent_income)) : null, null);
+  row('Resident receipts (cash, on arrival)',
+      thisRc ? money_(num_(thisRc.rent_collected)) : null,
+      prevRc ? money_(num_(prevRc.rent_collected)) : null);
+  row('Households paying',
+      thisRc ? thisRc.households_paying : null, prevRc ? prevRc.households_paying : null);
+  row('Rent charged (rent roll, at run time)', money_(num_(ps.rent_charged)), null);
+  L.push('');
+  L.push('Rent income and receipts are DIFFERENT MEASURES and will not agree. Income is ' +
+         'recognised in the month the rent covers — on this portfolio roughly 70% of it ' +
+         'posts on the 1st out of prepayment. Receipts are cash on the day it arrived, and ' +
+         'include the Resident Benefits Package, pet rent, late fees, utility ' +
+         'reimbursements and deposits.');
+  L.push('');
+
+  L.push('## Renewals and inspections');
+  var rp = readTab_('Renewal_Pipeline').filter(function (r) { return r.address; });
+  var n = function (st) {
+    return rp.filter(function (r) { return r.inspection_status === st; }).length;
+  };
+  var measurable = rp.length - n('NOT YET DUE') - n('NO RENEWAL DATE');
+  L.push('- Renewals in the tracked horizon: **' + rp.length + '**');
+  L.push('- Past the 80-day inspection deadline: **' + n('OVERDUE') + '**');
+  L.push('- Due within 30 days: ' + n('DUE SOON') + ' · scheduled: ' + n('SCHEDULED'));
+  L.push('- Done on time: ' + n('DONE ON TIME') + ' · done late: ' + n('DONE LATE'));
+  L.push('- **No lease end date on file: ' + n('NO RENEWAL DATE') + '** — these cannot be ' +
+         'clocked at all, and they are excluded from the rate below rather than counted ' +
+         'as failures.');
+  L.push('- On-time rate: ' + (measurable
+    ? round1_(n('DONE ON TIME') / measurable * 100) + '% of ' + measurable + ' whose ' +
+      'deadline has passed'
+    : 'nothing measurable yet'));
+  L.push('');
+
+  L.push('## Insurance');
+  // COUNTED FROM THE TABLES, not read off the last Insurance_History row.
+  //
+  // This used to print the history row's fields directly, and every line in the July
+  // snapshot read "undefined through the RBP, undefined own policy" — because that row was
+  // appended before those columns existed, so the fields were simply absent. The data was
+  // fine the whole time; the brief was reading a stale schema.
+  //
+  // Counting from Insurance_Owner and Insurance_Tenant cannot go stale that way: if the
+  // tables are there the numbers are right, and if they are not the section says so.
+  var itn = readTab_('Insurance_Tenant').filter(function (r) { return r.address; });
+  var iow = readTab_('Insurance_Owner').filter(function (r) { return r.address; });
+  var chase = readTab_('Insurance_Outreach').filter(function (r) { return r.side; });
+  var by = function (rows, v) {
+    return rows.filter(function (r) { return r.placed_by === v; }).length;
+  };
+  if (!itn.length && !iow.length) {
+    L.push('- No insurance build on record. Run buildInsuranceCompliance().');
+  } else {
+    L.push('- Residents (' + itn.length + ' households): ' +
+           by(itn, INSURANCE.THROUGH_US) + ' through the RBP, ' +
+           by(itn, INSURANCE.OWN) + ' own policy, ' +
+           by(itn, INSURANCE.EXPIRED) + ' expired, ' +
+           by(itn, INSURANCE.NONE) + ' nothing on record');
+    L.push('- Landlords (' + iow.length + ' properties): ' +
+           by(iow, INSURANCE.THROUGH_US) + ' through us, ' +
+           by(iow, INSURANCE.OWN) + ' own policy, ' +
+           by(iow, INSURANCE.EXPIRED) + ' expired, ' +
+           by(iow, INSURANCE.NONE) + ' nothing on record');
+    var noEmail = chase.filter(function (r) { return r.email_missing === 'YES'; }).length;
+    L.push('- To chase: ' + chase.length + ' (' + noEmail + ' with no email on file' +
+           (chase.length ? ', ' + Math.round(noEmail / chase.length * 100) + '% of the list'
+                         : '') + ')');
+  }
+  L.push('');
+
+  L.push('## Maintenance');
+  var wo = dropTPO_(readTab_('Work_Orders'));
+  var closedThis = wo.filter(function (w) {
+    var d = ymd_(w.completed_on); return d && monthNorm_(d) === month;
+  }).length;
+  var open = wo.filter(function (w) {
+    return !ymd_(w.completed_on) && !ymd_(w.canceled_on);
+  });
+  L.push('- Completed in ' + monthLabel_(month) + ': ' + closedThis);
+  L.push('- Open now: ' + open.length + ', of which ' +
+         open.filter(function (w) { return !w.vendor; }).length + ' have no vendor assigned');
+  L.push('');
+
+  L.push('## Data quality');
+  var dq = readTab_('_data_quality');
+  var high = dq.filter(function (r) { return r.severity === 'HIGH'; });
+  if (!dq.length) L.push('- No audit on record.');
+  else {
+    L.push('- ' + high.length + ' HIGH finding(s), ' +
+           dq.filter(function (r) { return r.severity === 'CLEAN'; }).length + ' field(s) clean');
+    high.forEach(function (r) {
+      L.push('  - **' + r.field + '** (' + r.area + '): ' + r.populated + ' — ' +
+             String(r.what_it_breaks).split('.')[0] + '.');
+    });
+  }
+  L.push('');
+  L.push('## How to read this folder');
+  L.push('- `owners/` — one pack per owner, ready to turn into an owner update.');
+  L.push('- `data/` — the tables behind every number above. Open these to ask why.');
+  L.push('- Compare against the previous month’s folder. That comparison is where most ' +
+         'of the judgement lives; a single month can only tell you the level, not the ' +
+         'direction.');
+  L.push('');
+  L.push('**Nothing in this folder states a law, a notice period, a rent cap, an allowable ' +
+         'fee or a lease term.** Anything touching notices, rent increases, screening, ' +
+         'habitability or deposits is for the WeLease team and counsel, not for a report ' +
+         'generated from a spreadsheet.');
+  return L.join('\n');
+}
+
+function readmeText_(month, files) {
+  return [
+    '# WeLease monthly snapshot — ' + monthLabel_(month),
+    '',
+    'Written automatically on the 15th by the operations dashboard. This folder is a ' +
+    'FROZEN copy of the month. It is not updated afterwards, which is the point: it can be ' +
+    'compared against other months.',
+    '',
+    '## What is in here',
+    '- `00-portfolio.md` — the month on one page. Start here.',
+    '- `owners/` — one pack per owner marked include in `Owner_Update_Scope`.',
+    '- `data/` — the supporting tables as CSV.',
+    '',
+    '## Who can see this',
+    'Shared with everyone at weleaseusa.com.',
+    '',
+    '## What is inside, plainly',
+    'These files contain **resident names, rent amounts, outstanding balances, property ' +
+    'addresses and owner contact details**. Treat the folder as you would the rent roll ' +
+    'itself. Do not forward files outside WeLease, and do not attach a `data/` CSV to an ' +
+    'owner email — the owner packs are scoped to one owner, the CSVs are not.',
+    '',
+    '## What it does not contain',
+    'No legal statements. No notice periods, rent caps, allowable fees, deposit rules or ' +
+    'lease terms. Residents are described only by lease and payment facts.',
+    '',
+    '## Files',
+    files.map(function (f) { return '- `' + f + '`'; }).join('\n'),
+    '',
+    'Generated ' + nowStamp_() + '.'
+  ].join('\n');
+}
+
+/**
+ * Write one month to Drive. Safe to re-run: it replaces that month's files and leaves
+ * every other month alone.
+ */
+function exportMonthlySnapshot(monthKey) {
+  var t0 = new Date().getTime();
+  var month = monthNorm_(monthKey || lastClosedMonth_());
+  var left = function () { return SNAPSHOT.BUDGET_MS - (new Date().getTime() - t0); };
+
+  var f = snapshotFolder_(month);
+  var written = [], skipped = [];
+
+  // Packs first. If the budget runs out it should run out on a CSV, not on the thing the
+  // review is actually for.
+  try { buildOwnerPacks(month); }
+  catch (e) { logError_('drive', 'owner packs', e.message); }
+
+  var packs = readTab_(OWNER_UPDATE.OUT_TAB).filter(function (r) { return r.pack; });
+  if (packs.length) {
+    var oi = f.month.getFoldersByName('owners');
+    var ownersDir = oi.hasNext() ? oi.next() : f.month.createFolder('owners');
+    packs.forEach(function (p) {
+      var name = safeName_(p.preferred_name || p.owner) + '.md';
+      putFile_(ownersDir, name, p.pack, MimeType.PLAIN_TEXT);
+      written.push('owners/' + name);
+    });
+  }
+
+  putFile_(f.month, '00-portfolio.md', portfolioBrief_(month), MimeType.PLAIN_TEXT);
+  written.push('00-portfolio.md');
+
+  var di = f.month.getFoldersByName('data');
+  var dataDir = di.hasNext() ? di.next() : f.month.createFolder('data');
+
+  SNAPSHOT.TABS.forEach(function (spec) {
+    var tab = spec[0];
+    if (left() < 25000) { skipped.push(tab); return; }
+    var rows;
+    try { rows = readTab_(tab); } catch (e) { rows = []; }
+    if (!rows.length) { skipped.push(tab + ' (empty)'); return; }
+    var csv = toCsv_(rows);
+    if (!csv) { skipped.push(tab + ' (empty)'); return; }
+    putFile_(dataDir, tab + '.csv', csv, MimeType.CSV);
+    written.push('data/' + tab + '.csv');
+  });
+
+  putFile_(f.month, 'README.md', readmeText_(month, written), MimeType.PLAIN_TEXT);
+
+  var url = f.month.getUrl();
+  appendTab_('_drive_exports', [{
+    exported_at: nowStamp_(),
+    month: month,
+    files: written.length,
+    owner_packs: packs.length,
+    skipped: skipped.join(', '),
+    folder_url: url,
+    sharing: SNAPSHOT.SHARING
+  }], ['exported_at', 'month', 'files', 'owner_packs', 'skipped', 'folder_url', 'sharing']);
+
+  if (skipped.length) {
+    logError_('drive', 'snapshot',
+      monthLabel_(month) + ' exported with ' + skipped.length + ' table(s) missing: ' +
+      skipped.join(', ') + '. Empty tables are expected if a job has not run; anything ' +
+      'skipped for time will be written if you re-run exportMonthlySnapshot("' + month + '").');
+  }
+
+  logRun_('exportMonthlySnapshot', 'drive', '-', written.length,
+          new Date().getTime() - t0,
+          monthLabel_(month) + ' · ' + written.length + ' file(s) · ' + packs.length +
+          ' owner pack(s)' + (skipped.length ? ' · skipped ' + skipped.length : '') +
+          ' · ' + url);
+  Logger.log('Snapshot written: ' + url + '\n' + written.length + ' file(s), ' +
+             packs.length + ' owner pack(s)' +
+             (skipped.length ? '\nSkipped: ' + skipped.join(', ') : ''));
+  return { month: month, files: written.length, packs: packs.length,
+           skipped: skipped, url: url };
+}
+
+/** A filename that will not upset Drive or a reviewer scanning a list. */
+function safeName_(s) {
+  return String(s || 'unnamed').replace(/[\\/:*?"<>|]/g, '-')
+                               .replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
+/** Every snapshot written so far, newest first, with links. */
+function listSnapshots() {
+  var rows = readTab_('_drive_exports');
+  if (!rows.length) return 'No snapshot has been exported yet. Run exportMonthlySnapshot().';
+  var out = ['--- MONTHLY SNAPSHOTS ---', ''];
+  rows.slice().reverse().slice(0, 24).forEach(function (r) {
+    out.push('  ' + String(r.month).padEnd(9) + String(r.files).padStart(4) + ' files  ' +
+             String(r.owner_packs).padStart(3) + ' packs  ' + r.exported_at + '  ' +
+             r.folder_url);
+    if (r.skipped) out.push('      skipped: ' + r.skipped);
+  });
+  out.push('');
+  out.push('Re-running a month replaces its files and leaves every other month untouched.');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+// ============================================================ DAILY EXPORT
+
+/**
+ * The same tables, every morning, to a dated folder plus a `latest/` that always holds the
+ * most recent COMPLETE pull.
+ *
+ * WHY THIS EXPORTS THE TABS RATHER THAN RE-PULLING APPFOLIO. The nightly jobs already did
+ * the expensive part between 2am and 5am. A second pull would cost an hour of API time to
+ * produce the same numbers, and — worse — the two could disagree, at which point nobody
+ * knows which is right. This runs after them and copies what they built.
+ *
+ * WHY `latest/` IS A REAL FOLDER. A shortcut can point at a folder that is still being
+ * written. This one is only overwritten once the day's files are all on disk, so a reader
+ * either sees yesterday complete or today complete, never today half done.
+ *
+ * WHY `manifest.json` IS WRITTEN LAST. It is the completion signal. No manifest, or a status
+ * that is not `ok`, means the folder is unfinished and a reader should fall back to the
+ * previous day and say so.
+ */
+var DAILY = {
+  ROOT: 'WeLease Operations Data',
+  KEEP_DAYS: 60,
+  BUDGET_MS: 280000,
+  LOCK_MS: 30000
+};
+
+function dailyFolders_() {
+  var it = DriveApp.getFoldersByName(DAILY.ROOT);
+  var root = it.hasNext() ? it.next() : DriveApp.createFolder(DAILY.ROOT);
+  var sub = function (parent, name) {
+    var i = parent.getFoldersByName(name);
+    return i.hasNext() ? i.next() : parent.createFolder(name);
+  };
+  try {
+    if (SNAPSHOT.SHARING === 'DOMAIN') {
+      root.setSharing(DriveApp.Access.DOMAIN, DriveApp.Permission.VIEW);
+    }
+  } catch (e) {
+    logError_('drive', 'daily sharing', e.message);
+  }
+  return { root: root, daily: sub(root, 'daily'), reference: sub(root, 'reference') };
+}
+
+/** Empties a folder's files without deleting the folder itself. */
+function emptyFolder_(folder) {
+  var it = folder.getFiles();
+  while (it.hasNext()) it.next().setTrashed(true);
+  var fi = folder.getFolders();
+  while (fi.hasNext()) fi.next().setTrashed(true);
+}
+
+function exportDailySnapshot(dateStr) {
+  var t0 = new Date().getTime();
+  var day = ymd_(dateStr || today_());
+  var left = function () { return DAILY.BUDGET_MS - (new Date().getTime() - t0); };
+
+  // A daily trigger overlapping a manual run would corrupt latest/. One at a time.
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(DAILY.LOCK_MS)) {
+    logError_('drive', 'daily export',
+      'Another export is already running. Skipped rather than racing it — latest/ must ' +
+      'never be written by two runs at once.');
+    return { skipped: 'locked' };
+  }
+
+  try {
+    var f = dailyFolders_();
+    var dayDir = f.daily.getFoldersByName(day).hasNext()
+      ? f.daily.getFoldersByName(day).next() : f.daily.createFolder(day);
+    // Re-running a day replaces it rather than doubling it.
+    emptyFolder_(dayDir);
+    var dataDir = dayDir.createFolder('data');
+
+    var files = [], warnings = [], errors = [], skipped = [];
+    var stamp = nowStamp_();
+
+    SNAPSHOT.TABS.forEach(function (spec) {
+      var tab = spec[0];
+      if (left() < 20000) { skipped.push(tab); return; }
+      var rows;
+      try { rows = readTab_(tab); } catch (e) { rows = []; }
+      if (!rows.length) { warnings.push(tab + ' is empty'); return; }
+
+      // pulled_at on every row. A folder named 2026-07 holding an August pull is a trap
+      // somebody eventually falls into; the stamp travels with the data instead.
+      var stamped = rows.map(function (r) {
+        var o = { pulled_at: stamp };
+        Object.keys(r).forEach(function (k) { o[k] = r[k]; });
+        return o;
+      });
+      var csv = toCsv_(stamped);
+      if (!csv) { warnings.push(tab + ' produced no CSV'); return; }
+      putFile_(dataDir, tab + '.csv', csv, MimeType.CSV);
+      files.push({ name: 'data/' + tab + '.csv', rows: stamped.length,
+                   columns: unionKeys_(stamped).length });
+    });
+
+    if (skipped.length) {
+      errors.push('Ran out of time before: ' + skipped.join(', ') +
+                  '. Re-run exportDailySnapshot("' + day + '").');
+    }
+
+    var status = errors.length ? 'partial' : 'ok';
+    var manifest = {
+      pulled_at: stamp,
+      pull_date: day,
+      status: status,
+      source_systems: ['AppFolio', 'LeadSimple', 'ShowMojo'],
+      note: 'Exported from the dashboard tabs, which the nightly jobs rebuild between ' +
+            '02:00 and 05:00. Not a second pull from AppFolio — a second pull would cost an ' +
+            'hour and could disagree with the dashboard.',
+      files: files,
+      warnings: warnings,
+      errors: errors
+    };
+    // LAST. Its presence with status ok is what tells a reader the folder is finished.
+    putFile_(dayDir, 'manifest.json', JSON.stringify(manifest, null, 2),
+             MimeType.PLAIN_TEXT);
+
+    // latest/ only after the day is complete. A partial run leaves the previous day in
+    // place — stale but whole beats fresh but half written.
+    if (status === 'ok') {
+      var li = f.root.getFoldersByName('latest');
+      var latest = li.hasNext() ? li.next() : f.root.createFolder('latest');
+      emptyFolder_(latest);
+      var ld = latest.createFolder('data');
+      var src = dataDir.getFiles();
+      while (src.hasNext()) {
+        var file = src.next();
+        ld.createFile(file.getName(), file.getBlob().getDataAsString(), MimeType.CSV);
+      }
+      putFile_(latest, 'manifest.json', JSON.stringify(manifest, null, 2),
+               MimeType.PLAIN_TEXT);
+    }
+
+    pruneDailyFolders_(f.daily);
+
+    appendTab_('_drive_exports', [{
+      exported_at: stamp, month: day, files: files.length, owner_packs: 0,
+      skipped: skipped.join(', '), folder_url: dayDir.getUrl(), sharing: SNAPSHOT.SHARING
+    }], ['exported_at', 'month', 'files', 'owner_packs', 'skipped', 'folder_url', 'sharing']);
+
+    logRun_('exportDailySnapshot', 'drive', '-', files.length,
+            new Date().getTime() - t0,
+            day + ' · ' + status + ' · ' + files.length + ' file(s)' +
+            (warnings.length ? ' · ' + warnings.length + ' warning(s)' : '') +
+            (skipped.length ? ' · SKIPPED ' + skipped.length : ''));
+    return { day: day, status: status, files: files.length,
+             warnings: warnings, errors: errors, url: dayDir.getUrl() };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Keeps 60 days. Monthly snapshots are permanent and live elsewhere. */
+function pruneDailyFolders_(dailyRoot) {
+  var cutoff = ymd_(addDays_(today_(), -DAILY.KEEP_DAYS));
+  var it = dailyRoot.getFolders(), gone = [];
+  while (it.hasNext()) {
+    var fo = it.next(), n = fo.getName();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(n) && n < cutoff) { fo.setTrashed(true); gone.push(n); }
+  }
+  if (gone.length) {
+    logRun_('pruneDailyFolders_', 'drive', '-', gone.length, 0,
+            'removed ' + gone.length + ' folder(s) older than ' + DAILY.KEEP_DAYS +
+            ' days: ' + gone.slice(0, 5).join(', '));
+  }
+  return gone;
+}
