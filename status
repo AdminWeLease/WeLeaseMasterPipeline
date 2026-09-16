@@ -1,0 +1,645 @@
+/**
+ * WeLease Pipeline — ITEM STATUS  v1.0.0 · 2026-08-06
+ * Requires Core.gs, Shared.gs.
+ *
+ * Makes the dashboard writable. The team sets a status and a follow-up date on any row,
+ * and the item behaves accordingly until that date arrives.
+ *
+ * THE PROBLEM THIS SOLVES: a work order open 20 days looks identical whether nobody has
+ * touched it or a plumber found rot behind the wall and it is genuinely mid-repair. The
+ * first needs chasing; the second needs leaving alone until Thursday. Without somewhere
+ * to record that, managers re-litigate the same rows every morning and stop trusting the
+ * red counts.
+ *
+ * HOW IT STAYS FAST: the heavy list rendering is still pre-rendered nightly and served
+ * from cache. Only this thin status layer is fetched live on page load — a few hundred
+ * rows — and applied over the top. Cached speed, live state.
+ *
+ * WHAT A STATUS DOES:
+ *   - the row is tinted and shows who set it, when, and why
+ *   - while the follow-up date is in the FUTURE the item leaves the "need action now"
+ *     count. It stays visible; it is being handled, not ignored.
+ *   - when the follow-up date ARRIVES the item returns to urgent automatically and
+ *     appears on the Follow-ups due list
+ *   - Done hides the row until the underlying condition recurs
+ *
+ * Nothing here writes to AppFolio. A status is how WeLease is handling the item, not a
+ * change to the record.
+ */
+
+var STATUS_TAB = 'Item_Status';
+
+/**
+ * The vocabulary. Deliberately short — a long list means nobody picks consistently and
+ * the field stops meaning anything.
+ *
+ * `urgentWhenDue` marks the statuses where the follow-up date is a real commitment.
+ * "Done" carries no commitment; "Waiting on vendor" very much does.
+ */
+/**
+ * TWO AXES, NOT ONE.
+ *
+ * A single status list is either too long to pick from consistently or too generic to
+ * describe the work. Worse, it hides a distinction that matters enormously:
+ *
+ *   "Done"             this instance is handled. If the condition recurs — the work
+ *                      order ages again, a new deposit passes 21 days — it SHOULD come
+ *                      back. That is the system working.
+ *   "Never show again" this specific item is permanently suppressed. Correct for a
+ *                      known exception; catastrophic if applied by accident, because
+ *                      the row disappears and nobody remembers why.
+ *
+ * Conflating those is how a worklist quietly stops being trustworthy. So:
+ *
+ *   AXIS 1 — DISPOSITION   what is happening, in the vocabulary of THAT work
+ *   AXIS 2 — PERSISTENCE   how long it sticks
+ *
+ * Persistence is chosen for you by the disposition, and can be overridden. Permanent
+ * suppression requires a note and is listed in its own auditable register — anything
+ * that makes work vanish has to be reversible and visible.
+ */
+
+var PERSISTENCE = {
+  FOLLOW_UP: 'follow_up',   // returns on the follow-up date
+  THIS_CYCLE: 'this_cycle', // hidden until the underlying condition recurs
+  PERMANENT: 'permanent'    // never again for this item, until someone deletes the row
+};
+
+/**
+ * Vocabularies by kind of work. A deposit dispute and a work order waiting on parts are
+ * not the same shape, and forcing them through one list makes both descriptions worse.
+ */
+var STATUS_SETS = {
+
+  generic: [
+    { id: 'working',    label: 'Working on it',    tone: 'info', p: 'follow_up' },
+    { id: 'blocked',    label: 'Blocked',          tone: 'bad',  p: 'follow_up' },
+    { id: 'reviewing',  label: 'Reviewing',        tone: 'info', p: 'follow_up' },
+    { id: 'no_action',  label: 'No action needed', tone: 'good', p: 'this_cycle' },
+    { id: 'done',       label: 'Done',             tone: 'good', p: 'this_cycle' }
+  ],
+
+  deposits: [
+    { id: 'working',      label: 'Working on it',        tone: 'info', p: 'follow_up' },
+    { id: 'refund_sent',  label: 'Refund sent',          tone: 'good', p: 'this_cycle' },
+    { id: 'itemising',    label: 'Itemising deductions', tone: 'info', p: 'follow_up' },
+    { id: 'disputed',     label: 'Disputed by resident', tone: 'bad',  p: 'follow_up',
+      note: true },
+    { id: 'owner_holds',  label: 'Owner holds the funds', tone: 'warn', p: 'this_cycle' },
+    { id: 'legal',        label: 'With counsel',         tone: 'bad',  p: 'follow_up' },
+    { id: 'no_action',    label: 'No action needed',     tone: 'good', p: 'this_cycle' },
+    { id: 'done',         label: 'Complete',             tone: 'good', p: 'this_cycle' }
+  ],
+
+  maintenance: [
+    { id: 'working',        label: 'Working on it',        tone: 'info', p: 'follow_up' },
+    { id: 'scheduled',      label: 'Scheduled',            tone: 'info', p: 'follow_up' },
+    { id: 'waiting_vendor', label: 'Waiting on vendor',    tone: 'warn', p: 'follow_up' },
+    { id: 'parts',          label: 'Parts ordered',        tone: 'warn', p: 'follow_up' },
+    { id: 'waiting_owner',  label: 'Waiting owner approval', tone: 'warn', p: 'follow_up' },
+    { id: 'access',         label: 'Cannot get access',    tone: 'bad',  p: 'follow_up' },
+    { id: 'no_action',      label: 'No action needed',     tone: 'good', p: 'this_cycle' },
+    { id: 'done',           label: 'Completed',            tone: 'good', p: 'this_cycle' }
+  ],
+
+  collections: [
+    { id: 'promised',    label: 'Promised to pay',    tone: 'info', p: 'follow_up' },
+    { id: 'plan',        label: 'Payment plan agreed', tone: 'info', p: 'follow_up' },
+    { id: 'disputed',    label: 'Disputed',           tone: 'bad',  p: 'follow_up', note: true },
+    { id: 'chasing',     label: 'Chasing',            tone: 'warn', p: 'follow_up' },
+    { id: 'agency',      label: 'Sent to collections', tone: 'warn', p: 'follow_up' },
+    { id: 'legal',       label: 'With counsel',       tone: 'bad',  p: 'follow_up' },
+    { id: 'paid_verify', label: 'Paid — verifying',   tone: 'good', p: 'follow_up' },
+    { id: 'writeoff',    label: 'Write-off approved', tone: 'good', p: 'permanent', note: true },
+    { id: 'no_action',   label: 'No action needed',   tone: 'good', p: 'this_cycle' }
+  ],
+
+  renewals: [
+    { id: 'sent',            label: 'Sent for signature',   tone: 'info', p: 'follow_up' },
+    { id: 'resident_decide', label: 'Resident deciding',    tone: 'warn', p: 'follow_up' },
+    { id: 'owner_decide',    label: 'Owner deciding',       tone: 'warn', p: 'follow_up' },
+    { id: 'negotiating',     label: 'Negotiating terms',    tone: 'info', p: 'follow_up' },
+    { id: 'not_renewing',    label: 'Not renewing',         tone: 'bad',  p: 'this_cycle' },
+    { id: 'mtm',             label: 'Going month-to-month', tone: 'warn', p: 'this_cycle' },
+    { id: 'done',            label: 'Renewed — verifying',  tone: 'good', p: 'follow_up' },
+    { id: 'no_action',       label: 'No action needed',     tone: 'good', p: 'this_cycle' }
+  ],
+
+  leasing: [
+    { id: 'marketing',   label: 'Marketing live',       tone: 'info', p: 'follow_up' },
+    { id: 'make_ready',  label: 'Make-ready in progress', tone: 'info', p: 'follow_up' },
+    { id: 'app_review',  label: 'Application in review', tone: 'info', p: 'follow_up' },
+    { id: 'held_owner',  label: 'Held at owner request', tone: 'warn', p: 'follow_up' },
+    { id: 'off_market',  label: 'Off market',           tone: 'warn', p: 'this_cycle' },
+    { id: 'no_action',   label: 'No action needed',     tone: 'good', p: 'this_cycle' },
+    { id: 'done',        label: 'Leased',               tone: 'good', p: 'this_cycle' }
+  ],
+
+  inspections: [
+    { id: 'scheduled',  label: 'Scheduled',          tone: 'info', p: 'follow_up' },
+    { id: 'entering',   label: 'Done — entering it', tone: 'info', p: 'follow_up' },
+    { id: 'access',     label: 'Access denied',      tone: 'bad',  p: 'follow_up' },
+    { id: 'not_req',    label: 'Not required',       tone: 'good', p: 'permanent', note: true },
+    { id: 'no_action',  label: 'No action needed',   tone: 'good', p: 'this_cycle' },
+    { id: 'done',       label: 'Completed',          tone: 'good', p: 'this_cycle' }
+  ],
+
+  utilities: [
+    { id: 'not_received', label: 'Bill not received',  tone: 'warn', p: 'follow_up' },
+    { id: 'chasing',      label: 'Chasing provider',   tone: 'warn', p: 'follow_up' },
+    { id: 'posted',       label: 'Posted — verifying', tone: 'info', p: 'follow_up' },
+    { id: 'dispute',      label: 'Provider dispute',   tone: 'bad',  p: 'follow_up', note: true },
+    { id: 'owner_paid',   label: 'Owner pays direct',  tone: 'good', p: 'permanent', note: true },
+    { id: 'no_action',    label: 'No action needed',   tone: 'good', p: 'this_cycle' },
+    { id: 'done',         label: 'Posted',             tone: 'good', p: 'this_cycle' }
+  ],
+
+  // LeadSimple process adherence. The vocabulary answers "why is this still open",
+  // which is the only question these four lists ask. No "done" that would contradict
+  // LeadSimple — closing a process happens there, and this status is cleared when the
+  // next sync stops returning it as open.
+  ls_process: [
+    { id: 'working',      label: 'Working it now',        tone: 'info', p: 'follow_up' },
+    { id: 'blocked_3p',   label: 'Waiting on a third party', tone: 'warn', p: 'follow_up' },
+    { id: 'blocked_owner',label: 'Waiting on the owner',  tone: 'warn', p: 'follow_up' },
+    { id: 'blocked_res',  label: 'Waiting on the resident', tone: 'warn', p: 'follow_up' },
+    { id: 'reassign',     label: 'Needs reassigning',     tone: 'bad',  p: 'follow_up' },
+    { id: 'ls_wrong',     label: 'Wrong in LeadSimple',   tone: 'bad',  p: 'follow_up', note: true },
+    { id: 'legal',        label: 'With counsel',          tone: 'bad',  p: 'follow_up', note: true },
+    { id: 'no_action',    label: 'No action needed',      tone: 'good', p: 'this_cycle' }
+  ],
+
+  offboarding: [
+    { id: 'working',     label: 'Offboarding underway', tone: 'info', p: 'follow_up' },
+    { id: 'reconsider',  label: 'Owner reconsidering',  tone: 'warn', p: 'follow_up' },
+    { id: 'final_acct',  label: 'Final accounting',     tone: 'info', p: 'follow_up' },
+    { id: 'done',        label: 'Offboarded',           tone: 'good', p: 'permanent', note: true },
+    { id: 'no_action',   label: 'No action needed',     tone: 'good', p: 'this_cycle' }
+  ]
+};
+
+/**
+ * Which vocabulary a list uses. Anything unmapped gets `generic`, which is short and
+ * always sensible — a missing mapping degrades, it does not break.
+ */
+var LIST_STATUS_SET = {
+  deposits: 'deposits',
+  workorders: 'maintenance', inspections: 'inspections',
+  delinquency: 'collections', rent_timing: 'collections', former: 'collections',
+  collect_vendor: 'collections', collect_approval: 'collections',
+  collect_owner: 'collections', collect_former: 'collections',
+  expiring: 'renewals', awaiting: 'renewals', no_expiry: 'renewals', undermarket: 'renewals',
+  movein: 'leasing', moveout: 'leasing', vacancy: 'leasing', unposted: 'leasing',
+  ending_mgmt: 'offboarding',
+  util_overdue: 'utilities', util_pastdue: 'utilities', util_duesoon: 'utilities',
+  util_period: 'utilities', util_dropped: 'utilities',
+  ls_overdue: 'ls_process', ls_stalled: 'ls_process',
+  ls_unassigned: 'ls_process', ls_no_due: 'ls_process',
+  followups: 'generic'
+};
+
+/**
+ * Two options every list carries, appended to whatever vocabulary applies.
+ *
+ * "Data looks wrong" is the one people never think to build, and it is the most
+ * valuable: the team looking at a row is the best detector of a bad row. Flagging it
+ * routes the item to a review queue instead of leaving someone to quietly ignore a
+ * number they do not believe.
+ */
+var UNIVERSAL_STATUSES = [
+  { id: 'data_wrong', label: 'Data looks wrong', tone: 'warn', p: 'follow_up', note: true,
+    universal: true },
+  { id: 'never',      label: 'Never show again', tone: 'none', p: 'permanent', note: true,
+    universal: true, confirm: true }
+];
+
+function statusSetFor_(listId) {
+  var name = LIST_STATUS_SET[String(listId || '')] || 'generic';
+  return (STATUS_SETS[name] || STATUS_SETS.generic).concat(UNIVERSAL_STATUSES);
+}
+
+/** Every status across every set, for lookup and validation. */
+function allStatuses_() {
+  var out = {}, list = [];
+  Object.keys(STATUS_SETS).forEach(function (k) {
+    STATUS_SETS[k].forEach(function (s) { if (!out[s.id]) { out[s.id] = s; list.push(s); } });
+  });
+  UNIVERSAL_STATUSES.forEach(function (s) { if (!out[s.id]) { out[s.id] = s; list.push(s); } });
+  return { byId: out, list: list };
+}
+
+/** Vocabularies serialised for the browser, so the editor shows the right options. */
+function statusSetsForClient_() {
+  var out = {};
+  Object.keys(LIST_STATUS_SET).forEach(function (listId) {
+    out[listId] = statusSetFor_(listId).map(function (s) {
+      return { id: s.id, label: s.label, tone: s.tone, p: s.p,
+               note: !!s.note, confirm: !!s.confirm };
+    });
+  });
+  out._default = statusSetFor_('').map(function (s) {
+    return { id: s.id, label: s.label, tone: s.tone, p: s.p,
+             note: !!s.note, confirm: !!s.confirm };
+  });
+  return out;
+}
+
+function statusMeta_(id) {
+  var all = allStatuses_();
+  return all.byId[String(id || '')] ||
+         { id: '', label: 'Open', tone: 'none', p: PERSISTENCE.FOLLOW_UP };
+}
+
+// ============================================================ READ
+
+var _itemStatus = null;
+
+function itemStatusMap_() {
+  if (_itemStatus) return _itemStatus;
+  _itemStatus = {};
+  readTab_(STATUS_TAB).forEach(function (r) {
+    var k = String(r.list_id || '') + '|' + String(r.item_key || '');
+    if (k === '|') return;
+    _itemStatus[k] = {
+      status: String(r.status || ''),
+      follow_up: ymd_(r.follow_up_date),
+      persistence: String(r.persistence || ''),
+      note: r.note || '',
+      by: r.updated_by || '',
+      at: r.updated_at || ''
+    };
+  });
+  return _itemStatus;
+}
+
+/**
+ * Called by the browser on page load. Returns only what the client needs to overlay,
+ * so the payload stays small even on a large portfolio.
+ */
+function getItemStatuses() {
+  var map = itemStatusMap_();
+  var t = ymd_(today_());
+  var out = {};
+  Object.keys(map).forEach(function (k) {
+    var s = map[k];
+    if (!s.status && !s.follow_up) return;
+    var meta = statusMeta_(s.status);
+    var persist = s.persistence || meta.p || PERSISTENCE.FOLLOW_UP;
+
+    // WHEN DOES IT COME BACK — the whole point of the second axis.
+    //   permanent   never, until someone deletes the row
+    //   this_cycle  hidden now; the next rebuild re-derives the list, so if the
+    //               condition still holds it returns on its own
+    //   follow_up   on the date. No date means it is due immediately.
+    var hide = false, due;
+    if (persist === PERSISTENCE.PERMANENT) { hide = true; due = false; }
+    else if (persist === PERSISTENCE.THIS_CYCLE) {
+      hide = true; due = false;
+    } else {
+      due = !s.follow_up || s.follow_up <= t;
+    }
+
+    out[k] = {
+      s: s.status, l: meta.label, tone: meta.tone, p: persist,
+      f: s.follow_up || '', n: s.note, by: s.by, at: s.at,
+      due: due, hide: hide,
+      perm: persist === PERSISTENCE.PERMANENT
+    };
+  });
+  return out;
+}
+
+/** Vocabularies + persistence labels, fetched once by the browser on load. */
+function getStatusConfig() {
+  return {
+    sets: statusSetsForClient_(),
+    persistence: [
+      { id: PERSISTENCE.FOLLOW_UP,  label: 'Comes back on the follow-up date' },
+      { id: PERSISTENCE.THIS_CYCLE, label: 'Hidden until the situation recurs' },
+      { id: PERSISTENCE.PERMANENT,  label: 'Never show this item again' }
+    ]
+  };
+}
+
+// ============================================================ WRITE
+
+/**
+ * Sets or clears a status. Called from the browser via google.script.run.
+ *
+ * Appends nothing — one row per item, updated in place, so the tab stays the size of the
+ * open workload rather than growing forever. History goes to Item_Status_Log.
+ */
+function setItemStatus(listId, itemKey, status, followUpDate, note, persistence) {
+  listId = String(listId || '').trim();
+  itemKey = String(itemKey || '').trim();
+  if (!listId || !itemKey) return { ok: false, error: 'missing list or item' };
+  // Checked BEFORE any work, so a view-only visitor gets a sentence rather than a raw
+  // "You do not have permission to call setValues" from somewhere three frames down.
+  if (!canWrite_()) return { ok: false, error: writeBlockedMessage_() };
+
+  var all = allStatuses_();
+  var st = String(status || '');
+  if (st && !all.byId[st]) return { ok: false, error: 'unknown status: ' + st };
+  var meta = statusMeta_(st);
+  var persist = String(persistence || '') || meta.p || PERSISTENCE.FOLLOW_UP;
+
+  // A note is required where the status makes a claim someone may have to defend later
+  // — a dispute, a write-off, or anything permanently suppressed. Six months on, "why is
+  // this hidden" has to have an answer.
+  if (st && (meta.note || persist === PERSISTENCE.PERMANENT) && !String(note || '').trim()) {
+    return { ok: false, error: '"' + meta.label + '" needs a note explaining why.' };
+  }
+
+  var fu = followUpDate ? ymd_(followUpDate) : null;
+  var who = '';
+  try { who = Session.getActiveUser().getEmail() || ''; } catch (e) {}
+  if (!who) { try { who = Session.getEffectiveUser().getEmail() || ''; } catch (e) {} }
+  var when = nowStamp_();
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(STATUS_TAB);
+  if (!sh) {
+    sh = ss.insertSheet(STATUS_TAB);
+    sh.getRange(1, 1, 1, 8).setValues([['list_id', 'item_key', 'status', 'follow_up_date',
+                                        'note', 'updated_by', 'updated_at', 'persistence']])
+      .setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+
+  var data = sh.getDataRange().getValues();
+  var hdr = data[0];
+  var iList = hdr.indexOf('list_id'), iKey = hdr.indexOf('item_key');
+  var row = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][iList]) === listId && String(data[i][iKey]) === itemKey) { row = i + 1; break; }
+  }
+
+  var values = [[listId, itemKey, st, fu || '', String(note || ''), who, when, persist]];
+  if (row > 0) sh.getRange(row, 1, 1, 8).setValues(values);
+  else sh.getRange(sh.getLastRow() + 1, 1, 1, 8).setValues(values);
+
+  // Append-only history — who said what, when. The status tab shows current state;
+  // this shows the story, which is what you need when something went wrong.
+  try {
+    appendTab_('Item_Status_Log', [{
+      logged_at: when, list_id: listId, item_key: itemKey,
+      status: st, follow_up_date: fu || '', persistence: persist,
+      note: String(note || ''), updated_by: who
+    }], ['logged_at', 'list_id', 'item_key', 'status', 'follow_up_date', 'persistence',
+         'note', 'updated_by']);
+  } catch (e) {}
+
+  _itemStatus = null;
+  invalidateTab_(STATUS_TAB);
+
+  var t = ymd_(today_());
+  var hide = (persist === PERSISTENCE.PERMANENT || persist === PERSISTENCE.THIS_CYCLE);
+  return { ok: true, status: st, label: meta.label, tone: meta.tone, p: persist,
+           follow_up: fu || '', note: String(note || ''), by: who, at: when,
+           due: hide ? false : (!fu || fu <= t),
+           hide: hide, perm: persist === PERSISTENCE.PERMANENT };
+}
+
+/** Clears a status entirely, returning the item to plain Open. */
+function clearItemStatus(listId, itemKey) {
+  return setItemStatus(listId, itemKey, '', '', '');
+}
+
+// ============================================================ FOLLOW-UPS DUE
+
+/**
+ * Items whose follow-up date has arrived, plus anything overdue.
+ *
+ * This is the list that makes the whole mechanism trustworthy: a promise to look again
+ * on Thursday is only worth making if Thursday actually surfaces it.
+ */
+function followUpBlocks_(pm) {
+  var map = itemStatusMap_();
+  var t = ymd_(today_());
+  var rows = [];
+
+  readTab_(STATUS_TAB).forEach(function (r) {
+    var status = String(r.status || '');
+    if (!status || status === 'done') return;
+    var fu = ymd_(r.follow_up_date);
+    if (!fu) return;
+    var days = daysBetween_(t, fu);
+    if (days > 7) return;                       // only what is due or nearly due
+    var meta = statusMeta_(status);
+    rows.push({
+      days: days, sort: days,
+      pm: UNASSIGNED, key: r.list_id + '|' + r.item_key,
+      cells: [String(r.item_key), r.list_id, meta.label,
+              String(r.note || '').slice(0, 60), r.updated_by || '',
+              dayOverdue_(days)],
+      sev: days < 0 ? 'bad' : (days === 0 ? 'bad' : 'warn')
+    });
+  });
+  rows.sort(function (a, b) { return a.sort - b.sort; });
+
+  return [block_('Follow-ups due', rows,
+    ['Item', 'List', 'Status', 'Note', 'Set by', 'Due'],
+    'Someone set a follow-up date and it has arrived. A commitment to look again on ' +
+    'Thursday is only worth making if Thursday surfaces it \\u2014 that is what this list is. ' +
+    'Overdue first.',
+    'followups', 'action', STATUS_TAB)];
+}
+
+/** Creates the tab with headers and guidance. */
+function setupItemStatus() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(STATUS_TAB) || ss.insertSheet(STATUS_TAB);
+  if (sh.getLastRow() > 0) return 'already exists';
+  sh.getRange(1, 1, 1, 7).setValues([['list_id', 'item_key', 'status', 'follow_up_date',
+                                      'note', 'updated_by', 'updated_at']]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.getRange(3, 1).setValue(
+    'Written by the dashboard when someone sets a status. Editing here works too, but the ' +
+    'dashboard is easier and records who made the change. ' +
+    'Statuses: ' + ITEM_STATUSES.map(function (s) { return s.id || '(open)'; }).join(' · ') + '. ' +
+    'While follow_up_date is in the future the item leaves the "need action now" count but ' +
+    'stays visible. When the date arrives it returns to urgent automatically.');
+  return 'created';
+}
+
+
+// ============================================================ SUPPRESSION REGISTER
+
+/**
+ * Everything permanently hidden, in one auditable place.
+ *
+ * A worklist that lets people make rows vanish, with no register of what vanished or
+ * why, decays into something nobody trusts. This is the counterweight: every permanent
+ * suppression, who made it, when, and the note they were required to leave.
+ *
+ * REVERSING ANYTHING: delete its row in Item_Status. That is the whole mechanism — no
+ * special tooling, no hidden state. The item returns on the next page load.
+ */
+function buildSuppressionRegister() {
+  var t0 = new Date().getTime();
+  var rows = readTab_(STATUS_TAB).filter(function (r) {
+    return String(r.persistence || '') === PERSISTENCE.PERMANENT ||
+           String(r.status || '') === 'never';
+  }).map(function (r) {
+    var meta = statusMeta_(r.status);
+    return {
+      list_id: r.list_id, item_key: r.item_key,
+      status: meta.label, reason: r.note || '(no reason recorded)',
+      suppressed_by: r.updated_by, suppressed_on: r.updated_at,
+      days_hidden: daysBetween_(ymd_(r.updated_at), ymd_(today_())),
+      how_to_reverse: 'Delete this item\u2019s row in the ' + STATUS_TAB + ' tab'
+    };
+  }).sort(function (a, b) { return (b.days_hidden || 0) - (a.days_hidden || 0); });
+
+  writeTab_('Suppressed_Items', rows.length ? rows
+    : [{ note: 'Nothing is permanently suppressed' }]);
+
+  var noReason = rows.filter(function (r) {
+    return r.reason === '(no reason recorded)'; }).length;
+  logRun_('buildSuppressionRegister', 'derived', 'Suppressed_Items', rows.length,
+          new Date().getTime() - t0,
+          rows.length + ' permanently hidden' + (noReason ? ' · ' + noReason + ' with no reason' : ''));
+  if (noReason) {
+    logError_('status', 'suppression',
+      noReason + ' item(s) are permanently hidden with no reason recorded. Those predate ' +
+      'the note requirement — review them in Suppressed_Items.');
+  }
+  return { suppressed: rows.length, without_reason: noReason };
+}
+
+/**
+ * Rows the team flagged as wrong. The people reading a row are the best detector of a
+ * bad row, and this is where that signal lands instead of being quietly ignored.
+ */
+function buildDataFlagQueue() {
+  var t0 = new Date().getTime();
+  var rows = readTab_(STATUS_TAB).filter(function (r) {
+    return String(r.status || '') === 'data_wrong';
+  }).map(function (r) {
+    return {
+      list_id: r.list_id, item_key: r.item_key,
+      what_looks_wrong: r.note || '(no detail given)',
+      flagged_by: r.updated_by, flagged_on: r.updated_at,
+      days_open: daysBetween_(ymd_(r.updated_at), ymd_(today_())),
+      recheck_on: ymd_(r.follow_up_date) || ''
+    };
+  }).sort(function (a, b) { return (b.days_open || 0) - (a.days_open || 0); });
+
+  writeTab_('Data_Flags', rows.length ? rows
+    : [{ note: 'No rows flagged as incorrect' }]);
+  logRun_('buildDataFlagQueue', 'derived', 'Data_Flags', rows.length,
+          new Date().getTime() - t0, rows.length + ' flagged by the team');
+  return rows.length;
+}
+
+// ============================================================ NOTE THREAD
+
+/**
+ * Every note ever left on one item, newest first.
+ *
+ * Item_Status_Log has recorded who changed what, when, and why since the status system
+ * was built — and none of it has ever been visible on the page. The row shows the LATEST
+ * note and nothing else, so "we're waiting on the plumber's estimate" replaces "owner
+ * approved, scheduling" and the reason the item is old disappears.
+ *
+ * A work order sitting at 40 days is not one decision. It is a sequence of them, and the
+ * sequence is what tells the next person whether it is stuck or moving.
+ */
+function getItemNotes(listId, itemKey) {
+  listId = String(listId || '').trim();
+  itemKey = String(itemKey || '').trim();
+  if (!listId || !itemKey) return [];
+
+  var out = [];
+  readTab_('Item_Status_Log').forEach(function (r) {
+    if (String(r.list_id) !== listId || String(r.item_key) !== itemKey) return;
+    var note = String(r.note || '').trim();
+    var st = String(r.status || '').trim();
+    // A row with neither a note nor a status change carries nothing to read.
+    if (!note && !st) return;
+    out.push({
+      at: String(r.logged_at || ''),
+      by: shortWho_(r.updated_by),
+      status: st ? statusMeta_(st).label : '',
+      tone: st ? statusMeta_(st).tone : 'none',
+      follow_up: String(r.follow_up_date || ''),
+      note: note,
+      // No status on the row means somebody left a note without changing anything.
+      kind: st ? 'status' : 'note'
+    });
+  });
+
+  out.sort(function (a, b) { return a.at < b.at ? 1 : -1; });
+  return out.slice(0, 40);
+}
+
+/**
+ * A note with no status change.
+ *
+ * Frank's case: a work order is already on "follow up in 3 days" and the status is right.
+ * What is missing is WHAT we are waiting on. Forcing a status change to record that would
+ * either reset the follow-up date or push people to pick a status they do not mean.
+ *
+ * Appends to the log and refreshes the note shown on the row, leaving status, follow-up
+ * date and persistence exactly as they were.
+ */
+function addItemNote(listId, itemKey, note) {
+  listId = String(listId || '').trim();
+  itemKey = String(itemKey || '').trim();
+  note = String(note || '').trim();
+  if (!listId || !itemKey) return { ok: false, error: 'missing list or item' };
+  if (!canWrite_()) return { ok: false, error: writeBlockedMessage_() };
+  if (!note) return { ok: false, error: 'Write something first.' };
+
+  var who = '';
+  try { who = Session.getActiveUser().getEmail() || ''; } catch (e) {}
+  if (!who) { try { who = Session.getEffectiveUser().getEmail() || ''; } catch (e) {} }
+  var when = nowStamp_();
+
+  // The current row, so the note can be shown without disturbing anything else.
+  var cur = (itemStatusMap_()[listId + '|' + itemKey]) || {};
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(STATUS_TAB);
+  if (sh) {
+    var data = sh.getDataRange().getValues();
+    var hdr = data[0];
+    var iList = hdr.indexOf('list_id'), iKey = hdr.indexOf('item_key');
+    var iNote = hdr.indexOf('note'), iBy = hdr.indexOf('updated_by'), iAt = hdr.indexOf('updated_at');
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][iList]) === listId && String(data[i][iKey]) === itemKey) {
+        // Only the note, author and timestamp. Status, follow-up and persistence untouched
+        // — that is the whole point of this being a separate action.
+        if (iNote > -1) sh.getRange(i + 1, iNote + 1).setValue(note);
+        if (iBy > -1) sh.getRange(i + 1, iBy + 1).setValue(who);
+        if (iAt > -1) sh.getRange(i + 1, iAt + 1).setValue(when);
+        break;
+      }
+    }
+  }
+
+  // SAME EIGHT COLUMNS as setItemStatus writes. A ninth would land in a column with no
+  // header on a sheet that already exists, and readTab_ would drop it silently — so the
+  // kind is INFERRED from a blank status instead of stored. One less schema to migrate.
+  appendTab_('Item_Status_Log', [{
+    logged_at: when, list_id: listId, item_key: itemKey,
+    status: '', follow_up_date: '', persistence: '',
+    note: note, updated_by: who
+  }], ['logged_at', 'list_id', 'item_key', 'status', 'follow_up_date', 'persistence',
+       'note', 'updated_by']);
+
+  _itemStatus = null;
+  invalidateTab_(STATUS_TAB);
+  invalidateTab_('Item_Status_Log');
+
+  return { ok: true, at: when, by: shortWho_(who), note: note,
+           notes: getItemNotes(listId, itemKey) };
+}
+
+/** "yuliana@weleaseusa.com" -> "yuliana". A full address on every line is noise. */
+function shortWho_(email) {
+  var s = String(email || '').trim();
+  if (!s) return 'unknown';
+  var at = s.indexOf('@');
+  return at > 0 ? s.slice(0, at) : s;
+}
