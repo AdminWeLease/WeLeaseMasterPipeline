@@ -1,0 +1,683 @@
+/**
+ * WeLease Pipeline — INGESTION JOBS  v1.0.0 · 2026-08-05
+ * Requires Core_v2.gs. AppFolio only.
+ *
+ * Four staged jobs pull every endpoint the 26 tracked metrics need.
+ * Staging exists to respect the 7-request/15-second rate limit and Apps Script's
+ * 6-minute execution cap — not for tidiness.
+ *
+ *   02:00  rebuildAll         directories, PM groups, unit variance
+ *   02:30  rebuildFinancials  rent roll, delinquency, unpaid charges
+ *   03:00  rebuildLeasing     renewals, applications, vacancy, expirations
+ *   03:30  rebuildCompliance  work orders, inspections, move-in/out events
+ *   04:30  computeMetrics     (Metrics.gs)
+ */
+
+// ============================================================ COLUMN SETS
+
+/**
+ * AppFolio returns every column by default. work_order alone is 78 columns and
+ * rental_applications is 85 — reading those back out of the sheet is what made the
+ * dashboard take 38 seconds to render. We use roughly a third of them, so ask for
+ * only those. Average reduction ~60% of cells.
+ *
+ * Every name below is verified against the live column data in the master JSON.
+ * If a metric ever needs a new field, add it here FIRST or it will silently be null.
+ */
+var COLS = {
+  work_order: ['work_order_id', 'work_order_number', 'service_request_id', 'created_at', 'completed_on', 'canceled_on', 'scheduled_start', 'estimate_req_on', 'estimated_on', 'estimate_approved_on', 'estimate_approval_status', 'status', 'work_order_type', 'unit_turn_id', 'unit_turn_category', 'priority', 'vendor', 'vendor_trade', 'assigned_user', 'job_description', 'ai_resolved', 'follow_up_on', 'inspection_date', 'occupancy_id', 'unit_id', 'unit_name', 'property_id', 'property_name', 'property_street', 'property_street2'],
+  rent_roll: ['unit_id', 'occupancy_id', 'tenant', 'tenant_id', 'status', 'rent', 'market_rent', 'computed_market_rent', 'past_due', 'lease_from', 'lease_to', 'move_in', 'move_out', 'last_rent_increase', 'property_id', 'property_name', 'property_street', 'property_street2', 'unit', 'property_type'],
+  rental_applications: ['received', 'screened_on', 'decision_made_at', 'approved_at', 'denied_at', 'canceled_at', 'application_status', 'unit_id', 'property_id', 'lease_start_date', 'move_in_date', 'applying_for'],
+  tenant_tickler: ['event', 'occurred_date', 'move_in_date', 'move_out_date', 'move_out_reason', 'occupancy_id', 'tenant', 'tenant_id', 'deposit', 'unit_id', 'unit', 'property_id', 'property_name', 'property_street', 'property_street2'],
+  renewal_summary: ['unit_id', 'unit_name', 'occupancy_id', 'tenant_name', 'tenant_id', 'lease_start', 'lease_end', 'previous_lease_end', 'countersigned_date', 'renewal_sent_date', 'percent_difference', 'dollar_difference', 'lease_start_month', 'status', 'property_id', 'property_name', 'property_street', 'property_street2'],
+  delinquency: ['name', 'tenant_status', 'occupancy_id', 'unit_id', 'unit', 'amount_receivable', 'delinquent_rent', '00_to30', '30_to60', '60_to90', '90_plus', 'not_yet_due', 'in_collections', 'collections_agency', 'move_out', 'delinquency_notes', 'property_id', 'property_name', 'property_street', 'property_street2'],
+  unit_vacancy: ['unit_id', 'unit', 'days_vacant', 'last_move_out', 'available_on', 'next_move_in', 'advertised_rent', 'posted_to_website', 'posted_to_internet', 'unit_status', 'property_id', 'property_name', 'street', 'street2', 'address'],
+  property_directory: ['property_id','property_name','property','property_street','property_street2',
+    'property_address','property_type','property_group_id','portfolio','portfolio_id','owners',
+    'owner_i_ds','management_start_date','management_end_date','management_end_reason','units',
+    'market_rent','property_created_on','visibility','insurance_expiration','year_built','sqft'],
+  tenant_directory: ['selected_tenant_id','tenant','status','tenant_type','primary_tenant',
+    'occupancy_id','unit_id','unit','property_id','property_name','property_street','property_street2',
+    'insurance_company_name','insurance_expiration','insurance_policy_number',
+    'lease_from','lease_to','move_in','move_out','emails','phone_numbers','deposit','rent'],
+  unit_directory: ['unit_id', 'property_id', 'property_name', 'unit_name', 'unit_street', 'unit_street2', 'unit_address', 'created_on', 'market_rent', 'computed_market_rent', 'rentable', 'rent_status', 'visibility', 'property'],
+  lease_expiration_detail: ['unit_id', 'unit', 'occupancy_id', 'tenant_name', 'tenant_id', 'lease_expires', 'status', 'notice_given_date', 'property_id', 'property_name', 'property_street', 'property_street2'],
+  inspection_detail: ['inspection_id', 'inspection_name', 'inspected_on', 'marked_done_on', 'status', 'occupancy_id', 'unit_id', 'unit', 'unit_turn_id', 'property_id', 'property_name'],
+  receivables_activity: ['txn_receipt_date', 'txn_amount', 'txn_remarks', 'payment_type', 'occupancy_id', 'unit_id', 'party', 'status', 'property_id', 'property_name', 'property_street', 'property_street2']
+};
+
+// ============================================================ HELPERS
+
+/** Pull, write, log, return count. Never lets one endpoint kill a whole job. */
+function pull_(job, slug, body, tab, opts) {
+  var t0 = new Date().getTime();
+  body = body || {};
+  // Ask for only the columns we use. If AppFolio rejects the filter for any reason we
+  // retry without it rather than losing the tab entirely.
+  if (COLS[slug] && !body.columns) body.columns = COLS[slug];
+  try {
+    var rows;
+    try {
+      rows = afReport_(slug, body, opts || {});
+    } catch (colErr) {
+      if (!body.columns) throw colErr;
+      logError_('appfolio', job + ' / ' + slug,
+        'columns filter rejected, retrying with all columns: ' + colErr.message.slice(0, 160));
+      delete body.columns;
+      rows = afReport_(slug, body, opts || {});
+    }
+    var n = writeTab_(tab, rows);
+    logRun_(job, 'appfolio', tab, n, new Date().getTime() - t0, slug);
+    sleepFor_('appfolio');
+    return rows;
+  } catch (e) {
+    logError_('appfolio', job + ' / ' + slug, e.message);
+    logRun_(job, 'appfolio', tab, 0, new Date().getTime() - t0, 'FAILED: ' + e.message.slice(0, 200));
+    sleepFor_('appfolio');
+    return [];
+  }
+}
+
+/**
+ * pull_, but the date range is split into windows so a page cap can never truncate it.
+ *
+ * Same contract as pull_ otherwise: column filter with a retry, one tab write, one log line.
+ * The row count goes into the log so a shortfall is visible in _refresh_log rather than
+ * only in the numbers three views downstream.
+ */
+function pullWindowed_(job, slug, body, fromKey, toKey, from, to, tab, opts) {
+  var t0 = new Date().getTime();
+  body = body || {};
+  if (COLS[slug] && !body.columns) body.columns = COLS[slug];
+  try {
+    var rows;
+    try {
+      rows = afReportWindowed_(slug, body, fromKey, toKey, from, to, opts || {});
+    } catch (colErr) {
+      if (!body.columns) throw colErr;
+      logError_('appfolio', job + ' / ' + slug,
+        'columns filter rejected, retrying with all columns: ' + colErr.message.slice(0, 160));
+      delete body.columns;
+      rows = afReportWindowed_(slug, body, fromKey, toKey, from, to, opts || {});
+    }
+    var n = writeTab_(tab, rows);
+    logRun_(job, 'appfolio', tab, n, new Date().getTime() - t0,
+            slug + ' ' + from + '..' + to + ' (windowed)');
+    sleepFor_('appfolio');
+    return rows;
+  } catch (e) {
+    logError_('appfolio', job + ' / ' + slug, e.message);
+    logRun_(job, 'appfolio', tab, 0, new Date().getTime() - t0, 'FAILED: ' + e.message.slice(0, 200));
+    sleepFor_('appfolio');
+    return [];
+  }
+}
+
+function periodStart_(days) { return ymd_(addDays_(today_(), -(days || 400))); }
+function periodEnd_()       { return ymd_(today_()); }
+
+// ============================================================ 02:00 — DIRECTORIES
+
+function rebuildAll() {
+  var t0 = new Date().getTime();
+  var asOf = periodEnd_();
+
+  var props  = pull_('rebuildAll', 'property_directory', {}, 'Properties_Units');
+  var units  = pull_('rebuildAll', 'unit_directory', {}, 'Unit_Directory');
+
+  /**
+   * The same directory again, including hidden records.
+   *
+   * AppFolio defaults these reports to VISIBLE properties only. Offboarding a property
+   * hides it, so the moment management ends the property — and every unit on it —
+   * drops out of the two pulls above. That is why lost doors could not be counted:
+   * management_end_date lives on the property row, and the property row had already
+   * left the building.
+   *
+   * property_visibility:'all' is the same parameter usFetchPostings_ has always used
+   * for the general ledger. It is deliberately written to SEPARATE tabs rather than
+   * widening the pulls above, because every operational list is scoped off those two
+   * and quietly handing them a pile of offboarded properties would change what the
+   * team sees on every view. History needs the wider set; worklists do not.
+   */
+  var propsAll = pull_('rebuildAll', 'property_directory',
+    { property_visibility: 'all' }, 'Properties_All');
+  var unitsAll = pull_('rebuildAll', 'unit_directory',
+    { property_visibility: 'all' }, 'Unit_Directory_All');
+
+  if (propsAll.length && propsAll.length === props.length) {
+    logError_('appfolio', 'rebuildAll',
+      'property_visibility:"all" returned the same ' + props.length + ' properties as the ' +
+      'default pull. Either nothing is hidden, or AppFolio is ignoring the parameter on ' +
+      'property_directory. Door history depends on this — run diagnoseDoorHistory().');
+  }
+  var owners = pull_('rebuildAll', 'owner_directory', {}, 'Owners');
+  var tenants= pull_('rebuildAll', 'tenant_directory', {}, 'Tenants');
+
+  // PM group assignment — group names follow "PM Frank, Jennifer, Mildred".
+  // This is what makes the /team view and every pm_group breakdown possible.
+  var groups = pull_('rebuildAll', 'property_group_directory', {}, 'PM_Groups');
+
+  var occ = pull_('rebuildAll', 'occupancy_summary', { as_of_to: asOf }, 'Occupancy_Summary');
+
+  buildUnitVariance_(units, occ, props);
+
+  logRun_('rebuildAll', 'appfolio', '-', units.length, new Date().getTime() - t0,
+    'properties=' + props.length + ' units=' + units.length + ' owners=' + owners.length +
+    ' tenants=' + tenants.length + ' groups=' + groups.length +
+    ' · including hidden: properties=' + propsAll.length + ' units=' + unitsAll.length +
+    ' (+' + (propsAll.length - props.length) + ' properties, +' +
+    (unitsAll.length - units.length) + ' units)');
+}
+
+/**
+ * THE CANON QUESTION. unit_directory is authoritative (Frank, 2026-08-04).
+ * occupancy_summary reports a different total. Every published rate depends on which
+ * denominator is used, so the gap gets named unit by unit — never averaged away.
+ */
+function buildUnitVariance_(units, occ, props) {
+  var occByProp = {};
+  occ.forEach(function (r) {
+    occByProp[r.property_id] = (occByProp[r.property_id] || 0) + (num_(r.number_of_units) || 0);
+  });
+  var dirByProp = {};
+  units.forEach(function (u) { dirByProp[u.property_id] = (dirByProp[u.property_id] || 0) + 1; });
+
+  var propName = {};
+  props.forEach(function (p) { propName[p.property_id] = p.property_name || p.property; });
+
+  var ids = {};
+  Object.keys(dirByProp).forEach(function (k) { ids[k] = true; });
+  Object.keys(occByProp).forEach(function (k) { ids[k] = true; });
+
+  var rows = Object.keys(ids).map(function (pid) {
+    var d = dirByProp[pid] || 0, o = occByProp[pid] || 0;
+    return {
+      property_id: pid, property_name: propName[pid] || null,
+      units_in_directory: d, units_in_occupancy_summary: o, variance: d - o,
+      note: d === o ? null
+          : (o === 0 ? 'Not in occupancy_summary — inactive, or excluded by unit type'
+                     : 'Counts disagree — investigate before publishing any rate')
+    };
+  }).filter(function (r) { return r.variance !== 0; })
+    .sort(function (a, b) { return Math.abs(b.variance) - Math.abs(a.variance); });
+
+  writeTab_('_unit_variance', rows.length ? rows : [{ note: 'No variance — both sources agree' }]);
+
+  var totalDir = units.length;
+  var totalOcc = Object.keys(occByProp).reduce(function (s, k) { return s + occByProp[k]; }, 0);
+  logRun_('buildUnitVariance', 'appfolio', '_unit_variance', rows.length, 0,
+    'CANON unit_directory=' + totalDir + ' · occupancy_summary=' + totalOcc +
+    ' · gap=' + (totalDir - totalOcc) + ' across ' + rows.length + ' properties');
+}
+
+// ============================================================ 02:30 — FINANCIALS
+
+function rebuildFinancials() {
+  var t0 = new Date().getTime();
+  var asOf = periodEnd_();
+
+  pull_('rebuildFinancials', 'rent_roll', { as_of_to: asOf }, 'Rent_Roll');
+  pull_('rebuildFinancials', 'delinquency', {}, 'Delinquency_Aged');
+  // balance_operator shape is {amount, comparator} — comparator is one of = != > < >= <=
+  pull_('rebuildFinancials', 'tenant_unpaid_charges_summary', {
+    occurred_on_to: asOf,
+    balance_operator: { comparator: '>', amount: '0' }
+  }, 'Unpaid_Charges');
+
+  // 12 months of receipts — the rent-timing story window.
+  //
+  // WINDOWED, and this is the fix for a wrong number rather than a tidy-up. WeLease takes
+  // roughly 500 receipts a month, so 12 months is ~6,500 rows against a 5,000-row page cap.
+  // The pull was being cut off, and because AppFolio returns oldest first, the rows lost
+  // were the NEWEST ones — so the current month arrived with a third of its receipts.
+  // August 2026 showed $315,152 from 122 households against an income statement saying
+  // $1,033,368 from ~334. Sixty-day windows keep every request inside one page.
+  //
+  // property_visibility: 'all' — the same parameter buildDoorHistory needed. Without it
+  // AppFolio returns only VISIBLE properties, and this account has 452 ended properties with
+  // 610 doors sitting behind that flag. Their residents paid rent too, and every one of
+  // those receipts was being dropped.
+  //
+  // The arithmetic that exposed it: over January to August our receipts totalled $7,275,599
+  // against $8,771,768 of GL rent income. Receipts INCLUDE the Resident Benefits Package,
+  // pet rent, late fees, utility reimbursements and deposits, so over a long window they
+  // must EXCEED rent income, not fall 17% short of it. Only a missing slice of properties
+  // explains a gap in that direction.
+  pullWindowed_('rebuildFinancials', 'receivables_activity',
+                { property_visibility: 'all' },
+                'receipt_date_from', 'receipt_date_to',
+                periodStart_(365), asOf, 'Receivables_Activity', { windowDays: 60 });
+
+  // Rent income from the ledger — the figure that reconciles to the income statement.
+  // Wrapped: if the GL pull fails, the receipts series above is still written.
+  if (typeof buildRentIncomeGL === 'function') {
+    try { buildRentIncomeGL(); }
+    catch (e) { logError_('appfolio', 'buildRentIncomeGL', e.message); }
+  }
+
+  logRun_('rebuildFinancials', 'appfolio', '-', 0, new Date().getTime() - t0, 'complete');
+}
+
+// ============================================================ 03:00 — LEASING
+
+function rebuildLeasing() {
+  var t0 = new Date().getTime();
+  var asOf = periodEnd_();
+
+  // Renewals: look back 12 months and forward 6 so the pipeline is visible.
+  pull_('rebuildLeasing', 'renewal_summary',
+        { start_on_from: periodStart_(365), start_on_to: ymd_(addDays_(today_(), 180)) }, 'Renewals');
+
+  // NOTE: the returned column is "received", not "received_on" — the filter and the
+  // column disagree. Easy to get wrong.
+  pull_('rebuildLeasing', 'rental_applications',
+        { received_on_from: periodStart_(365), received_on_to: asOf }, 'Applications');
+
+  pull_('rebuildLeasing', 'unit_vacancy', {}, 'Unit_Vacancy');
+
+  pull_('rebuildLeasing', 'lease_expiration_detail', {
+    filter_lease_date_range_by: 'current_lease',
+    ends_on_from: asOf,
+    ends_on_to: ymd_(addDays_(today_(), 120))
+  }, 'Lease_Expirations');
+
+  logRun_('rebuildLeasing', 'appfolio', '-', 0, new Date().getTime() - t0, 'complete');
+}
+
+// AppFolio work order status codes. The API DEFAULT is ["0","1","2","9","3"] — which
+// silently excludes Completed (4), Canceled (5), Completed-No-Bill (7) and Ready to
+// Bill (12). That default is why the first pull returned 120 work orders with ZERO
+// completions, and why cancellation rate computed as 0.
+var WO_STATUS = {
+  '0': 'New', '1': 'Work Done', '2': 'Estimated', '3': 'Scheduled', '4': 'Completed',
+  '5': 'Canceled', '6': 'Status 6', '7': 'Completed No Need To Bill', '8': 'Status 8',
+  '9': 'Estimate Requested', '12': 'Ready to Bill'
+};
+var WO_ALL_STATUSES   = ['0','1','2','3','4','5','6','7','8','9','12'];
+var WO_DONE_STATUSES  = ['1','4','7','12'];   // work finished, in some form
+var WO_CANCELED       = ['5'];
+
+// status_date selects WHICH date status_date_range_from/to filters on:
+//   0 Created On · 1 Estimate Requested · 2 Estimated · 3 Scheduled Start
+//   8 Work Done On · 4 Completed On
+// We filter on Created On so each pull is a clean cohort: everything raised in the
+// window, whatever state it reached. That is the correct basis for created-to-completed
+// speed metrics.
+var WO_STATUS_DATE_CREATED   = '0';
+var WO_STATUS_DATE_COMPLETED = '4';
+
+// ============================================================ 03:30 — COMPLIANCE
+
+function rebuildCompliance() {
+  var t0 = new Date().getTime();
+  var from = periodStart_(400), to = periodEnd_();
+
+  // Work orders: the DEFAULT pull returns the OPEN QUEUE ONLY — 116 rows, no
+  // Completed, no Canceled. Every maintenance speed metric needs completed work,
+  // so the status date range is mandatory. Falls back loudly rather than silently
+  // computing speeds on unfinished work.
+  var wo = [];
+  try {
+    wo = afReport_('work_order', {
+      work_order_statuses: WO_ALL_STATUSES,          // MUST be explicit — see WO_STATUS
+      status_date: WO_STATUS_DATE_CREATED,
+      status_date_range_from: from,
+      status_date_range_to: to,
+      columns: COLS.work_order
+    }, { maxPages: 20 });
+    writeTab_('Work_Orders', wo);
+    logRun_('rebuildCompliance', 'appfolio', 'Work_Orders', wo.length,
+            new Date().getTime() - t0,
+            'all statuses · created ' + from + ' to ' + to + ' · statuses seen: ' +
+            Object.keys(groupBy_(wo, function (r) { return r.status; })).join('/'));
+  } catch (e) {
+    logError_('appfolio', 'work_order status_date_range', e.message);
+    wo = pull_('rebuildCompliance', 'work_order', {}, 'Work_Orders', { maxPages: 20 });
+    logError_('appfolio', 'work_order',
+      'FELL BACK TO DEFAULT FILTER — this returns OPEN work orders only. ' +
+      'Maintenance speed metrics computed from this are INVALID. Do not publish them.');
+  }
+  sleepFor_('appfolio');
+
+  var completed = wo.filter(function (r) { return r.completed_on; }).length;
+  if (wo.length && completed === 0) {
+    logError_('appfolio', 'work_order',
+      'ZERO completed work orders in ' + wo.length + ' rows. Maintenance speed metrics ' +
+      'cannot be computed. Check the status filter before trusting any maintenance number.');
+  }
+
+  // INSPECTIONS REACH FURTHER BACK than the rest of this job. The annual clock asks "when
+  // was this unit last inspected", and a 400-day window answers "not in the last 400 days"
+  // — which renders as "never recorded" for a unit seen 18 months ago. Both are overdue, so
+  // the STATUS is right either way, but the date on the row is what someone books against.
+  //
+  // 900 days covers two full cycles. Windowed, because the account holds 2,653 inspection
+  // records and a flat pull would meet the 5,000-row page cap on a wider range.
+  pullWindowed_('rebuildCompliance', 'inspection_detail', {},
+                'inspected_on_from', 'inspected_on_to',
+                periodStart_(900), to, 'Inspections', { windowDays: 180 });
+  // Window runs FORWARD 90 days as well as back. Scheduled move-ins and move-outs are
+  // future-dated events — without the forward reach, "upcoming move-ins" is always empty.
+  pull_('rebuildCompliance', 'tenant_tickler',
+        { occurred_on_from: from, occurred_on_to: ymd_(addDays_(today_(), 90)) }, 'Tenant_Tickler');
+  pull_('rebuildCompliance', 'security_deposit_funds_detail',
+        { occurred_on_to: to }, 'Security_Deposits');
+
+  // Renewal pipeline LAST in this job — it reads Inspections (pulled just above),
+  // Lease_Expirations, Rent_Roll and LS_Processes. Wrapped, because a failure here should
+  // cost the pipeline tab, not the inspection and work-order pulls that already succeeded.
+  var renew = null;
+  if (typeof buildRenewalPipeline === 'function') {
+    try { renew = buildRenewalPipeline(); }
+    catch (e) { logError_('portfolio', 'buildRenewalPipeline', e.message); }
+  }
+
+  logRun_('rebuildCompliance', 'appfolio', '-', wo.length, new Date().getTime() - t0,
+    'work_orders=' + wo.length + ' (completed=' + completed + ')' +
+    (renew ? ' · renewals in horizon=' + renew.renewals_in_horizon +
+             ' inspection on-time=' + renew.on_time_rate_pct + '%' : ''));
+}
+
+// ============================================================ 04:15 — DERIVED
+
+/** Portfolio summary, door history, leasing activity. Runs after the pulls. */
+function rebuildPortfolio() {
+  return buildPortfolio();   // Portfolio.gs
+}
+
+/** Last job of the night: render the dashboard once so page loads are instant. */
+function rebuildDashboardCache() {
+  return buildDashboardCache();   // Dashboard.gs
+}
+
+/** Vendor bills, stalled approvals, owner shortfalls, former residents. */
+function rebuildCollections() {
+  return buildCollections();      // Collections.gs
+}
+
+/** Added vs cleared per list. Must run after the rebuilds, before the cache. */
+function rebuildThroughput() {
+  return buildThroughput();       // Throughput.gs
+}
+
+/** Re-seeds Master_Units and Master_Tenancies. Your decisions are preserved. */
+function rebuildMasterScope() {
+  return buildMasterScope();      // Master_Scope.gs
+}
+
+/** Rent-vs-market worklist, insurance compliance, field audit. */
+function rebuildDataQuality() {
+  return buildDataQuality();      // Data_Quality.gs
+}
+
+// ============================================================ RUN ALL (manual)
+
+/**
+ * Full sequential rebuild, in dependency order.
+ *
+ * This previously stopped after the four pulls, so computeMetrics never ran and the
+ * Metrics tab stayed stale — which is why the Performance view rendered every KPI as
+ * a dash with "no benchmark". A function called rebuildEverything has to mean it.
+ *
+ * Will likely exceed the 6-minute cap on a first full pull. Run the steps individually
+ * the first time, then let the staged triggers handle it nightly.
+ */
+/**
+ * MANUAL FULL REFRESH — everything, in dependency order, resumably.
+ *
+ * The whole chain is roughly fifteen minutes of work and Apps Script kills an execution
+ * at six, so this checkpoints between steps and re-arms itself. Run it once and walk
+ * away; watch _refresh_log for REFRESH COMPLETE.
+ *
+ * The nightly triggers do the same work, each job in its own execution. This exists for
+ * when you want everything current NOW without waiting for tonight.
+ *
+ * ORDER IS NOT ARBITRARY:
+ *   directories before everything      — every scope filter reads them
+ *   financials/leasing/compliance      — the raw pulls each list is built from
+ *   master scope                       — a human decision that gates what is in scope
+ *   portfolio                          — address book first, then summaries and rent
+ *   utilities, LeadSimple, ShowMojo    — vendor systems, independent of each other
+ *   data quality, collections          — derived from the pulls above
+ *   throughput                         — must see every list AFTER it is rebuilt
+ *   metrics                            — reads everything; itself resumable
+ *   dashboard cache LAST               — renders whatever the rest just produced
+ */
+var REFRESH_PROP_AT = 'REFRESH_STEP_AT';
+var REFRESH_PROP_RUN = 'REFRESH_RUN_STAMP';
+var REFRESH_PROP_TRIGGER = 'REFRESH_CONTINUATION_ID';
+
+function refreshSteps_() {
+  var steps = [
+    ['rebuildAll', 'directories — properties, units, owners, tenants, PM groups'],
+    ['rebuildFinancials', 'delinquency, receipts, deposits'],
+    ['rebuildLeasing', 'applications, renewals, vacancy, lease expirations'],
+    ['rebuildCompliance', 'inspections, work orders, tickler'],
+    ['rebuildMasterScope', 'scope decisions — gates everything downstream'],
+    ['rebuildPortfolio', 'address book, doors, rent timing, rent collection'],
+    ['rebuildCollections', 'vendor bills, approvals, owner shortfalls'],
+    ['rebuildDataQuality', 'rent vs market, insurance, field audit']
+  ];
+  if (typeof buildUtilitySchedule === 'function') {
+    steps.push(['buildUtilitySchedule', 'utility posting clock']);
+  }
+  if (typeof rebuildLeadSimple === 'function' && systemEnabled_('leadsimple')) {
+    steps.push(['rebuildLeadSimple', 'processes, deals, review, lead-to-move-in']);
+  }
+  if (typeof rebuildShowMojo === 'function' && systemEnabled_('showmojo')) {
+    steps.push(['rebuildShowMojo', 'listings, showings, unit join']);
+  }
+  if (typeof buildSuppressionRegister === 'function') {
+    steps.push(['buildSuppressionRegister', 'what is permanently hidden, and why']);
+    steps.push(['buildDataFlagQueue', 'rows the team flagged as wrong']);
+  }
+  // AFTER every list exists, or it snapshots a half-built picture.
+  if (typeof buildThroughput === 'function') {
+    steps.push(['rebuildThroughput', 'added versus cleared per list']);
+  }
+  steps.push(['computeMetrics', 'the metric registry — resumable, may take several passes']);
+  steps.push(['rebuildDashboardCache', 'render the page — must be last']);
+  return steps;
+}
+
+function refreshEverything() {
+  var t0 = new Date().getTime();
+  var props = PropertiesService.getScriptProperties();
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    Logger.log('A refresh is already running. Nothing to do.');
+    return { skipped_locked: true };
+  }
+  try {
+    return refreshPass_(t0, props);
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+function refreshPass_(t0, props) {
+  var steps = refreshSteps_();
+  var at = parseInt(props.getProperty(REFRESH_PROP_AT) || '0', 10) || 0;
+  var stamp = props.getProperty(REFRESH_PROP_RUN);
+  if (!at || !stamp) { stamp = nowStamp_(); props.setProperty(REFRESH_PROP_RUN, stamp); }
+
+  // 240s, so a step that overruns still leaves room to checkpoint and re-arm.
+  var BUDGET_MS = 240000;
+  var done = [], i = at;
+
+  for (; i < steps.length; i++) {
+    if (new Date().getTime() - t0 > BUDGET_MS) break;
+
+    var name = steps[i][0];
+    var fn = null;
+    try { fn = eval(name); } catch (e) { fn = null; }
+    if (typeof fn !== 'function') {
+      done.push(name + ' SKIPPED — not defined in this project');
+      continue;
+    }
+
+    var s0 = new Date().getTime();
+    try {
+      var res = fn();
+      var secs = Math.round((new Date().getTime() - s0) / 1000);
+      // computeMetrics checkpoints internally. If it is not finished, stay on this
+      // step rather than moving past it and rendering the cache against a partial set.
+      if (res && res.partial) {
+        done.push(name + ' PARTIAL (' + secs + 's) — needs another pass');
+        break;
+      }
+      done.push(name + ' OK (' + secs + 's)');
+    } catch (e) {
+      done.push(name + ' FAILED: ' + e.message.slice(0, 140));
+      logError_('refresh', name, e.message);
+    }
+  }
+
+  var elapsed = new Date().getTime() - t0;
+
+  if (i < steps.length) {
+    props.setProperty(REFRESH_PROP_AT, String(i));
+    try { refreshScheduleContinuation_(); } catch (e) {
+      logError_('refresh', 'continuation',
+        'Could not schedule the continuation: ' + e.message + ' — run refreshEverything() again.');
+    }
+    var left = steps.slice(i).map(function (x) { return x[0]; });
+    logRun_('refreshEverything', 'system', '-', done.length, elapsed,
+      'PARTIAL — ' + done.length + ' step(s) this pass, ' + left.length + ' to go: ' +
+      left.slice(0, 5).join(', ') + (left.length > 5 ? '…' : ''));
+    Logger.log(done.join('\n') + '\n\nPARTIAL — ' + left.length + ' step(s) remain: ' +
+               left.join(', ') + '\nA continuation runs in about a minute.');
+    return { partial: true, completed: done, remaining: left };
+  }
+
+  props.deleteProperty(REFRESH_PROP_AT);
+  props.deleteProperty(REFRESH_PROP_RUN);
+  try { refreshClearContinuation_(); } catch (e) {}
+
+  var failed = done.filter(function (d) { return d.indexOf('FAILED') > -1; });
+  logRun_('refreshEverything', 'system', '-', steps.length, elapsed,
+    'REFRESH COMPLETE — ' + steps.length + ' step(s)' +
+    (failed.length ? ' · ' + failed.length + ' FAILED' : ' · none failed'));
+  Logger.log(done.join('\n') + '\n\nREFRESH COMPLETE.' +
+    (failed.length ? '\n' + failed.length + ' step(s) failed — see _errors.' : ''));
+  return { complete: true, steps: done, failed: failed.length };
+}
+
+function refreshScheduleContinuation_() {
+  refreshClearContinuation_();
+  var t = ScriptApp.newTrigger('refreshEverything').timeBased().after(60 * 1000).create();
+  try {
+    PropertiesService.getScriptProperties().setProperty(REFRESH_PROP_TRIGGER, t.getUniqueId());
+  } catch (e) {}
+}
+
+/** By id, never by handler name — the nightly triggers share these handlers. */
+function refreshClearContinuation_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty(REFRESH_PROP_TRIGGER);
+  if (!id) return;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    try { if (t.getUniqueId() === id) ScriptApp.deleteTrigger(t); } catch (e) {}
+  });
+  props.deleteProperty(REFRESH_PROP_TRIGGER);
+}
+
+/** Where is the refresh up to? */
+function refreshStatus() {
+  var props = PropertiesService.getScriptProperties();
+  var at = props.getProperty(REFRESH_PROP_AT);
+  var steps = refreshSteps_();
+  if (at === null || at === undefined) {
+    Logger.log('No refresh in progress. ' + steps.length + ' steps would run.');
+    return 'idle';
+  }
+  var n = parseInt(at, 10) || 0;
+  var out = ['Refresh in progress, started ' + props.getProperty(REFRESH_PROP_RUN),
+             'Next step: ' + (steps[n] ? steps[n][0] : '(end)') + '  (' + n + ' of ' + steps.length + ')',
+             '', 'Remaining:'];
+  steps.slice(n).forEach(function (x) { out.push('  ' + x[0] + ' — ' + x[1]); });
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+/** Abandon a stuck refresh. */
+function resetRefresh() {
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty(REFRESH_PROP_AT);
+  props.deleteProperty(REFRESH_PROP_RUN);
+  try { refreshClearContinuation_(); } catch (e) {}
+  Logger.log('Refresh checkpoint cleared. refreshEverything() will start from the top.');
+  return 'reset';
+}
+
+/** Old name, kept so anything already pointing at it still works. */
+function rebuildEverything() { return refreshEverything(); }
+
+/**
+ * What is actually installed, against what installTriggers would create.
+ *
+ * Triggers are the one part of this project that lives outside the code, so the code
+ * cannot tell you they are right — it can only tell you what it expected.
+ */
+function verifyTriggers() {
+  var live = ScriptApp.getProjectTriggers().filter(function (t) {
+    return t.getEventType() === ScriptApp.EventType.CLOCK;
+  });
+  var liveNames = {};
+  live.forEach(function (t) {
+    var h = t.getHandlerFunction();
+    liveNames[h] = (liveNames[h] || 0) + 1;
+  });
+
+  var expected = expectedTriggers_();
+  var out = ['INSTALLED: ' + live.length + ' clock trigger(s)', ''];
+
+  out.push('--- EXPECTED ---');
+  var missing = [];
+  expected.forEach(function (e) {
+    var have = liveNames[e.fn] || 0;
+    var defined = false;
+    try { defined = typeof eval(e.fn) === 'function'; } catch (x) {}
+    out.push('  ' + String(e.h).padStart(2, '0') + ':' + String(e.m).padStart(2, '0') +
+             '  ' + e.fn.padEnd(26) +
+             (e.dayOfMonth ? 'monthly/' + e.dayOfMonth + 'th ' : 'daily      ') +
+             (have ? 'installed' : 'MISSING') +
+             (defined ? '' : '   <-- function not defined!'));
+    if (!have) missing.push(e.fn);
+  });
+
+  out.push('');
+  out.push('--- INSTALLED BUT NOT EXPECTED ---');
+  var expNames = {};
+  expected.forEach(function (e) { expNames[e.fn] = 1; });
+  var extra = Object.keys(liveNames).filter(function (n) { return !expNames[n]; });
+  if (!extra.length) out.push('  none');
+  extra.forEach(function (n) {
+    var why = (n === 'computeMetrics' || n === 'refreshEverything' ||
+               n === 'lsSeedProcesses' || n === 'lsSeedCompletedTasks')
+      ? '  (a one-off continuation — normal while a resumable job is mid-flight)'
+      : '  (left over from an earlier version — installTriggers() clears these)';
+    out.push('  ' + n + ' x' + liveNames[n] + why);
+  });
+
+  var dupes = Object.keys(liveNames).filter(function (n) { return liveNames[n] > 1; });
+  if (dupes.length) {
+    out.push('');
+    out.push('--- DUPLICATES (a job running twice a night) ---');
+    dupes.forEach(function (n) { out.push('  ' + n + ' x' + liveNames[n]); });
+    out.push('  Run installTriggers() to reset them.');
+  }
+
+  out.push('');
+  out.push(missing.length
+    ? missing.length + ' trigger(s) missing. Run installTriggers().'
+    : 'Every expected trigger is installed.');
+  out.push('NOTE: installTriggers() deletes ALL triggers first. Never run it while a');
+  out.push('seed or a resumable job is mid-flight — it kills the continuation.');
+
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
