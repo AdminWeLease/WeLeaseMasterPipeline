@@ -1,0 +1,1129 @@
+/**
+ * WeLease Pipeline — UTILITY BILLING SCHEDULE  v2.0.0 · 2026-08-05
+ * Requires Core_v2.gs, Shared.gs, Metrics.gs (readTab_), Discover_v2.gs (sleepFor_).
+ *
+ * WHAT THIS IS
+ *   A compliance clock, not a bill processor. It watches every recurring utility
+ *   account, learns its cycle from posted history, projects when the next posting is
+ *   due, and alerts when one is late. It also checks that the service period is
+ *   recorded, because that is what makes a charge auditable.
+ *
+ * THE CLOCK — Frank's 4195 Marzo St example, which is the test case
+ *   Water charge posted            2026-08-03   (GL 6173, Occupancy 821, Front House)
+ *   + 2-month cycle -> expected    2026-10-03
+ *   + 5-day window  -> POST BY     2026-10-08   <- the compliance deadline
+ *   + 3 days grace  -> alert after 2026-10-11
+ *   Calendar days throughout.
+ *
+ *   NOTE FOR ANYONE READING v1: the old "Jul 25 issued -> Aug 04 post by" chain is
+ *   RETIRED. That version anchored on the date the bill was RECEIVED and added a
+ *   5-day receive window plus a 5-day processing window. v2 anchors on WeLease's own
+ *   POSTING date, which already absorbs receipt, so there is ONE 5-day window. Keeping
+ *   both windows would have pushed every deadline five days late.
+ *
+ * HOW ACCOUNTS ARE GROUPED — this is the part that is easy to get wrong
+ *   Water and sewer are NEVER billed separately. The providers WeLease uses bill sewer
+ *   inside the water bill, and it always posts to 6173. So 6173 and 6174 are ONE clock,
+ *   and a stray 6174 posting is folded in and flagged rather than creating a phantom
+ *   second clock that reads as permanently missing.
+ *
+ *   Energy is grouped by PROVIDER. SDG&E bills gas and electric together (6177), but
+ *   some properties post gas alone (6172) or electric alone (6171) depending on setup.
+ *   Grouping by payee means one SDG&E bill is one clock however it was coded, and a
+ *   different provider on the same property gets its own clock automatically.
+ *
+ * WHICH POSTING STOPS THE CLOCK
+ *   Resident charges and vendor bills BOTH post to the same GL — a resident water
+ *   charge and the City of San Diego bill are both 6173. Per property, the schedule
+ *   locks onto whichever side that property actually uses: resident charges where they
+ *   exist, otherwise the vendor bill. The measured side is reported on every row, so a
+ *   property is never silently measured on the wrong thing.
+ *
+ * WHAT COUNTS AS ONE BILL
+ *   Marzo has a Front House and a Back House. One water bill becomes two resident
+ *   charges, and they may not post on the same day. Charges are grouped by SERVICE
+ *   PERIOD, so "May 05 - Jul 06, 2026" is one bill no matter when each unit was
+ *   charged. Date-clustering is only the fallback when no period is recorded.
+ *
+ * WHAT THIS DOES NOT DO
+ *   No allocation, no import files. Multifamily bill splitting happens outside this
+ *   pipeline. This module answers one question: did the posting happen, on time, with
+ *   its service period intact.
+ */
+
+// ============================================================ CONFIG
+
+var USCHED = {
+  // The clock. Anchored on our own posting date, so there is a single window.
+  POST_WINDOW_DAYS: 5,      // expected posting date -> compliance deadline
+  ALERT_GRACE_DAYS: 3,      // deadline -> raise the alert
+  DUE_SOON_DAYS: 5,         // how far ahead "Due Soon" looks
+
+  LOOKBACK_MONTHS: 24,      // history used to infer a cycle
+  MIN_EVENTS_TO_INFER: 3,   // below this, say so rather than guess
+
+  // Recurring-with-rent signature. Every signal is reported so the call is auditable.
+  RECURRING_DOM_MAX: 3,
+  RECURRING_GAP_MIN: 26,
+  RECURRING_GAP_MAX: 35,
+  RECURRING_AMOUNT_CV: 0.06,
+
+  SAME_EVENT_DAYS: 4        // fallback only, when no service period is recorded
+};
+
+/**
+ * SCOPE — what the schedule measures. Added 2026-08-06 at Frank's direction.
+ *
+ * The point of this clock is to hold WeLease to the standard a utility company is held
+ * to: charge the resident consistently, every cycle, on time. That reframes what belongs
+ * in it.
+ *
+ * TENANT_CHARGES_ONLY    Vendor bills and owner draws are how WeLease pays the provider.
+ *                        They are not what the resident sees. Vendor rows are still read,
+ *                        but ONLY to learn the provider name — a resident charge never
+ *                        carries one.
+ *
+ * MIN_POSTINGS_TO_TRACK  A property posted once, three years ago, is not a billing cycle.
+ *                        Those previously surfaced as "INSUFFICIENT HISTORY", which reads
+ *                        as a task. Now dropped and written to Utility_Schedule_Dropped,
+ *                        so nothing disappears silently.
+ *
+ * ACTIVE_PROPERTIES_ONLY Ledger history outlives the management relationship. We cannot
+ *                        post a utility charge for a property we no longer manage.
+ *
+ * SINGLE-FAMILY          A single-family resident is usually billed directly by the
+ *                        provider, leaving nothing for WeLease to post. Excluded by
+ *                        default UNLESS the team has demonstrably been posting by hand —
+ *                        proven by MIN_MANUAL_POSTINGS_SFH postings carrying a typed
+ *                        service period.
+ */
+var USCHED_SCOPE = {
+  TENANT_CHARGES_ONLY: true,
+  MIN_POSTINGS_TO_TRACK: 3,
+  ACTIVE_PROPERTIES_ONLY: true,
+  EXCLUDE_SINGLE_FAMILY: true,
+  MIN_MANUAL_POSTINGS_SFH: 3,
+  SINGLE_FAMILY_TYPES: ['single-family', 'single family', 'sfr', 'sfh', 'condo', 'townhome', 'townhouse']
+};
+
+/**
+ * A manual posting, detected from the description.
+ *
+ * WeLease types the service period into the description when entering a utility charge
+ * by hand — "SDGE Utilities 06/12/2026-07/13/2026". A system-generated recurring charge
+ * carries no such period, so a date range in the description is the manual signature.
+ *
+ * If the team's convention differs, this is the ONE function to change.
+ */
+function usIsManualPosting_(desc) {
+  var d = String(desc || '');
+  if (!d) return false;
+  if (/\d{1,2}\/\d{1,2}\/\d{2,4}\s*[-\u2013\u2014]|\d{1,2}\/\d{1,2}\/\d{2,4}\s*to\s/i.test(d) &&
+      /\d{1,2}\/\d{1,2}\/\d{2,4}[\s\S]{0,6}\d{1,2}\/\d{1,2}\/\d{2,4}/.test(d)) return true;
+  if (/\d{4}-\d{2}-\d{2}[\s\S]{0,6}\d{4}-\d{2}-\d{2}/.test(d)) return true;
+  if (/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d{1,2}[^a-z0-9]{1,4}(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(d)) return true;
+  return false;
+}
+
+/**
+ * Applies the scope rules to the assembled series and reports every drop.
+ *
+ * Runs AFTER series assembly so the decision can use posting counts and manual-entry
+ * evidence, neither of which exists per-row. Everything dropped is returned with a
+ * reason and written to a tab — a series that vanishes without explanation is
+ * indistinguishable from a bug.
+ */
+function usApplyScope_(series) {
+  var props = {};
+  readTab_('Properties_Units').forEach(function (p) {
+    props[String(p.property_id)] = p;
+  });
+  var t = ymd_(today_());
+  var kept = {}, dropped = [], counts = {};
+
+  function drop(s, reason, detail) {
+    counts[reason] = (counts[reason] || 0) + 1;
+    dropped.push({
+      property_label: s.property_label, property_id: s.property_id,
+      utility: s.group_label, provider: s.provider || '',
+      postings: (s.events || []).length, manual_postings: s.manual_postings || 0,
+      reason: reason, detail: detail || ''
+    });
+  }
+
+  Object.keys(series).forEach(function (k) {
+    var s = series[k];
+    var p = props[String(s.property_id)] || {};
+    var n = (s.events || []).length;
+
+    if (USCHED_SCOPE.ACTIVE_PROPERTIES_ONLY) {
+      var end = ymd_(p.management_end_date);
+      if (end && end <= t) { drop(s, 'Management ended', 'ended ' + end); return; }
+    }
+
+    if (n < USCHED_SCOPE.MIN_POSTINGS_TO_TRACK) {
+      drop(s, 'Too few postings', n + ' in ' + USCHED.LOOKBACK_MONTHS + ' months, need ' +
+           USCHED_SCOPE.MIN_POSTINGS_TO_TRACK);
+      return;
+    }
+
+    if (USCHED_SCOPE.EXCLUDE_SINGLE_FAMILY) {
+      var ptype = String(p.property_type || '').toLowerCase();
+      var isSF = USCHED_SCOPE.SINGLE_FAMILY_TYPES.some(function (x) {
+        return ptype.indexOf(x) !== -1;
+      });
+      if (isSF && (s.manual_postings || 0) < USCHED_SCOPE.MIN_MANUAL_POSTINGS_SFH) {
+        drop(s, 'Single-family, not manually billed',
+             ptype + ' with ' + (s.manual_postings || 0) + ' manual posting(s), need ' +
+             USCHED_SCOPE.MIN_MANUAL_POSTINGS_SFH);
+        return;
+      }
+    }
+    kept[k] = s;
+  });
+
+  if (dropped.length) {
+    writeTab_('Utility_Schedule_Dropped', dropped);
+    logRun_('usApplyScope_', 'derived', 'Utility_Schedule_Dropped', dropped.length, 0,
+      Object.keys(counts).map(function (r) { return r + ': ' + counts[r]; }).join(' · '));
+  } else {
+    writeTab_('Utility_Schedule_Dropped', [{ note: 'Nothing dropped by the scope rules' }]);
+  }
+  return { series: kept, dropped: dropped.length, reasons: counts };
+}
+
+
+/**
+ * Service groups, not individual GL accounts. One group is one bill is one clock.
+ * Source: chart_of_accounts, verified live 2026-08-04.
+ *
+ * 4470 Monthly Utilities is deliberately ABSENT. It is flagged Hidden in the chart of
+ * accounts and Frank confirmed it is not used — utilities post to the utility GL by
+ * type (6173 for water, and so on) for residents and vendors alike. An earlier version
+ * tracked it because the API master lists it under gl_ids_to_track; that was wrong.
+ */
+var USCHED_GROUPS = {
+  WATER: {
+    label: 'Water & Sewer', numbers: ['6173', '6174'], byProvider: true,
+    note: 'Sewer is billed inside the water bill and posts to 6173. 6174 is folded in.'
+  },
+  ENERGY: {
+    label: 'Gas & Electric', numbers: ['6171', '6172', '6177'], byProvider: true,
+    note: 'Grouped by provider. SDG&E bills gas and electric together; a separate ' +
+          'provider gets its own clock.'
+  },
+  WASTE: {
+    label: 'Garbage & Recycling', numbers: ['6175', '6176'], byProvider: true, note: null
+  },
+  SOLAR: {
+    label: 'Solar', numbers: ['6178', '4490'], byProvider: false,
+    note: 'Expense 6178 and income 4490 together — net metering runs both directions.'
+  }
+};
+
+/** GL descriptors. `name` matters: general_ledger may return account_number as null. */
+var USCHED_GL = [
+  { id: 89,  number: '6171', name: 'Electricity',           group: 'ENERGY' },
+  { id: 90,  number: '6172', name: 'Gas',                   group: 'ENERGY' },
+  { id: 115, number: '6177', name: 'Gas & Electricity',     group: 'ENERGY' },
+  { id: 91,  number: '6173', name: 'Water',                 group: 'WATER'  },
+  { id: 92,  number: '6174', name: 'Sewer',                 group: 'WATER', stray: true },
+  { id: 93,  number: '6175', name: 'Garbage and Recycling', group: 'WASTE'  },
+  { id: 110, number: '6176', name: 'Trash Replacement',     group: 'WASTE'  },
+  { id: 116, number: '6178', name: 'Solar Panel',           group: 'SOLAR'  },
+  { id: 125, number: '4490', name: 'Solar Panel Income',    group: 'SOLAR'  }
+];
+
+function uschedGlIds_() { return USCHED_GL.map(function (g) { return String(g.id); }); }
+
+/**
+ * Resolve a ledger row to a GL descriptor.
+ *
+ * WHY BY NAME AS WELL AS NUMBER: in the sampled general_ledger response account_number
+ * comes back NULL while account_name is populated. Matching on the number alone would
+ * discard every row and produce an empty schedule. Number first, name second.
+ */
+function uschedResolveGl_(row) {
+  var num = String(row.account_number || '').trim();
+  var i;
+  if (num) {
+    for (i = 0; i < USCHED_GL.length; i++) if (USCHED_GL[i].number === num) return USCHED_GL[i];
+  }
+  var nm = String(row.account_name || '').trim().toLowerCase();
+  if (nm) {
+    for (i = 0; i < USCHED_GL.length; i++) {
+      if (USCHED_GL[i].name.toLowerCase() === nm) return USCHED_GL[i];
+    }
+    // "6173 Water" or "6173 - Water" in a single field
+    var m = nm.match(/^(\d{4})\b/);
+    if (m) for (i = 0; i < USCHED_GL.length; i++) if (USCHED_GL[i].number === m[1]) return USCHED_GL[i];
+  }
+  return null;
+}
+
+var TABS_USCHED = [
+  'Utility_Schedule', 'Utility_Schedule_Alerts', 'Utility_Schedule_Overrides',
+  'Utility_Schedule_History', 'Utility_Schedule_Anomalies', '_uschedule_events'
+];
+
+function setupUtilityScheduleSheets() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet(), made = [];
+  TABS_USCHED.forEach(function (t) {
+    if (!ss.getSheetByName(t)) { ss.insertSheet(t); made.push(t); }
+  });
+  seedOverridesHeader_();
+  logRun_('setupUtilityScheduleSheets', 'system', '-', made.length, 0,
+          'created: ' + (made.join(', ') || 'none'));
+  return made;
+}
+
+function seedOverridesHeader_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('Utility_Schedule_Overrides');
+  if (!sh || sh.getLastRow() > 0) return;
+  var head = ['property_id', 'service_group', 'provider', 'property_label',
+              'cycle_months_override', 'exempt_override', 'anchor_date_override', 'note'];
+  sh.getRange(1, 1, 1, head.length).setValues([head]).setFontWeight('bold');
+  sh.getRange(2, 1, 1, head.length).setValues([['', 'WATER', '', 'EXAMPLE — 4195 Marzo St water',
+    2, 'no', '', 'Bi-monthly. Leave the cycle blank to let the pipeline infer it. ' +
+    'Blank property_id applies the row to every property in that group.']]);
+  sh.setFrozenRows(1);
+}
+
+// ============================================================ DATES
+
+/**
+ * Date parsing for this module. Does NOT replace parseDate_() — that would shadow it.
+ *
+ * WHY IT EXISTS — a bug in Core_v2.gs parseDate_() worth fixing there too:
+ *   parseDate_ appends 'T00:00:00' to any 10-character string so an ISO date reads at
+ *   local midnight. Correct for '2026-06-12'. But a zero-padded US date is also 10
+ *   characters, so '06/12/2026' becomes '06/12/2026T00:00:00' — invalid, returns null.
+ *
+ *     parseDate_('2026-06-12')  -> correct
+ *     parseDate_('6/12/2026')   -> correct (9 chars, skips the fixup)
+ *     parseDate_('06/12/2026')  -> NULL   <-- silent
+ *     parseDate_('12/31/2026')  -> NULL   <-- silent
+ *
+ *   A null date is indistinguishable from an absent one, which is the worst kind of
+ *   wrong. Recommended fix there: test /^\d{4}-\d{2}-\d{2}$/ instead of length.
+ */
+function usDate_(s) {
+  if (!s) return null;
+  if (s instanceof Date) return isNaN(s.getTime()) ? null : s;
+  s = String(s).trim();
+  if (!s) return null;
+
+  var m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2}|\d{4})$/);
+  if (m) {
+    var y = +m[3];
+    if (y < 100) y += (y < 70 ? 2000 : 1900);
+    return new Date(y, +m[1] - 1, +m[2]);
+  }
+  var d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+var US_MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+                  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+function usMonthIndex_(s) {
+  var k = String(s || '').trim().slice(0, 3).toLowerCase();
+  return (k in US_MONTHS) ? US_MONTHS[k] : null;
+}
+
+/**
+ * Add whole months, preserving day-of-month, clamping at short months.
+ * Always called from the anchor in a single call — chaining drifts (Jan 31 +1 +1 =
+ * Mar 28, but Jan 31 +2 = Mar 31).
+ */
+function usAddMonths_(d, n) {
+  var target = new Date(d.getFullYear(), d.getMonth() + n, 1);
+  var lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+  return new Date(target.getFullYear(), target.getMonth(), Math.min(d.getDate(), lastDay));
+}
+
+function usDom_(d) { return d.getDate(); }
+
+function usCv_(arr) {
+  if (arr.length < 2) return 0;
+  var mean = arr.reduce(function (a, b) { return a + b; }, 0) / arr.length;
+  if (!mean) return 0;
+  var v = arr.reduce(function (a, b) { return a + Math.pow(b - mean, 2); }, 0) / arr.length;
+  return Math.sqrt(v) / Math.abs(mean);
+}
+
+function usNormProvider_(s) {
+  return String(s || '').toUpperCase()
+    .replace(/[.,]/g, ' ')
+    .replace(/\b(INC|LLC|LP|CO|COMPANY|THE|OF)\b/g, ' ')
+    .replace(/&/g, ' AND ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ============================================================ SERVICE PERIOD
+//
+// Frank's real format is "WATER | Service Period: May 05 - Jul 06, 2026" — month names,
+// with ONE year at the end covering both ends. A numeric-only parser reads that as no
+// period at all, which would have flagged every correctly-described charge as missing.
+
+function usParsePeriod_(text) {
+  if (!text) return null;
+  var t = String(text);
+
+  // Month-name range, year optional on either end: "May 05 - Jul 06, 2026"
+  var m = t.match(new RegExp(
+    '([A-Za-z]{3,9})\\.?\\s+(\\d{1,2})(?:\\s*,?\\s*(\\d{4}))?' +
+    '\\s*(?:[-\u2013\u2014]|to|thru|through)\\s*' +
+    '([A-Za-z]{3,9})\\.?\\s+(\\d{1,2})(?:\\s*,?\\s*(\\d{4}))?', 'i'));
+  if (m) {
+    var m1 = usMonthIndex_(m[1]), m2 = usMonthIndex_(m[4]);
+    if (m1 !== null && m2 !== null) {
+      var y2 = m[6] ? +m[6] : (m[3] ? +m[3] : null);
+      var y1 = m[3] ? +m[3] : y2;
+      // A single trailing year with the start month after the end month means the
+      // period crosses New Year: "Dec 05 - Feb 06, 2026" starts in 2025.
+      if (y1 !== null && !m[3] && m1 > m2) y1 = y2 - 1;
+      if (y1 !== null && y2 !== null) {
+        return { from: new Date(y1, m1, +m[2]), to: new Date(y2, m2, +m[5]),
+                 raw: m[0], found: 'range' };
+      }
+    }
+  }
+
+  // Numeric range: 06/12/2026-07/13/2026 · 6/12/26 to 7/13/26
+  m = t.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s*(?:[-–—]|to|thru|through)\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
+  if (m) return { from: usDate_(m[1]), to: usDate_(m[2]), raw: m[0], found: 'range' };
+
+  // ISO range
+  m = t.match(/(\d{4}-\d{2}-\d{2})\s*(?:[-–—]|to|thru|through)\s*(\d{4}-\d{2}-\d{2})/i);
+  if (m) return { from: usDate_(m[1]), to: usDate_(m[2]), raw: m[0], found: 'range' };
+
+  // One date only — present but incomplete, which is its own finding
+  m = t.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2})/);
+  if (m) return { from: usDate_(m[1]), to: null, raw: m[0], found: 'single_date' };
+
+  return null;
+}
+
+/** Assess one event's service period. */
+function usServicePeriod_(e) {
+  var parsed = usParsePeriod_(e.descriptions.join(' | '));
+  // Judged on what the LEDGER holds. e.service_from/to may have been backfilled from
+  // the description for grouping purposes; using those here would report a blank
+  // ledger period as OK.
+  var nf = e.ledger_from, nt = e.ledger_to;
+
+  if (nf && nt) {
+    if (!parsed || parsed.found !== 'range') {
+      return { status: 'DESCRIPTION MISSING PERIOD', from: nf, to: nt,
+               detail: 'The ledger records ' + ymd_(nf) + ' to ' + ymd_(nt) + ' but the ' +
+                       'description does not state the service period. The description is ' +
+                       'what a resident and an auditor read.' };
+    }
+    var offFrom = Math.abs(daysBetween_(parsed.from, nf));
+    var offTo = parsed.to ? Math.abs(daysBetween_(parsed.to, nt)) : 999;
+    if (offFrom > 2 || offTo > 2) {
+      return { status: 'PERIOD DISAGREES', from: nf, to: nt,
+               detail: 'Description says ' + parsed.raw + ' but the ledger records ' +
+                       ymd_(nf) + ' to ' + ymd_(nt) + '. One of them is wrong.' };
+    }
+    return { status: 'OK', from: nf, to: nt, detail: null };
+  }
+
+  if (parsed && parsed.found === 'range' && parsed.from && parsed.to) {
+    return { status: 'OK (DESCRIPTION ONLY)', from: parsed.from, to: parsed.to,
+             detail: 'Service period is in the description (' + parsed.raw + ') but the ' +
+                     'ledger service_from and service_to are empty, so nothing downstream ' +
+                     'can filter or sort on it.' };
+  }
+  if (parsed && parsed.found === 'single_date') {
+    return { status: 'PERIOD INCOMPLETE', from: parsed.from, to: null,
+             detail: 'Only one date found (' + parsed.raw + '). A period needs both ends.' };
+  }
+  return { status: 'NO SERVICE PERIOD', from: null, to: null,
+           detail: 'No service period in the ledger fields or the description. This charge ' +
+                   'cannot be tied to a period of service.' };
+}
+
+// ============================================================ FETCH
+
+function usFetchPostings_(monthsBack) {
+  var from = ymd_(addDays_(today_(), -Math.round((monthsBack || USCHED.LOOKBACK_MONTHS) * 30.44)));
+  var to = ymd_(today_());
+
+  var rows = afReport_('general_ledger', {
+    posted_on_from: from, posted_on_to: to,
+    gl_account_ids: uschedGlIds_(),
+    property_visibility: 'all',
+    // Accrual, not the Cash default. A bill entered but unpaid is still processed.
+    accounting_basis: 'Accrual'
+  }, { maxRows: 60000 });
+
+  if (!rows.length) {
+    logError_('appfolio', 'usFetchPostings_',
+      'ZERO utility postings in ' + (monthsBack || USCHED.LOOKBACK_MONTHS) + ' months across ' +
+      USCHED_GL.length + ' GL accounts. Not plausible for a 438-unit portfolio. Verify ' +
+      'gl_account_ids is honoured on general_ledger. Schedule NOT rebuilt.');
+    return null;
+  }
+
+  // LOUD FALLBACK. If the server-side filter were ignored we would receive rent and
+  // repairs. Resolution is by number OR name, because account_number can be null.
+  var kept = [], unresolved = {};
+  rows.forEach(function (r) {
+    var gl = uschedResolveGl_(r);
+    if (gl) { r._gl = gl; kept.push(r); }
+    else {
+      var k = String(r.account_number || r.account_name || '(blank)');
+      unresolved[k] = (unresolved[k] || 0) + 1;
+    }
+  });
+
+  var unresolvedKeys = Object.keys(unresolved);
+  if (unresolvedKeys.length) {
+    logError_('appfolio', 'usFetchPostings_',
+      unresolvedKeys.length + ' account(s) in the result could not be matched to a tracked ' +
+      'utility GL and were discarded: ' +
+      unresolvedKeys.slice(0, 12).map(function (k) { return k + ' x' + unresolved[k]; }).join(' | ') +
+      '. If any of those ARE utilities, add them to USCHED_GL or the filter is being ignored.');
+  }
+  if (!kept.length) {
+    logError_('appfolio', 'usFetchPostings_',
+      'No rows resolved to a tracked utility GL. Both account_number and account_name ' +
+      'failed to match. Run discoverUtilityFields() and check the real field names. ' +
+      'Schedule NOT rebuilt.');
+    return null;
+  }
+  return kept;
+}
+
+// ============================================================ SIDE OF THE LEDGER
+//
+// Resident charges and vendor bills share a GL, so party_type is the only thing that
+// separates them. Its exact values are not documented, so match loosely and report
+// what was actually seen rather than assuming.
+
+function usSide_(row) {
+  var t = String(row.party_type || '').toLowerCase();
+  if (/tenant|occupan|resident|lease/.test(t)) return 'resident';
+  if (/vendor|payee|supplier/.test(t)) return 'vendor';
+  if (/owner/.test(t)) return 'owner';
+  return 'unknown';
+}
+
+// ============================================================ EVENTS
+//
+// One bill is one event. Marzo's Front and Back House produce two resident charges for
+// the same bill, and they need not post on the same day — so events are keyed on the
+// SERVICE PERIOD first, and only fall back to date-clustering when no period exists.
+
+function usEventsFromRows_(rows) {
+  var series = {};
+
+  // Pass 1 — providers per property+group, from VENDOR rows only. A resident charge's
+  // party is the tenant, so it can never tell us who the provider is.
+  var providersBy = {};
+  rows.forEach(function (r) {
+    if (usSide_(r) !== 'vendor') return;
+    var pk = (r.property_id || r.property_name || '') + '||' + r._gl.group;
+    var p = usNormProvider_(r.party_name);
+    if (!p) return;
+    (providersBy[pk] = providersBy[pk] || {})[p] = true;
+  });
+
+  // Pass 2 — assign every row to a series.
+  rows.forEach(function (r) {
+    var pid = r.property_id || r.property_name || '';
+    var group = r._gl.group;
+    var pk = pid + '||' + group;
+    var known = Object.keys(providersBy[pk] || {});
+    var side = usSide_(r);
+
+    // TENANT CHARGES ONLY. Vendor rows were already read in pass 1 for the provider
+    // name; they must not become billing events. A vendor bill is how we pay the
+    // provider — not what the resident was charged.
+    if (USCHED_SCOPE.TENANT_CHARGES_ONLY && side !== 'resident') return;
+
+    // Provider scope. With exactly one provider on the property for this group, every
+    // row belongs to it — including resident charges, which carry no provider. With
+    // several, vendor rows split by provider and the rest are held separately and
+    // flagged rather than silently attached to the wrong bill.
+    var scope;
+    if (!USCHED_GROUPS[group].byProvider || known.length <= 1) {
+      scope = known.length === 1 ? known[0] : '';
+    } else {
+      scope = (side === 'vendor') ? usNormProvider_(r.party_name) : '(unattributed)';
+    }
+
+    var key = pid + '||' + group + '||' + scope;
+    if (!series[key]) {
+      series[key] = {
+        key: key, property_id: pid,
+        property_label: addr_(r) !== '\u2014' ? addr_(r) : (r.property_name || r.property || ''),
+        property_name: r.property_name || r.property || '',
+        service_group: group, group_label: USCHED_GROUPS[group].label,
+        provider: scope || null,
+        providers_on_property: known.join(' | ') || null,
+        multi_provider: (USCHED_GROUPS[group].byProvider && known.length > 1),
+        gls_seen: {}, sides_seen: {}, party_types_seen: {}, stray_6174: 0,
+        manual_postings: 0,
+        rows: []
+      };
+    }
+    var s = series[key];
+    s.gls_seen[r._gl.number + ' ' + r._gl.name] = (s.gls_seen[r._gl.number + ' ' + r._gl.name] || 0) + 1;
+    s.sides_seen[side] = (s.sides_seen[side] || 0) + 1;
+    s.party_types_seen[String(r.party_type || '(blank)')] = true;
+    if (r._gl.stray) s.stray_6174++;
+
+    var d = usDate_(r.post_date);
+    if (!d) return;
+    var desc = [r.description, r.remarks, r.reference].filter(function (x) { return x; }).join(' | ');
+    if (usIsManualPosting_(desc)) s.manual_postings++;
+
+    // The EFFECTIVE period is used to group charges into one bill, and may come from
+    // the description when the ledger fields are empty. The LEDGER values are kept
+    // separately, because "recorded in AppFolio" and "only written in the description"
+    // are different compliance facts — the second cannot be filtered or sorted on.
+    // Collapsing them made a blank ledger period report as OK.
+    var lf = usDate_(r.service_from), lt = usDate_(r.service_to);
+    var sf = lf, st = lt;
+    if (!sf || !st) {
+      var p = usParsePeriod_(desc);
+      if (p && p.found === 'range') { sf = sf || p.from; st = st || p.to; }
+    }
+    s.rows.push({
+      date: d, side: side,
+      amount: Math.abs(num_(r.debit)) || Math.abs(num_(r.credit)) || 0,
+      description: desc,
+      service_from: sf, service_to: st,          // effective — for grouping
+      ledger_from: lf, ledger_to: lt,            // what AppFolio actually holds
+      party: r.party_name || '', unit: r.unit || '', unit_id: r.unit_id || null,
+      gl_number: r._gl.number
+    });
+  });
+
+  // Pass 3 — collapse rows into billing events, then pick the measured side.
+  Object.keys(series).forEach(function (k) {
+    var s = series[k];
+    // Measure resident charges where the property uses them, else vendor bills.
+    var measured = s.sides_seen.resident ? 'resident'
+                 : (s.sides_seen.vendor ? 'vendor'
+                 : (s.sides_seen.owner ? 'owner' : 'unknown'));
+    s.measured_side = measured;
+    s.measured_side_note = s.sides_seen.resident && s.sides_seen.vendor
+      ? 'Both resident charges and vendor bills exist here; measuring resident charges.'
+      : null;
+
+    var use = s.rows.filter(function (r) { return r.side === measured; });
+    s.events = usCollapseEvents_(use);
+    s.gls_seen = Object.keys(s.gls_seen).join(' | ');
+    s.party_types_seen = Object.keys(s.party_types_seen).join(' | ');
+    delete s.rows;
+  });
+
+  // Drop series with nothing measurable.
+  Object.keys(series).forEach(function (k) { if (!series[k].events.length) delete series[k]; });
+  return series;
+}
+
+/** Service period first, date-cluster as the fallback. */
+function usCollapseEvents_(rows) {
+  rows = rows.slice().sort(function (a, b) { return a.date - b.date; });
+  var byPeriod = {}, noPeriod = [], order = [];
+
+  rows.forEach(function (r) {
+    if (r.service_from && r.service_to) {
+      var pk = ymd_(r.service_from) + '..' + ymd_(r.service_to);
+      if (!byPeriod[pk]) { byPeriod[pk] = usNewEvent_(r); order.push(byPeriod[pk]); }
+      else usMergeInto_(byPeriod[pk], r);
+    } else {
+      noPeriod.push(r);
+    }
+  });
+
+  var cur = null;
+  noPeriod.forEach(function (r) {
+    if (cur && daysBetween_(cur.date, r.date) <= USCHED.SAME_EVENT_DAYS) { usMergeInto_(cur, r); return; }
+    cur = usNewEvent_(r);
+    order.push(cur);
+  });
+
+  return order.sort(function (a, b) { return a.date - b.date; });
+}
+
+function usNewEvent_(r) {
+  return { date: r.date, amount: r.amount, row_count: 1,
+           descriptions: r.description ? [r.description] : [],
+           service_from: r.service_from, service_to: r.service_to,
+           ledger_from: r.ledger_from, ledger_to: r.ledger_to,
+           parties: r.party ? [r.party] : [], units: r.unit ? [r.unit] : [],
+           grouped_by: (r.service_from && r.service_to) ? 'service period' : 'posting date' };
+}
+
+function usMergeInto_(e, r) {
+  e.amount += r.amount;
+  e.row_count++;
+  // The event date is the EARLIEST posting in the bill. A unit charged late must not
+  // make the whole bill look later than it was.
+  if (r.date < e.date) e.date = r.date;
+  if (r.description && e.descriptions.indexOf(r.description) < 0) e.descriptions.push(r.description);
+  if (r.party && e.parties.indexOf(r.party) < 0) e.parties.push(r.party);
+  if (r.unit && e.units.indexOf(r.unit) < 0) e.units.push(r.unit);
+  if (r.service_from && (!e.service_from || r.service_from < e.service_from)) e.service_from = r.service_from;
+  if (r.service_to && (!e.service_to || r.service_to > e.service_to)) e.service_to = r.service_to;
+  if (r.ledger_from && (!e.ledger_from || r.ledger_from < e.ledger_from)) e.ledger_from = r.ledger_from;
+  if (r.ledger_to && (!e.ledger_to || r.ledger_to > e.ledger_to)) e.ledger_to = r.ledger_to;
+}
+
+// ============================================================ CLASSIFY
+
+function usClassifySeries_(s) {
+  var ev = s.events, gaps = [], amounts = [], doms = [];
+  for (var i = 1; i < ev.length; i++) gaps.push(daysBetween_(ev[i - 1].date, ev[i].date));
+  ev.forEach(function (e) { amounts.push(e.amount); doms.push(usDom_(e.date)); });
+
+  var medGap = gaps.length ? median_(gaps) : null;
+  var cv = usCv_(amounts);
+  var domMax = doms.length ? Math.max.apply(null, doms) : null;
+  var monthly = medGap !== null && medGap >= USCHED.RECURRING_GAP_MIN && medGap <= USCHED.RECURRING_GAP_MAX;
+  var earlyMonth = domMax !== null && domMax <= USCHED.RECURRING_DOM_MAX;
+  var flatAmount = cv <= USCHED.RECURRING_AMOUNT_CV;
+  var recurring = monthly && (earlyMonth || flatAmount);
+
+  var reason;
+  if (ev.length < USCHED.MIN_EVENTS_TO_INFER) {
+    reason = 'Only ' + ev.length + ' posting' + (ev.length === 1 ? '' : 's') + ' in ' +
+             USCHED.LOOKBACK_MONTHS + ' months — not enough to infer a cycle';
+  } else if (recurring) {
+    reason = 'Monthly (median ' + Math.round(medGap) + 'd)' +
+             (earlyMonth ? ', posts by day ' + domMax : '') +
+             (flatAmount ? ', amount flat (CV ' + (cv * 100).toFixed(1) + '%)' : '') +
+             ' — reads as a recurring charge billed with rent';
+  } else {
+    reason = 'Median gap ' + (medGap === null ? 'n/a' : Math.round(medGap) + 'd') +
+             ', amount varies (CV ' + (cv * 100).toFixed(1) + '%), posts up to day ' + domMax +
+             ' — reads as a variable bill on a cycle';
+  }
+
+  return { event_count: ev.length, median_gap_days: medGap === null ? null : Math.round(medGap),
+           gap_days_observed: gaps.map(Math.round).join(', '),
+           amount_cv_pct: Math.round(cv * 1000) / 10, max_day_of_month: domMax,
+           signal_monthly: monthly ? 'Yes' : 'No',
+           signal_posts_early: earlyMonth ? 'Yes' : 'No',
+           signal_flat_amount: flatAmount ? 'Yes' : 'No',
+           inferred_recurring: recurring, classification_reason: reason };
+}
+
+// ============================================================ WALK
+//
+// ONE function owns the deadline arithmetic, so the forward projection and the backward
+// compliance record can never disagree about what a deadline was.
+//
+// ANCHORING — Frank's decision. The anchor is WeLease's own last POSTING date, so the
+// clock measures WeLease's consistency rather than provider variance. Its side effect
+// would be that a late posting pushes the next deadline out, compounding. The guard: a
+// cycle posted late anchors the next one on the date the posting was EXPECTED. Lateness
+// is recorded and then absorbed. Ordinary variation inside the window still steers the
+// schedule, which is the point.
+
+function usDeadlineFrom_(anchor, cycleMonths) {
+  var expected = usAddMonths_(anchor, cycleMonths);
+  return { expected: expected, postBy: addDays_(expected, USCHED.POST_WINDOW_DAYS) };
+}
+
+function usWalkSeries_(events, cycleMonths) {
+  var anchor = events[0].date;
+  var anchorSource = events.length === 1 ? 'Only posting' : 'First posting';
+  var cycles = [];
+  if (!cycleMonths) return { cycles: cycles, anchor: anchor, anchor_source: anchorSource };
+
+  for (var i = 1; i < events.length; i++) {
+    var w = usDeadlineFrom_(anchor, cycleMonths);
+    var actual = events[i].date;
+    var late = Math.round(daysBetween_(w.postBy, actual));
+    var onTime = late <= 0;
+
+    cycles.push({ prior_anchor: anchor, expected: w.expected, deadline: w.postBy,
+                  actual: actual, days_vs_deadline: late, on_time: onTime, event: events[i] });
+
+    anchor = onTime ? actual : w.expected;
+    anchorSource = onTime ? 'Last posting'
+                          : 'Expected date — the last posting was ' + late + 'd late, so the ' +
+                            'schedule was held rather than pushed out';
+  }
+  return { cycles: cycles, anchor: anchor, anchor_source: anchorSource };
+}
+
+// ============================================================ PROJECT
+
+function usSchedule_(s, cls, ov) {
+  var ev = s.events, last = ev[ev.length - 1], t = today_();
+
+  var cycleMonths = null, cycleSource = null;
+  if (ov && num_(ov.cycle_months_override) > 0) {
+    cycleMonths = Math.round(num_(ov.cycle_months_override));
+    cycleSource = 'Override';
+  } else if (cls.median_gap_days) {
+    cycleMonths = Math.max(1, Math.round(cls.median_gap_days / 30.44));
+    cycleSource = 'Inferred from ' + cls.event_count + ' postings (median ' + cls.median_gap_days + 'd)';
+  }
+
+  var exemptOv = ov ? String(ov.exempt_override || '').trim().toLowerCase() : '';
+  var exempt = cls.inferred_recurring, exemptSource = 'Inferred';
+  if (exemptOv === 'yes' || exemptOv === 'true')  { exempt = true;  exemptSource = 'Override'; }
+  if (exemptOv === 'no'  || exemptOv === 'false') { exempt = false; exemptSource = 'Override'; }
+
+  var walk = usWalkSeries_(ev, cycleMonths);
+  var anchor = walk.anchor, anchorSource = walk.anchor_source;
+  var lateCycles = walk.cycles.filter(function (c) { return !c.on_time; }).length;
+  if (ov && ov.anchor_date_override) {
+    var a = usDate_(ov.anchor_date_override);
+    if (a) { anchor = a; anchorSource = 'Override'; }
+  }
+
+  var sp = usServicePeriod_(last);
+  var out = {
+    property_label: s.property_label, property_name: s.property_name, property_id: s.property_id,
+    service_group: s.service_group, utility: s.group_label,
+    provider: s.provider, gls_seen: s.gls_seen,
+    measured_side: s.measured_side,
+    // last_posted is what happened; anchor_date is what the projection measures from.
+    // They differ whenever the drift guard engaged, and showing the anchor as
+    // "last posted" would display a date nobody posted on.
+    last_posted: ymd_(last.date), anchor_date: ymd_(anchor), anchor_source: anchorSource,
+    last_amount: Math.round(last.amount * 100) / 100,
+    last_rows: last.row_count, last_units: last.units.join(' | ') || null,
+    event_grouped_by: last.grouped_by,
+    postings_observed: cls.event_count,
+    cycles_measured: exempt ? null : walk.cycles.length,
+    cycles_late: exempt ? null : lateCycles,
+    drift_guard: (walk.cycles.length && ymd_(anchor) !== ymd_(last.date))
+      ? 'ENGAGED — projecting from ' + ymd_(anchor) + ' rather than the actual posting ' +
+        ymd_(last.date) + ', so a late cycle does not move the schedule' : null,
+    cycle_months: cycleMonths, cycle_source: cycleSource,
+    median_gap_days: cls.median_gap_days, gap_days_observed: cls.gap_days_observed,
+    amount_cv_pct: cls.amount_cv_pct, max_day_of_month: cls.max_day_of_month,
+    exempt: exempt ? 'Yes' : 'No', exempt_source: exemptSource,
+    service_period: (sp.from ? ymd_(sp.from) : '?') + ' to ' + (sp.to ? ymd_(sp.to) : '?'),
+    service_period_status: sp.status, service_period_detail: sp.detail,
+    classification_reason: cls.classification_reason,
+    data_flag: usSeriesFlag_(s)
+  };
+
+  if (exempt) {
+    out.status = 'EXEMPT';
+    out.expected_posting = null; out.post_by = null; out.alert_after = null; out.days_late = null;
+    out.action = 'Recurring charge billed with rent. Not tracked for lateness.';
+    return out;
+  }
+  if (!cycleMonths) {
+    out.status = 'INSUFFICIENT HISTORY';
+    out.expected_posting = null; out.post_by = null; out.alert_after = null; out.days_late = null;
+    out.action = 'Only ' + cls.event_count + ' posting(s). Set cycle_months_override on ' +
+                 'Utility_Schedule_Overrides to start the clock now.';
+    return out;
+  }
+
+  var w = usDeadlineFrom_(anchor, cycleMonths);
+  var alertAft = addDays_(w.postBy, USCHED.ALERT_GRACE_DAYS);
+  out.expected_posting = ymd_(w.expected);
+  out.post_by = ymd_(w.postBy);
+  out.alert_after = ymd_(alertAft);
+
+  var over = daysBetween_(w.postBy, t);
+  out.days_late = over > 0 ? Math.round(over) : 0;
+
+  if (t < w.expected) {
+    var untilExp = Math.round(daysBetween_(t, w.expected));
+    out.status = untilExp <= USCHED.DUE_SOON_DAYS ? 'DUE SOON' : 'SCHEDULED';
+    out.action = 'Next posting expected ' + ymd_(w.expected) + ', due by ' + ymd_(w.postBy) + '.';
+  } else if (t <= w.postBy) {
+    out.status = 'DUE SOON';
+    out.action = 'In the posting window — due by ' + ymd_(w.postBy) + ', ' +
+                 Math.round(daysBetween_(t, w.postBy)) + ' day(s) left.';
+  } else if (t <= alertAft) {
+    out.status = 'PAST DUE';
+    out.action = 'Deadline was ' + ymd_(w.postBy) + ', ' + out.days_late +
+                 ' day(s) ago. Alerts on ' + ymd_(alertAft) + '.';
+  } else {
+    out.status = 'OVERDUE';
+    out.action = 'Overdue since ' + ymd_(w.postBy) + ' — ' + out.days_late + ' days. Confirm ' +
+                 'the bill arrived; if it never came, contact the provider.';
+  }
+  return out;
+}
+
+/** Data-quality findings about the series itself, as distinct from lateness. */
+function usSeriesFlag_(s) {
+  var f = [];
+  if (s.stray_6174) {
+    f.push(s.stray_6174 + ' posting(s) coded to 6174 Sewer. Sewer belongs inside the water ' +
+           'bill on 6173 — folded into this clock, but the coding should be corrected.');
+  }
+  if (s.multi_provider && s.provider === '(unattributed)') {
+    f.push('This property has more than one provider for ' + s.group_label +
+           ' (' + s.providers_on_property + ') and these postings carry no provider, so they ' +
+           'could not be attributed to one bill. Split them with an override.');
+  } else if (s.multi_provider) {
+    f.push('Property has several providers for ' + s.group_label + ': ' +
+           s.providers_on_property + '. Confirm these are genuinely separate bills and not ' +
+           'a payee-name variant, which would fragment the history.');
+  }
+  if (s.measured_side === 'unknown') {
+    f.push('Could not tell resident charges from vendor bills — party_type values seen: ' +
+           s.party_types_seen + '. Confirm against _uschedule_events.');
+  }
+  if (s.measured_side_note) f.push(s.measured_side_note);
+  return f.length ? f.join(' · ') : null;
+}
+
+// ============================================================ COMPLIANCE HISTORY
+
+function usComplianceHistory_(s, cycleMonths) {
+  if (!cycleMonths || s.events.length < 2) return [];
+  var walk = usWalkSeries_(s.events, cycleMonths);
+
+  return walk.cycles.map(function (c, i) {
+    var prev = s.events[i], cur = c.event;
+    var sp = usServicePeriod_(cur);
+
+    // A gap between consecutive service periods means a cycle's bill was never posted
+    // at all. Lateness cannot see that — a skipped cycle just looks like a longer gap.
+    var gapNote = null;
+    if (prev.service_to && cur.service_from) {
+      var g = Math.round(daysBetween_(prev.service_to, cur.service_from));
+      if (g > 45) gapNote = 'Service period gap of ' + g + ' days since the prior bill — a ' +
+                            'cycle may have been missed entirely.';
+      if (g < -5) gapNote = 'Service periods overlap by ' + Math.abs(g) +
+                            ' days — possible duplicate posting.';
+    }
+
+    return { property_label: s.property_label, service_group: s.service_group,
+             utility: s.group_label, provider: s.provider, measured_side: s.measured_side,
+             prior_posting: ymd_(prev.date), measured_from: ymd_(c.prior_anchor),
+             expected: ymd_(c.expected), deadline_was: ymd_(c.deadline),
+             posting: ymd_(c.actual), days_vs_deadline: c.days_vs_deadline,
+             on_time: c.on_time ? 'Yes' : 'No',
+             amount: Math.round(cur.amount * 100) / 100, rows: cur.row_count,
+             service_period: (sp.from ? ymd_(sp.from) : '?') + ' to ' + (sp.to ? ymd_(sp.to) : '?'),
+             service_period_status: sp.status, note: gapNote };
+  });
+}
+
+// ============================================================ MAIN
+
+function buildUtilitySchedule() {
+  var t0 = new Date().getTime();
+
+  var rows = usFetchPostings_();
+  if (rows === null) {
+    logRun_('buildUtilitySchedule', 'appfolio', 'Utility_Schedule', 0,
+            new Date().getTime() - t0, 'ABORTED — see _errors. Existing schedule left intact.');
+    return null;
+  }
+  sleepFor_('appfolio');
+
+  var overrides = {};
+  readTab_('Utility_Schedule_Overrides').forEach(function (o) {
+    var g = String(o.service_group || '').trim().toUpperCase();
+    if (!g) return;
+    var pid = String(o.property_id || '').trim();
+    var prov = usNormProvider_(o.provider);
+    overrides[pid + '||' + g + '||' + prov] = o;
+    if (!pid) overrides['ANY||' + g] = o;          // group-wide default
+  });
+
+  var series = usEventsFromRows_(rows);
+
+  // Scope gate — tenant charges only, minimum history, active properties, and
+  // single-family excluded unless manually billed. Everything removed is written to
+  // Utility_Schedule_Dropped with its reason.
+  var scoped = usApplyScope_(series);
+  series = scoped.series;
+
+  var schedule = [], history = [], events = [], anomalies = [];
+
+  Object.keys(series).forEach(function (k) {
+    var s = series[k];
+    var ov = overrides[s.property_id + '||' + s.service_group + '||' + usNormProvider_(s.provider)] ||
+             overrides[s.property_id + '||' + s.service_group + '||'] ||
+             overrides['ANY||' + s.service_group] || null;
+
+    var cls = usClassifySeries_(s);
+    var row = usSchedule_(s, cls, ov);
+    schedule.push(row);
+
+    // Exempt series are excluded from the compliance record on purpose. A flat charge
+    // posted with rent is trivially on time every month; letting those into the
+    // denominator would inflate the on-time rate with cycles nobody measures.
+    if (row.exempt === 'No') history = history.concat(usComplianceHistory_(s, row.cycle_months));
+
+    if (row.data_flag) {
+      anomalies.push({ property_label: s.property_label, utility: s.group_label,
+        provider: s.provider, gls_seen: s.gls_seen, measured_side: s.measured_side,
+        party_types_seen: s.party_types_seen, finding: row.data_flag });
+    }
+
+    s.events.forEach(function (e) {
+      events.push({ property_label: s.property_label, property_id: s.property_id,
+        service_group: s.service_group, utility: s.group_label, provider: s.provider,
+        measured_side: s.measured_side, posted: ymd_(e.date),
+        amount: Math.round(e.amount * 100) / 100, ledger_rows: e.row_count,
+        units: e.units.join(' | '), grouped_by: e.grouped_by,
+        service_from: e.service_from ? ymd_(e.service_from) : null,
+        service_to: e.service_to ? ymd_(e.service_to) : null,
+        parties: e.parties.join(' | '), descriptions: e.descriptions.join(' | ').slice(0, 400) });
+    });
+  });
+
+  var rank = { 'OVERDUE': 0, 'PAST DUE': 1, 'DUE SOON': 2, 'SCHEDULED': 3,
+               'INSUFFICIENT HISTORY': 4, 'EXEMPT': 5 };
+  schedule.sort(function (a, b) {
+    var d = (rank[a.status] === undefined ? 9 : rank[a.status]) -
+            (rank[b.status] === undefined ? 9 : rank[b.status]);
+    return d ? d : (b.days_late || 0) - (a.days_late || 0);
+  });
+
+  var HEAD = ['property_label', 'utility', 'service_group', 'provider', 'measured_side',
+    'status', 'days_late', 'last_posted', 'expected_posting', 'post_by', 'alert_after',
+    'cycle_months', 'cycle_source', 'exempt', 'exempt_source', 'service_period',
+    'service_period_status', 'action', 'data_flag', 'postings_observed', 'cycles_measured',
+    'cycles_late', 'anchor_date', 'anchor_source', 'drift_guard', 'median_gap_days',
+    'gap_days_observed', 'amount_cv_pct', 'max_day_of_month', 'last_amount', 'last_rows',
+    'last_units', 'event_grouped_by', 'gls_seen', 'classification_reason',
+    'service_period_detail', 'property_id', 'property_name'];
+
+  var n = writeTab_('Utility_Schedule', schedule, { headers: HEAD });
+
+  var alerts = [];
+  schedule.forEach(function (r) {
+    if (r.exempt !== 'No') return;
+    if (r.status === 'OVERDUE' || r.status === 'PAST DUE' || r.status === 'DUE SOON') {
+      alerts.push({ alert: r.status === 'DUE SOON' ? 'DUE SOON' : 'LATE POSTING',
+        property_label: r.property_label, utility: r.utility, provider: r.provider,
+        status: r.status, days_late: r.days_late, post_by: r.post_by,
+        last_posted: r.last_posted, action: r.action });
+    }
+    if (String(r.service_period_status).indexOf('OK') !== 0) {
+      alerts.push({ alert: 'SERVICE PERIOD', property_label: r.property_label,
+        utility: r.utility, provider: r.provider, status: r.service_period_status,
+        days_late: null, post_by: null, last_posted: r.last_posted,
+        action: r.service_period_detail });
+    }
+  });
+  var aOrder = { 'LATE POSTING': 0, 'SERVICE PERIOD': 1, 'DUE SOON': 2 };
+  alerts.sort(function (a, b) {
+    var d = aOrder[a.alert] - aOrder[b.alert];
+    return d ? d : (b.days_late || 0) - (a.days_late || 0);
+  });
+
+  writeTab_('Utility_Schedule_Alerts', alerts, { headers: ['alert', 'property_label',
+    'utility', 'provider', 'status', 'days_late', 'post_by', 'last_posted', 'action'] });
+  history.sort(function (a, b) { return String(b.posting).localeCompare(String(a.posting)); });
+  writeTab_('Utility_Schedule_History', history);
+  writeTab_('Utility_Schedule_Anomalies', anomalies);
+  writeTab_('_uschedule_events', events);
+
+  var tracked = schedule.filter(function (r) { return r.exempt === 'No'; });
+  var onTime = history.filter(function (h) { return h.on_time === 'Yes'; }).length;
+
+  logRun_('buildUtilitySchedule', 'appfolio', 'Utility_Schedule', n, new Date().getTime() - t0,
+    'series=' + n + ' tracked=' + tracked.length + ' exempt=' + (n - tracked.length) +
+    ' overdue=' + schedule.filter(function (r) { return r.status === 'OVERDUE'; }).length +
+    ' pastdue=' + schedule.filter(function (r) { return r.status === 'PAST DUE'; }).length +
+    ' alerts=' + alerts.length + ' anomalies=' + anomalies.length +
+    ' compliance=' + (history.length ? Math.round(onTime / history.length * 100) + '%' : 'n/a'));
+
+  return { series: n, tracked: tracked.length, alerts: alerts.length, anomalies: anomalies.length };
+}
+
+// ============================================================ DISCOVERY
+
+/**
+ * Confirms the live response shape. The API master documents these columns, but in the
+ * sampled response account_number, service_from, service_to and remarks all came back
+ * NULL. A field that exists but is always null is the failure mode that has bitten this
+ * pipeline before, and it is indistinguishable from a missing value downstream.
+ */
+function discoverUtilityFields() {
+  var from = ymd_(addDays_(today_(), -180)), to = ymd_(today_());
+  var probes = [
+    ['general_ledger', { posted_on_from: from, posted_on_to: to, gl_account_ids: uschedGlIds_(),
+                         property_visibility: 'all', accounting_basis: 'Accrual' }],
+    ['bill_detail',    { occurred_on_from: from, occurred_on_to: to, gl_account_ids: uschedGlIds_(),
+                         property_visibility: 'all' }]
+  ];
+  var MUST = { general_ledger: ['post_date', 'account_name', 'party_type', 'party_name',
+                                'description', 'property_id'], bill_detail: [] };
+
+  var out = [];
+  probes.forEach(function (p) {
+    try {
+      var rows = afReport_(p[0], p[1], { maxPages: 1 });
+      var keys = rows.length ? unionKeys_(rows) : [];
+      var alwaysNull = keys.filter(function (k) {
+        return rows.every(function (r) { return r[k] === null || r[k] === '' || r[k] === undefined; });
+      });
+      var missing = (MUST[p[0]] || []).filter(function (f) { return keys.indexOf(f) < 0; });
+      var nullMust = (MUST[p[0]] || []).filter(function (f) { return alwaysNull.indexOf(f) >= 0; });
+      var pt = {}, an = {};
+      rows.forEach(function (r) {
+        pt[String(r.party_type || '(blank)')] = true;
+        an[String(r.account_name || r.account_number || '(blank)')] = true;
+      });
+
+      out.push({ endpoint: p[0], rows_returned: rows.length, field_count: keys.length,
+        party_types_seen: Object.keys(pt).join(' | '),
+        accounts_seen: Object.keys(an).slice(0, 20).join(' | '),
+        always_null_fields: alwaysNull.join(', ') || null,
+        fields: keys.join(', '), sample_row: JSON.stringify(rows[0] || {}).slice(0, 900),
+        note: !rows.length ? 'ZERO ROWS — filter may not be honoured; re-run without gl_account_ids.'
+            : missing.length ? 'MISSING REQUIRED: ' + missing.join(', ')
+            : nullMust.length ? 'PRESENT BUT ALWAYS NULL: ' + nullMust.join(', ') +
+                                ' — treat as unavailable' : 'OK' });
+    } catch (e) {
+      out.push({ endpoint: p[0], rows_returned: 0, note: 'FAILED: ' + e.message.slice(0, 300) });
+    }
+    sleepFor_('appfolio');
+  });
+
+  writeTab_('_utility_field_discovery', out, { headers: ['endpoint', 'rows_returned',
+    'field_count', 'party_types_seen', 'accounts_seen', 'always_null_fields', 'fields',
+    'sample_row', 'note'] });
+  Logger.log(JSON.stringify(out, null, 1));
+  return out;
+}
+
+// ============================================================ SUMMARY
+
+function utilityScheduleSummary_() {
+  var sched = readTab_('Utility_Schedule');
+  var hist = readTab_('Utility_Schedule_History');
+  var tracked = sched.filter(function (r) { return r.exempt === 'No'; });
+
+  var onTime = hist.filter(function (h) { return h.on_time === 'Yes'; }).length;
+  var rate = hist.length >= CFG.MIN_N_TO_PUBLISH ? Math.round(onTime / hist.length * 1000) / 10 : null;
+
+  return {
+    accounts_tracked: tracked.length,
+    accounts_exempt: sched.length - tracked.length,
+    overdue: tracked.filter(function (r) { return r.status === 'OVERDUE'; }).length,
+    past_due: tracked.filter(function (r) { return r.status === 'PAST DUE'; }).length,
+    due_soon: tracked.filter(function (r) { return r.status === 'DUE SOON'; }).length,
+    insufficient: tracked.filter(function (r) { return r.status === 'INSUFFICIENT HISTORY'; }).length,
+    missing_service_period: tracked.filter(function (r) {
+      return r.service_period_status && String(r.service_period_status).indexOf('OK') !== 0;
+    }).length,
+    anomalies: readTab_('Utility_Schedule_Anomalies').length,
+    cycles_measured: hist.length, on_time_count: onTime, on_time_rate_pct: rate,
+    on_time_rate_display: rate === null ? 'insufficient data (n=' + hist.length + ')'
+      : rate.toFixed(1) + '% (' + onTime + ' of ' + hist.length + ')'
+  };
+}
+
