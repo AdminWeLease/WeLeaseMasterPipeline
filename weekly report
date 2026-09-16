@@ -1,0 +1,373 @@
+/**
+ * THE WEEKLY DEPARTMENT REPORT — the half a machine can fill in.
+ *
+ * Upper management asks each department for a snapshot every Tuesday. Most of what they ask
+ * for is a COUNT the dashboard already holds: vacancies, applications, move-ins, renewals by
+ * status, delinquent accounts, active turnovers, inspections completed.
+ *
+ * Two reasons to compute those rather than have people type them.
+ *
+ * SELF-REPORTED COUNTS DRIFT. Not through dishonesty — through definition. One week
+ * "vacancies" means unrented units, the next it includes units with a signed lease and no
+ * move-in yet. The trend then measures the definition, not the portfolio.
+ *
+ * AND THE MEETING IS FOR JUDGEMENT. The team's own note says reports should take 10-15
+ * minutes and that management is looking for "trends, bottlenecks, accountability gaps" —
+ * none of which is served by somebody counting rows. What cannot be automated is the part
+ * worth the meeting: why a turn is stuck, which owner is sensitive, what support is needed.
+ *
+ * So this fills the counts and leaves the judgement fields blank and clearly marked.
+ *
+ * EVERY NUMBER CARRIES LAST WEEK. Their instruction is "review pattern, not perfection", and
+ * a single week cannot show a pattern. A count with no comparison is a number; a count with
+ * last week beside it is information.
+ */
+
+var WEEKLY = {
+  TAB: 'Weekly_Report',
+  HISTORY: 'Weekly_Report_History',
+  VACANCY_AGED_DAYS: 30,
+
+  // THE WINDOW. Frank, 2026-08-24: "last 7 days should be 08/17 to 08/24", and that applies
+  // to every review. So the window ENDS TODAY and starts seven days back — not the last
+  // completed Monday-to-Sunday week, which is what this did first and which meant a Monday
+  // report never covered the weekend just gone.
+  LOOKBACK_DAYS: 7,
+
+  // How many past weeks to keep on screen beside the current one.
+  SHOW_WEEKS: 3
+};
+
+/**
+ * The window for a review ending on `end` (default today).
+ *
+ * HALF OPEN AT THE START, and this matters more than it looks. The label reads
+ * "08/17 to 08/24" because that is how people say it, but a value dated 08/17 belongs to the
+ * PREVIOUS window — otherwise the boundary day is counted twice, once in each week, and
+ * every week-over-week comparison is quietly inflated by whatever happened that day.
+ *
+ * So: from < date <= to. Seven days counted, eight days named.
+ */
+function reviewWindow_(end) {
+  var to = ymd_(end || today_());
+  var from = ymd_(addDays_(parseDate_(to), -WEEKLY.LOOKBACK_DAYS));
+  return { from: from, to: to };
+}
+
+/** Monday of the week containing d. Kept for anything that genuinely wants a calendar week. */
+function weekStart_(d) {
+  var dt = parseDate_(ymd_(d || today_()));
+  if (!dt) return null;
+  var dow = dt.getDay();                       // 0 Sun .. 6 Sat
+  var back = (dow === 0) ? 6 : (dow - 1);      // Monday-anchored
+  return ymd_(addDays_(dt, -back));
+}
+
+/** from EXCLUSIVE, to inclusive — see reviewWindow_. */
+function inRange_(dateVal, from, to) {
+  var d = ymd_(dateVal);
+  return !!d && d > from && d <= to;
+}
+
+/**
+ * Builds the week. Pass a date inside the week you want; defaults to the week just ended.
+ */
+function buildWeeklyReport(anyDateInWeek) {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+  // Seven days back from today, or from the date given. Same convention everywhere.
+  var w = reviewWindow_(anyDateInWeek || t);
+  var from = w.from, to = w.to;
+  var pw = reviewWindow_(from);
+  var prevFrom = pw.from, prevTo = pw.to;
+
+  var rows = [];
+  var add = function (dept, metric, value, prev, source, note) {
+    rows.push({
+      week_start: from, week_end: to, department: dept, metric: metric,
+      value: (value === null || value === undefined) ? '' : value,
+      last_week: (prev === null || prev === undefined) ? '' : prev,
+      change: (typeof value === 'number' && typeof prev === 'number') ? (value - prev) : '',
+      source: source || 'dashboard',
+      note: note || ''
+    });
+  };
+
+  // ---------------------------------------------------------------- vacancy & leasing
+  var vac = dropTPO_(readTab_('Unit_Vacancy'));
+  var vacant = vac.filter(function (v) { return num_(v.days_vacant) !== null; });
+  add('Vacancy & Leasing', 'Total vacancies', vacant.length, null, 'Unit_Vacancy');
+  add('Vacancy & Leasing', 'Vacancies over ' + WEEKLY.VACANCY_AGED_DAYS + ' days',
+      vacant.filter(function (v) {
+        return num_(v.days_vacant) > WEEKLY.VACANCY_AGED_DAYS; }).length,
+      null, 'Unit_Vacancy');
+  add('Vacancy & Leasing', 'New vacancies this week',
+      vac.filter(function (v) { return inRange_(v.last_move_out, from, to); }).length,
+      vac.filter(function (v) { return inRange_(v.last_move_out, prevFrom, prevTo); }).length,
+      'Unit_Vacancy.last_move_out');
+  add('Vacancy & Leasing', 'Posted to website',
+      vac.filter(function (v) { return String(v.posted_to_website || '')
+        .toLowerCase().indexOf('y') === 0; }).length, null, 'Unit_Vacancy');
+
+  var apps = dropTPO_(readTab_('Applications'));
+  add('Vacancy & Leasing', 'Applications received this week',
+      apps.filter(function (a) { return inRange_(a.received, from, to); }).length,
+      apps.filter(function (a) { return inRange_(a.received, prevFrom, prevTo); }).length,
+      'Applications.received');
+  var pending = apps.filter(function (a) {
+    return !ymd_(a.decision_made_at) && !ymd_(a.canceled_at) && ymd_(a.received);
+  });
+  add('Vacancy & Leasing', 'Applications pending a decision', pending.length, null,
+      'Applications',
+      pending.length ? 'oldest ' + daySpan_(Math.max.apply(null, pending.map(function (a) {
+        return daysBetween_(ymd_(a.received), t) || 0; }))) : '');
+
+  var tick = dropTPO_(readTab_('Tenant_Tickler'));
+  add('Vacancy & Leasing', 'Move-ins completed this week',
+      tick.filter(function (r) { return inRange_(r.move_in_date, from, to); }).length,
+      tick.filter(function (r) { return inRange_(r.move_in_date, prevFrom, prevTo); }).length,
+      'Tenant_Tickler.move_in_date');
+
+  // Days on market — their named KPI for leasing.
+  var dom = vacant.map(function (v) { return num_(v.days_vacant); })
+                  .filter(function (x) { return x !== null; });
+  add('Vacancy & Leasing', 'KPI · days on market (median)',
+      dom.length ? median_(dom) : null, null, 'Unit_Vacancy.days_vacant',
+      dom.length ? 'across ' + dom.length + ' vacant unit(s)' : 'no vacant units');
+
+  // ---------------------------------------------------------------- field / showings
+  var smPerf = readTab_('SM_Listing_Performance');
+  if (smPerf.length) {
+    var sched = 0, actual = 0;
+    smPerf.forEach(function (r) {
+      sched += (num_(r['Scheduled showings']) || 0);
+      actual += (num_(r['Actual showings']) || 0);
+    });
+    add('Field', 'Showings scheduled (listing lifetime)', sched, null, 'ShowMojo');
+    add('Field', 'Showings conducted (listing lifetime)', actual, null, 'ShowMojo',
+        sched ? Math.round(actual / sched * 100) + '% completion' : '');
+  } else {
+    add('Field', 'Showings conducted', null, null, 'ShowMojo',
+        'SM_Listing_Performance is empty — run rebuildShowMojo()');
+  }
+
+  var insp = readTab_('Inspections');
+  var annual = insp.filter(function (r) {
+    var n = String(r.inspection_name || '');
+    return RENEWAL.ANNUAL_NAME.test(n) && !RENEWAL.NOT_ANNUAL.test(n);
+  });
+  add('Field', 'Annual inspections completed this week',
+      annual.filter(function (r) {
+        return inRange_(r.inspected_on || r.marked_done_on, from, to); }).length,
+      annual.filter(function (r) {
+        return inRange_(r.inspected_on || r.marked_done_on, prevFrom, prevTo); }).length,
+      'Inspections');
+
+  var rp = readTab_('Renewal_Pipeline').filter(function (r) { return r.address; });
+  var measurable = rp.filter(function (r) {
+    return r.inspection_status !== 'NOT YET DUE' && r.inspection_status !== 'NO RENEWAL DATE';
+  }).length;
+  var onTime = rp.filter(function (r) {
+    return r.inspection_status === 'DONE ON TIME'; }).length;
+  add('Field', 'KPI · inspections on time for renewal',
+      measurable ? round1_(onTime / measurable * 100) : null, null, 'Renewal_Pipeline',
+      measurable ? onTime + ' of ' + measurable + ' whose deadline has passed'
+                 : 'nothing measurable yet');
+  add('Field', 'Renewals past the 80-day inspection deadline',
+      rp.filter(function (r) { return r.inspection_status === 'OVERDUE'; }).length,
+      null, 'Renewal_Pipeline');
+
+  // ---------------------------------------------------------------- resident relations
+  var ren = dropTPO_(readTab_('Renewals'));
+  var thisMonthKey = monthNorm_(t);
+  var renThisMonth = ren.filter(function (r) {
+    return monthNorm_(r.lease_end) === thisMonthKey; });
+  add('Resident Relations', 'Renewals for the current month', renThisMonth.length, null,
+      'Renewals.lease_end');
+  add('Resident Relations', 'Renewals countersigned this week',
+      ren.filter(function (r) { return inRange_(r.countersigned_date, from, to); }).length,
+      ren.filter(function (r) { return inRange_(r.countersigned_date, prevFrom, prevTo); }).length,
+      'Renewals.countersigned_date');
+  add('Resident Relations', 'Renewals sent, awaiting signature',
+      ren.filter(function (r) {
+        return ymd_(r.renewal_sent_date) && !ymd_(r.countersigned_date); }).length,
+      null, 'Renewals');
+
+  var del = dropTPO_(readTab_('Delinquency_Aged'));
+  var delinquent = del.filter(function (r) { return (num_(r.amount_receivable) || 0) > 0; });
+  add('Resident Relations', 'Delinquent accounts', delinquent.length, null,
+      'Delinquency_Aged');
+  add('Resident Relations', 'Delinquent over 30 days',
+      del.filter(function (r) {
+        return (num_(r['30_to60']) || 0) + (num_(r['60_to90']) || 0) +
+               (num_(r['90_plus']) || 0) > 0; }).length, null, 'Delinquency_Aged');
+  add('Resident Relations', 'Total outstanding balance',
+      round2_(delinquent.reduce(function (s2, r) {
+        return s2 + (num_(r.amount_receivable) || 0); }, 0)), null, 'Delinquency_Aged');
+
+  add('Resident Relations', 'Move-outs this week',
+      tick.filter(function (r) { return inRange_(r.move_out_date, from, to); }).length,
+      tick.filter(function (r) { return inRange_(r.move_out_date, prevFrom, prevTo); }).length,
+      'Tenant_Tickler.move_out_date');
+
+  // Renewal rate — their named KPI. Countersigned against leases that ended in the window.
+  var ended = ren.filter(function (r) { return inRange_(r.previous_lease_end, prevFrom, to); });
+  var kept = ended.filter(function (r) { return ymd_(r.countersigned_date); }).length;
+  add('Resident Relations', 'KPI · renewal rate',
+      ended.length ? round1_(kept / ended.length * 100) : null, null, 'Renewals',
+      ended.length ? kept + ' of ' + ended.length + ' leases ending in the last fortnight'
+                   : 'no lease ended in the window');
+
+  // ---------------------------------------------------------------- turnovers
+  var wo = dropTPO_(readTab_('Work_Orders'));
+  var turns = wo.filter(function (w) { return w.unit_turn_id; });
+  var activeTurns = turns.filter(function (w) {
+    return !ymd_(w.completed_on) && !ymd_(w.canceled_on); });
+  add('Turnovers', 'Active turnovers', activeTurns.length, null, 'Work_Orders.unit_turn_id');
+  add('Turnovers', 'Turn work completed this week',
+      turns.filter(function (w) { return inRange_(w.completed_on, from, to); }).length,
+      turns.filter(function (w) { return inRange_(w.completed_on, prevFrom, prevTo); }).length,
+      'Work_Orders');
+  add('Turnovers', 'Active turns with no scheduled start',
+      activeTurns.filter(function (w) { return !ymd_(w.scheduled_start); }).length,
+      null, 'Work_Orders.scheduled_start',
+      'the closest thing we hold to "has a timeline"');
+
+  var turnDays = turns.filter(function (w) {
+    return ymd_(w.completed_on) && ymd_(w.created_at);
+  }).map(function (w) { return daysBetween_(ymd_(w.created_at), ymd_(w.completed_on)); })
+    .filter(function (x) { return x !== null && x >= 0; });
+  add('Turnovers', 'KPI · average turn time',
+      turnDays.length ? round1_(turnDays.reduce(function (a, b) { return a + b; }, 0) /
+                                turnDays.length) : null,
+      null, 'Work_Orders', turnDays.length ? 'n=' + turnDays.length : 'no completed turns');
+
+  // ---------------------------------------------------------------- maintenance
+  var openWo = wo.filter(function (w) {
+    return !ymd_(w.completed_on) && !ymd_(w.canceled_on); });
+  add('Maintenance', 'Open work orders', openWo.length, null, 'Work_Orders');
+  add('Maintenance', 'Open with no vendor assigned',
+      openWo.filter(function (w) { return !w.vendor; }).length, null, 'Work_Orders.vendor');
+  add('Maintenance', 'Open more than 14 days',
+      openWo.filter(function (w) {
+        var a = daysBetween_(ymd_(w.created_at), t); return a !== null && a > 14; }).length,
+      null, 'Work_Orders');
+  add('Maintenance', 'Awaiting owner approval',
+      openWo.filter(function (w) {
+        return /pend/i.test(String(w.estimate_approval_status || '')); }).length,
+      null, 'Work_Orders.estimate_approval_status');
+  add('Maintenance', 'Completed this week',
+      wo.filter(function (w) { return inRange_(w.completed_on, from, to); }).length,
+      wo.filter(function (w) { return inRange_(w.completed_on, prevFrom, prevTo); }).length,
+      'Work_Orders');
+
+  // ---------------------------------------------------------------- owner relations
+  var props = dropTPO_(readTab_('Properties_All'));
+  // THIS USED TO COUNT EVERY PROPERTY THAT HAS EVER LEFT — 460 of them, the whole
+  // offboarding history since the company started. On a weekly report that reads as though
+  // 460 owners gave notice this week. Properties_All deliberately includes hidden and
+  // offboarded records so door history can count losses; a weekly count has to bound itself.
+  //
+  // Three separate questions, three separate numbers:
+  var endedThisWeek = props.filter(function (p) {
+    return inRange_(p.management_end_date, from, to); }).length;
+  var scheduled = props.filter(function (p) {
+    var d = ymd_(p.management_end_date);
+    return d && d > t;                          // notice given, not yet gone
+  }).length;
+  var recent = props.filter(function (p) {
+    var d = ymd_(p.management_end_date);
+    return d && d <= t && d >= ymd_(addDays_(today_(), -90));
+  }).length;
+
+  add('Owner Relations', 'Properties ending management this week', endedThisWeek,
+      props.filter(function (p) {
+        return inRange_(p.management_end_date, prevFrom, prevTo); }).length,
+      'Properties_All.management_end_date');
+  add('Owner Relations', 'Scheduled to end management', scheduled, null,
+      'Properties_All.management_end_date', 'notice given, departure date still ahead');
+  add('Owner Relations', 'Ended in the last 90 days', recent, null,
+      'Properties_All.management_end_date',
+      'context for the weekly figure, not a weekly figure itself');
+  add('Owner Relations', 'New properties onboarded this week',
+      props.filter(function (p) { return inRange_(p.management_start_date, from, to); }).length,
+      props.filter(function (p) {
+        return inRange_(p.management_start_date, prevFrom, prevTo); }).length,
+      'Properties_All.management_start_date');
+
+  var deals = readTab_('LS_Deals').filter(function (d) { return d.is_active === 'YES'; });
+  add('Owner Relations', 'Owner deals in the pipeline', deals.length, null, 'LS_Deals');
+
+  var onb = (typeof lsOnboardingProcs_ === 'function') ? lsOnboardingProcs_() : [];
+  add('Owner Relations', 'Onboarding processes open',
+      onb.filter(function (o) { return o.created && !o.closed; }).length, null,
+      'LS_Processes');
+
+  var closedOnb = onb.filter(function (o) { return o.created && o.closed; })
+    .map(function (o) { return daysBetween_(o.created, o.closed); })
+    .filter(function (x) { return x !== null && x >= 0; });
+  add('Resident Experience', 'KPI · average onboarding time',
+      closedOnb.length ? round1_(closedOnb.reduce(function (a, b) { return a + b; }, 0) /
+                                 closedOnb.length) : null,
+      null, 'LS_Processes + LS_Tasks_All',
+      closedOnb.length ? 'n=' + closedOnb.length : 'no onboarding has closed yet');
+
+  // ---------------------------------------------------------------- insurance
+  var itn = readTab_('Insurance_Tenant').filter(function (r) { return r.address; });
+  var iow = readTab_('Insurance_Owner').filter(function (r) { return r.address; });
+  add('Compliance', 'Residents with no insurance on record',
+      itn.filter(function (r) { return r.placed_by === INSURANCE.NONE; }).length, null,
+      'Insurance_Tenant');
+  add('Compliance', 'Owner properties expired or unrecorded',
+      iow.filter(function (r) {
+        return r.placed_by === INSURANCE.EXPIRED || r.placed_by === INSURANCE.NONE; }).length,
+      null, 'Insurance_Owner');
+
+  // ---------------------------------------------------------------- write
+  writeTab_(WEEKLY.TAB, rows);
+
+  // History, deduplicated by week. Running the report twice in the same week must not
+  // produce two sets of rows for that week — the three-week view reads this back, and a
+  // duplicate week would show the same numbers in two columns and hide an older one.
+  var keep = readTab_(WEEKLY.HISTORY).filter(function (r) {
+    return r.week_start && r.week_start !== from;
+  });
+  writeTab_(WEEKLY.HISTORY, keep.concat(rows));
+
+  var computed = rows.filter(function (r) { return r.value !== ''; }).length;
+  logRun_('buildWeeklyReport', 'derived', WEEKLY.TAB, rows.length,
+          new Date().getTime() - t0,
+          'week ' + from + ' to ' + to + ' · ' + computed + ' of ' + rows.length +
+          ' metric(s) computed');
+  return { week_start: from, week_end: to, metrics: rows.length, computed: computed };
+}
+
+
+/**
+ * The last N weeks, one column each, keyed by department and metric.
+ *
+ * Their own instruction is "review pattern, not perfection". One week is a number; three
+ * weeks is a direction, and a direction is what a meeting can act on. Reading three columns
+ * takes no longer than reading one.
+ */
+function weeklyTrend_(weeks) {
+  var want = weeks || WEEKLY.SHOW_WEEKS;
+  var hist = readTab_(WEEKLY.HISTORY).filter(function (r) { return r.week_start && r.metric; });
+  var current = readTab_(WEEKLY.TAB).filter(function (r) { return r.week_start && r.metric; });
+
+  // The current tab is authoritative for its own week — history may lag by a run.
+  var curWeek = current.length ? current[0].week_start : null;
+  var all = hist.filter(function (r) { return r.week_start !== curWeek; }).concat(current);
+
+  var weekKeys = {};
+  all.forEach(function (r) { weekKeys[r.week_start] = r.week_end || ''; });
+  var order = Object.keys(weekKeys).sort().reverse().slice(0, want);   // newest first
+
+  var byKey = {};
+  all.forEach(function (r) {
+    var k = (r.department || '') + '||' + r.metric;
+    (byKey[k] = byKey[k] || {})[r.week_start] = r;
+  });
+
+  return { weeks: order, ends: weekKeys, rows: byKey };
+}
