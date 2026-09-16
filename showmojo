@@ -1,0 +1,460 @@
+/**
+ * WeLease Pipeline — SHOWMOJO  v1.0.0 · 2026-08-12
+ * Requires Core_v2.gs.
+ *
+ * Verified against the live WeLease account on 2026-08-12. Every behaviour below was
+ * tested, not inferred:
+ *
+ *   - Auth header must be exactly:  Token token="TOKEN"     Bearer returns 401.
+ *   - acting_as_master_account=true returns 401 on this account. Never send it.
+ *   - POST with form-encoded parameters. A JSON body fails.
+ *   - Every response wraps results as {"response":{"status":..,"data":[..]}}.
+ *   - high_level_metrics returns [label, value] pairs. Everything else returns objects.
+ *   - listing_performance accepts NO date parameters.
+ *   - detailed_prospect_data is capped at a 7-day range by ShowMojo.
+ *   - No pagination. Control volume with the date range.
+ *
+ * WHY THE OLD ADAPTER FAILED: smReport_ in Core_v2.gs sent "Bearer" and read
+ * data.results at the top level instead of unwrapping response.data. Two bugs, one
+ * recorded as "vendor did not respond" — the same story as LeadSimple's LS_AUTH_MODE.
+ * It is retired rather than deleted so the failure names itself.
+ *
+ * PII: detailed_prospect_data and prospect_showing_data carry resident names, emails,
+ * phone numbers and free-text notes. None of the metrics need them, so they are
+ * dropped before anything is written to the sheet. See SM_DROP_FIELDS.
+ */
+
+var SM = {
+  BASE: 'https://showmojo.com/api/v3/reports/',
+  PROP_TOKEN: 'SHOWMOJO_API_TOKEN',
+
+  // 400–600ms between calls has run clean. No documented rate limit.
+  SLEEP_MS: 600,
+  PROSPECT_MAX_DAYS: 7,        // ShowMojo's cap, not ours
+  LOOKBACK_DAYS: 90,           // default window for the nightly pull
+  EVENT_LOOKBACK_DAYS: 30      // listing_and_showing_metrics is ~1,500 rows a month
+};
+
+/**
+ * Fields removed before writing. Every one is personal data that no metric reads.
+ * Pulling it and then not using it would put resident contact details in a shared
+ * sheet for no reason.
+ */
+var SM_DROP_FIELDS = ['name', 'email', 'phone', 'notes', 'comments',
+                      'Pulled by', 'Pulled for', 'Access code'];
+
+var SM_REPORTS = [
+  { name: 'high_level_metrics',          tab: 'SM_High_Level',          shape: 'pairs' },
+  { name: 'listing_performance',         tab: 'SM_Listing_Performance', shape: 'objects', noDates: true },
+  { name: 'detailed_listing_data',       tab: 'SM_Listings',            shape: 'objects' },
+  { name: 'prospect_showing_data',       tab: 'SM_Showings',            shape: 'objects' },
+  { name: 'listing_and_showing_metrics', tab: 'SM_Listing_Showing',     shape: 'objects',
+    lookback: 'EVENT_LOOKBACK_DAYS' },
+  { name: 'detailed_prospect_data',      tab: 'SM_Prospects',           shape: 'objects',
+    maxDays: 7 }
+];
+
+// ============================================================ HTTP
+
+function smToken_() {
+  var t = PropertiesService.getScriptProperties().getProperty(SM.PROP_TOKEN);
+  if (!t) throw new Error('Missing Script Property: ' + SM.PROP_TOKEN +
+    ' — generate one at showmojo.com/settings/import');
+  return String(t).trim();
+}
+
+/**
+ * One report, one window.
+ *
+ * Routed through httpWithRetry_ so it inherits the 429 backoff fix — the one where
+ * attempt++ sat in the wrong branch and the loop never terminated.
+ */
+function smFetch_(reportName, startDate, endDate) {
+  if (!systemEnabled_('showmojo')) {
+    throw new Error('ShowMojo is disabled. Set SYSTEMS.showmojo.enabled = true.');
+  }
+  var form = {};
+  if (startDate) form.start_date = startDate;
+  if (endDate)   form.end_date   = endDate;
+  // acting_as_master_account is deliberately never sent. It returns 401 here.
+
+  var res = httpWithRetry_(SM.BASE + reportName, {
+    method: 'post',
+    payload: form,                               // form-encoded, NOT JSON
+    headers: { 'Authorization': 'Token token="' + smToken_() + '"' },
+    muteHttpExceptions: true
+  }, 'showmojo');
+
+  var env = res.parsed && res.parsed.response;
+  if (!env) {
+    throw new Error(reportName + ': response envelope missing. Got ' +
+                    String(res.raw || '').slice(0, 200));
+  }
+  if (env.status && env.status !== 'success') {
+    throw new Error(reportName + ': API status "' + env.status + '"');
+  }
+  return Array.isArray(env.data) ? env.data : [];
+}
+
+/** ShowMojo caps some reports at a 7-day window. Walk the range in chunks. */
+function smFetchChunked_(reportName, start, end, maxDays) {
+  if (!maxDays) return smFetch_(reportName, start, end);
+  var out = [];
+  var cur = parseDate_(start).getTime();
+  var stop = parseDate_(end).getTime();
+  var step = maxDays * 86400000;
+  var guard = 0;
+  while (cur < stop && guard++ < 60) {
+    var chunkEnd = Math.min(cur + step, stop);
+    out = out.concat(smFetch_(reportName, ymd_(new Date(cur)), ymd_(new Date(chunkEnd))));
+    cur = chunkEnd + 86400000;
+    Utilities.sleep(SM.SLEEP_MS);
+  }
+  return out;
+}
+
+/** Strips personal data and flattens anything nested. */
+function smClean_(rows) {
+  return (rows || []).map(function (r) {
+    var out = {};
+    Object.keys(r).forEach(function (k) {
+      if (SM_DROP_FIELDS.indexOf(k) !== -1) return;
+      var v = r[k];
+      out[k] = (v && typeof v === 'object') ? JSON.stringify(v) : v;
+    });
+    return out;
+  });
+}
+
+// ============================================================ NIGHTLY
+
+function rebuildShowMojo(lookbackDays) {
+  var t0 = new Date().getTime();
+  if (!systemEnabled_('showmojo')) {
+    logError_('showmojo', 'rebuildShowMojo', 'System disabled — nothing ran.');
+    return [];
+  }
+
+  // ShowMojo parses start_date and end_date in the SHOWMOJO ACCOUNT timezone. If this
+  // project runs in a different one, date boundaries shift and records are silently
+  // clipped or double-counted. Logged every run so a mismatch surfaces early.
+  var tz = Session.getScriptTimeZone();
+  if (tz !== CFG.TZ) {
+    logError_('showmojo', 'timezone',
+      'Apps Script project timezone is ' + tz + ' but CFG.TZ is ' + CFG.TZ + '. ShowMojo ' +
+      'parses dates in the ShowMojo account timezone — a mismatch shifts every date ' +
+      'boundary. Set them all to the same zone.');
+  }
+
+  var end = ymd_(today_());
+  var notes = ['tz=' + tz];
+
+  SM_REPORTS.forEach(function (r) {
+    try {
+      var days = lookbackDays || SM[r.lookback || 'LOOKBACK_DAYS'] || SM.LOOKBACK_DAYS;
+      var start = ymd_(addDays_(today_(), -days));
+      var rows = r.noDates ? smFetch_(r.name, null, null)
+                           : smFetchChunked_(r.name, start, end, r.maxDays || 0);
+
+      if (r.shape === 'pairs') {
+        // [label, value] pairs become one row each, so the tab is readable and the
+        // history tab below can trend them.
+        var pairs = rows.map(function (p) {
+          return Array.isArray(p) ? { metric: p[0], value: p[1] } : { metric: String(p), value: '' };
+        });
+        writeTab_(r.tab, pairs);
+        if (pairs.length) {
+          var hist = { run_date: nowStamp_(), period_start: start, period_end: end };
+          pairs.forEach(function (p) { hist[String(p.metric)] = p.value; });
+          appendTab_('SM_High_Level_History', [hist]);
+        }
+      } else {
+        writeTab_(r.tab, smClean_(rows));
+      }
+      notes.push(r.tab + '=' + rows.length);
+    } catch (e) {
+      logError_('showmojo', r.name, e.message);
+      notes.push(r.tab + ' FAILED');
+    }
+    Utilities.sleep(SM.SLEEP_MS);
+  });
+
+  try { buildShowMojoSummary(); }
+  catch (e) { logError_('showmojo', 'summary', e.message); }
+  // The join needs SM_Listings above and Unit_Directory from the 02:00 AppFolio run,
+  // so it belongs here at 04:25 rather than anywhere earlier in the night.
+  try { buildShowMojoJoin(); }
+  catch (e) { logError_('showmojo', 'join', e.message); }
+
+  logRun_('rebuildShowMojo', 'showmojo', '-', 0, new Date().getTime() - t0, notes.join(' · '));
+  Logger.log(notes.join('\n'));
+  return notes;
+}
+
+// ============================================================ ROLLUP
+
+/**
+ * Listing-level funnel, joined on Listing code.
+ *
+ * listing_performance carries showings and leads per listing but no dates;
+ * detailed_listing_data carries days on market and market status. Together they are the
+ * listing picture. "Listing code" is the field the spec names as the AppFolio join key.
+ */
+function buildShowMojoSummary() {
+  var t0 = new Date().getTime();
+  var perf = readTab_('SM_Listing_Performance');
+  var listings = readTab_('SM_Listings');
+  if (!perf.length && !listings.length) return { rows: 0 };
+
+  var byCode = {};
+  listings.forEach(function (l) {
+    var c = String(l.listing_code || '').trim();
+    if (c) byCode[c] = l;
+  });
+
+  var rows = perf.map(function (p) {
+    var code = String(p['Listing code'] || '').trim();
+    var l = byCode[code] || {};
+    var scheduled = num_(p['Scheduled showings']) || 0;
+    var actual = num_(p['Actual showings']) || 0;
+    return {
+      listing: p['Listing address'] || l.address || '',
+      unit: l.unit || '',
+      listing_code: code,
+      listing_uid: l.listing_uid || '',
+      market_status: l.market_status || '',
+      days_on_market: num_(l.days_on_market),
+      last_on_market: l.last_on_market || '',
+      rent: num_(l.rent),
+      leads: num_(p['Leads']),
+      scheduled_showings: scheduled,
+      actual_showings: actual,
+      completion_rate_pct: scheduled ? round1_(actual / scheduled * 100) : null,
+      market_time: p['Market time'] || '',
+      showing_agent: p['Showing agent'] || '',
+      feedback_count: num_(p['Feedback count'])
+    };
+  }).sort(function (a, b) { return (num_(b.days_on_market) || 0) - (num_(a.days_on_market) || 0); });
+
+  writeTab_('SM_Listing_Funnel', rows);
+
+  var sched = rows.reduce(function (a, r) { return a + (r.scheduled_showings || 0); }, 0);
+  var act = rows.reduce(function (a, r) { return a + (r.actual_showings || 0); }, 0);
+  var leads = rows.reduce(function (a, r) { return a + (num_(r.leads) || 0); }, 0);
+
+  logRun_('buildShowMojoSummary', 'showmojo', 'SM_Listing_Funnel', rows.length,
+          new Date().getTime() - t0,
+          'listings=' + rows.length + ' leads=' + leads + ' scheduled=' + sched +
+          ' actual=' + act + (sched ? ' completion=' + Math.round(act / sched * 100) + '%' : ''));
+  return { rows: rows.length, leads: leads, scheduled: sched, actual: act };
+}
+
+// ============================================================ VERIFY
+
+/**
+ * Proves auth and reports what each report actually returns. Run this first.
+ */
+function smVerify() {
+  var out = [];
+  out.push('Project timezone: ' + Session.getScriptTimeZone() + '  (CFG.TZ is ' + CFG.TZ + ')');
+  out.push('');
+  var end = ymd_(today_()), start = ymd_(addDays_(today_(), -7));
+  SM_REPORTS.forEach(function (r) {
+    try {
+      var rows = r.noDates ? smFetch_(r.name, null, null)
+                           : smFetch_(r.name, start, end);
+      var keys = rows.length && !Array.isArray(rows[0]) ? Object.keys(rows[0]) : [];
+      out.push(r.name + ': ' + rows.length + ' rows' +
+        (keys.length ? '  fields: ' + keys.join(', ') : ''));
+      var dropped = keys.filter(function (k) { return SM_DROP_FIELDS.indexOf(k) !== -1; });
+      if (dropped.length) out.push('   PII dropped before writing: ' + dropped.join(', '));
+    } catch (e) {
+      out.push(r.name + ': FAILED — ' + e.message);
+    }
+    Utilities.sleep(SM.SLEEP_MS);
+  });
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ APPFOLIO JOIN
+
+/**
+ * listing_code is an ADDRESS, not an id.
+ *
+ *   AppfolioAPI-4527_35TH_STREET-92116-2-2-A
+ *   AppfolioAPI-5028_70TH_STREET-92115-3-2
+ *                └ street ──────┘ └zip┘ b b └unit (optional)
+ *
+ * My first diagnostic claimed 45 of 69 codes "contain an AppFolio unit_id". That was
+ * a substring test against ids like "6" and "2", which appear inside every street
+ * number and zip in the set. It matched noise. There is no AppFolio id in these codes
+ * at all — the only way across is the address.
+ *
+ * So this is an address join, and it carries the same risk as the lead-to-move-in name
+ * match: a wrong pair produces a plausible duration nobody questions. Same discipline
+ * applies — a listing is only joined when it resolves to exactly ONE unit, and
+ * everything else is written to _sm_join_exceptions rather than guessed at.
+ */
+var SM_STREET_WORDS = {
+  st: 'street', str: 'street', street: 'street',
+  ave: 'avenue', av: 'avenue', avenue: 'avenue',
+  blvd: 'boulevard', boulevard: 'boulevard',
+  dr: 'drive', drive: 'drive', rd: 'road', road: 'road',
+  ln: 'lane', lane: 'lane', ct: 'court', court: 'court',
+  pl: 'place', place: 'place', way: 'way', ter: 'terrace', terrace: 'terrace',
+  cir: 'circle', circle: 'circle', pkwy: 'parkway', parkway: 'parkway'
+};
+
+function smNormStreet_(s) {
+  var t = String(s || '').toLowerCase()
+    .replace(/[_]+/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return '';
+  return t.split(' ').map(function (w) {
+    return SM_STREET_WORDS[w] || w;
+  }).join(' ');
+}
+
+function smNormUnit_(u) {
+  var t = String(u === null || u === undefined ? '' : u).toLowerCase()
+    .replace(/^(unit|apt|apartment|ste|suite|#)\s*/,'')
+    .replace(/[^a-z0-9]/g, '');
+  return t;
+}
+
+/** Pulls the parts out of a listing_code. Returns null if it is not the expected shape. */
+function smCodeParse_(code) {
+  var raw = String(code || '').trim();
+  if (!raw) return null;
+  var p = raw.split('-');
+  if (p.length < 3) return null;
+  var street = smNormStreet_(p[1]);
+  if (!street) return null;
+  return {
+    raw: raw,
+    street: street,
+    zip: String(p[2] || '').trim(),
+    beds: p[3] || '',
+    baths: p[4] || '',
+    unit: smNormUnit_(p.length > 5 ? p.slice(5).join('-') : '')
+  };
+}
+
+/**
+ * Joins every ShowMojo listing to an AppFolio unit and writes the result.
+ *
+ * Match key is normalised street plus unit. Street alone is used only when the code
+ * carries no unit AND exactly one AppFolio unit sits at that street — a single-family
+ * house. A street with several units and no unit in the code is ambiguous by
+ * definition and is logged, not guessed.
+ */
+function buildShowMojoJoin() {
+  var t0 = new Date().getTime();
+  var listings = readTab_('SM_Listings');
+  if (!listings.length) {
+    logError_('showmojo', 'join', 'SM_Listings is empty — run rebuildShowMojo() first.');
+    return { joined: 0, rate: null };
+  }
+
+  var units = readTab_('Unit_Directory');
+  var book = addressBook_();
+
+  // street -> [unit rows], and street|unit -> [unit rows]
+  var byStreet = {}, byStreetUnit = {};
+  units.forEach(function (u) {
+    var disp = (book[u.unit_id] && book[u.unit_id].address) || '';
+    var src = u.unit_street || u.unit_address || disp || '';
+    // A display address may carry the unit as "#3"; strip it off the street part.
+    var streetOnly = String(src).split('#')[0];
+    var street = smNormStreet_(streetOnly);
+    if (!street) return;
+    var unit = smNormUnit_(u.unit_name || (String(disp).indexOf('#') > -1
+      ? String(disp).split('#')[1] : ''));
+    (byStreet[street] = byStreet[street] || []).push(u);
+    if (unit) (byStreetUnit[street + '|' + unit] = byStreetUnit[street + '|' + unit] || []).push(u);
+  });
+
+  var rows = [], exceptions = [];
+  var seenCode = {};
+  listings.forEach(function (l) {
+    var code = String(l.listing_code || '').trim();
+    function except(reason) {
+      exceptions.push({ source: 'listing_join', listing_code: code,
+                        address: l.address || '', unit: l.unit || '',
+                        reason: reason, checked_on: ymd_(today_()) });
+    }
+    if (!code) { except('listing has no listing_code'); return; }
+    if (seenCode[code]) { except('duplicate listing_code'); return; }
+    seenCode[code] = 1;
+
+    var parsed = smCodeParse_(code);
+    if (!parsed) { except('listing_code is not in the expected AppfolioAPI-street-zip form'); return; }
+
+    var cands = [];
+    if (parsed.unit) {
+      cands = byStreetUnit[parsed.street + '|' + parsed.unit] || [];
+      if (!cands.length) {
+        // The code carries a unit the address book does not know.
+        var atStreet = byStreet[parsed.street] || [];
+        except(atStreet.length
+          ? 'street matched but unit "' + parsed.unit + '" is not on it'
+          : 'no AppFolio unit at this street');
+        return;
+      }
+    } else {
+      cands = byStreet[parsed.street] || [];
+      if (!cands.length) { except('no AppFolio unit at this street'); return; }
+      if (cands.length > 1) {
+        except('code carries no unit and ' + cands.length + ' units sit at this street');
+        return;
+      }
+    }
+    if (cands.length > 1) {
+      except('ambiguous — ' + cands.length + ' AppFolio units match');
+      return;
+    }
+
+    var u = cands[0];
+    rows.push({
+      listing_code: code,
+      listing_uid: l.listing_uid || '',
+      unit_id: u.unit_id,
+      property_id: u.property_id,
+      address: (book[u.unit_id] && book[u.unit_id].address) || l.address || '',
+      market_status: l.market_status || '',
+      last_on_market: ymd_(l.last_on_market) || '',
+      days_on_market: num_(l.days_on_market),
+      matched_on: parsed.unit ? 'street and unit' : 'street, single unit'
+    });
+  });
+
+  writeTab_('SM_Unit_Join', rows.length ? rows
+    : [{ note: 'No ShowMojo listing joined to an AppFolio unit. See _sm_join_exceptions.' }]);
+
+  if (exceptions.length) {
+    var prior = readTab_('_sm_join_exceptions').filter(function (r) {
+      return r.source !== 'listing_join';
+    });
+    writeTab_('_sm_join_exceptions', prior.concat(exceptions));
+  }
+
+  var rate = listings.length ? Math.round(rows.length / listings.length * 100) : null;
+  logRun_('buildShowMojoJoin', 'showmojo', 'SM_Unit_Join', rows.length,
+          new Date().getTime() - t0,
+          'joined ' + rows.length + ' of ' + listings.length + ' listings (' + rate + '%) · ' +
+          exceptions.length + ' unmatched');
+
+  if (rate !== null && rate < 60) {
+    logError_('showmojo', 'join',
+      'Only ' + rate + '% of ShowMojo listings matched an AppFolio unit by address. ' +
+      'Metrics built on this join describe the matched subset, not the portfolio. ' +
+      'Read _sm_join_exceptions — the reasons say whether it is a formatting difference ' +
+      'or genuinely missing units.');
+  }
+  return { joined: rows.length, listings: listings.length, rate: rate,
+           unmatched: exceptions.length };
+}
