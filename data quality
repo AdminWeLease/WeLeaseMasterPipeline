@@ -1,0 +1,750 @@
+/**
+ * WeLease Pipeline — DATA QUALITY & INSURANCE  v1.0.0 · 2026-08-06
+ * Requires Core_v2.gs, Shared.gs, Metrics.gs.
+ *
+ * Three jobs:
+ *   buildRentMarketVariance()  the worklist for fixing market_rent in AppFolio
+ *   buildInsuranceCompliance() owner and renters insurance, both trackable after all
+ *   buildDataQualityAudit()    what else is unreliable, ranked by what it costs
+ *
+ * Run after rebuildAll / rebuildFinancials.
+ */
+
+// ============================================================ RENT vs MARKET
+
+/**
+ * Every occupied unit where market_rent cannot be trusted.
+ *
+ * WHY THIS EXISTS: portfolio-wide, rent charged ($1,024,706) EXCEEDS market rent on
+ * occupied units ($995,291). Residents are paying 3% above "market", which is backwards
+ * and means the field was set at onboarding and never revised. The consequence is worse
+ * than a wrong number — the under-market list reads as near-empty, so genuine pricing
+ * gaps are invisible and renewals get priced off a figure below what people already pay.
+ *
+ * computed_market_rent is reported alongside, because if AppFolio maintains that one it
+ * is the better field and the metric should switch to it.
+ */
+function buildRentMarketVariance() {
+  var t0 = new Date().getTime();
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+  var pm = pmLookup_();
+
+  var rows = rr.filter(function (r) {
+    return String(r.status || '').toLowerCase().indexOf('current') !== -1;
+  }).map(function (r) {
+    var rent = num_(r.rent);
+    var mkt = num_(r.market_rent);
+    var comp = num_(r.computed_market_rent);
+    if (!rent || rent <= 0) return null;
+
+    var gap = (mkt === null) ? null : round2_(mkt - rent);
+    var gapPct = (mkt && mkt > 0) ? round1_((mkt - rent) / mkt * 100) : null;
+
+    // What is actually wrong with this row, most serious first.
+    var issue, priority;
+    if (mkt === null || mkt === 0) {
+      issue = 'No market rent on file'; priority = 1;
+    } else if (rent > mkt) {
+      issue = 'Rent EXCEEDS market — market rent is stale'; priority = 2;
+    } else if (gapPct !== null && gapPct > 15) {
+      issue = 'Rent more than 15% below market'; priority = 3;
+    } else if (comp !== null && mkt !== null && Math.abs(comp - mkt) > mkt * 0.1) {
+      issue = 'market_rent and computed_market_rent disagree by >10%'; priority = 4;
+    } else {
+      return null;                                  // nothing wrong with this one
+    }
+
+    return {
+      priority: priority, issue: issue,
+      address: addr_(r), pm_group: pmOf_(pm, r.property_id, r.unit_id),
+      rent_charged: rent, market_rent: mkt, computed_market_rent: comp,
+      gap: gap, gap_pct: gapPct,
+      last_rent_increase: ymd_(r.last_rent_increase),
+      lease_to: ymd_(r.lease_to),
+      suggested_market_rent: (mkt !== null && rent > mkt)
+        ? Math.max(rent, comp || 0)                 // at minimum, what they already pay
+        : (comp || null),
+      unit_id: r.unit_id, property_id: r.property_id, tenant: r.tenant
+    };
+  }).filter(function (x) { return x; })
+    .sort(function (a, b) {
+      return a.priority - b.priority ||
+             Math.abs(num_(b.gap) || 0) - Math.abs(num_(a.gap) || 0);
+    });
+
+  writeTab_('Rent_Market_Variance', rows.length ? rows
+    : [{ note: 'No discrepancies found — market_rent looks maintained' }]);
+
+  var counts = {};
+  rows.forEach(function (r) { counts[r.issue] = (counts[r.issue] || 0) + 1; });
+  logRun_('buildRentMarketVariance', 'derived', 'Rent_Market_Variance', rows.length,
+          new Date().getTime() - t0,
+          Object.keys(counts).map(function (k) { return k + ': ' + counts[k]; }).join(' · '));
+  Logger.log(rows.length + ' units need a market rent review');
+  Logger.log(JSON.stringify(counts, null, 1));
+  return { rows: rows.length, by_issue: counts };
+}
+
+// ============================================================ INSURANCE
+
+var INSURANCE = {
+  EXPIRING_SOON_DAYS: 60,
+  // Renters insurance lives on tenant_directory, NOT on the insurance_usage report —
+  // that one returns zero rows on this tenant and looked like "nobody has coverage".
+  TENANT_FIELDS: ['insurance_company_name', 'insurance_expiration', 'insurance_policy_number'],
+
+  // ---- WHO PLACED THE POLICY ----------------------------------------------------
+  // Residents covered through the Resident Benefits Package all sit with the same carrier,
+  // so the carrier name is what separates "insured through us" from "brought their own".
+  //
+  // Frank, 2026-08-17: RLL and Piñata are the RBP carriers. 91 and 12 households
+  // respectively in the 2026-08-17 reading — RLL is the current one, Piñata the earlier
+  // programme still showing on older tenancies.
+  //
+  // Matched case-insensitively as a substring, with accents folded, so "Piñata" and
+  // "Pinata" both hit. Lemonade, FolioGuard, USAA and the rest are residents' own policies.
+  RBP_CARRIERS: ['RLL', 'Pinata'],
+
+  // Landlord policies placed through WeLease show up as membership of a property group.
+  // Two groups carry it — "MGL | Single Family - Surevestor" (49 properties) and
+  // "MGL | Multi-Family - Surevestor" (9) — and one substring catches both. Counted PER
+  // PROPERTY, which is the grain the groups are recorded at.
+  OWNER_WITH_US_GROUPS: ['surevestor'],
+
+  // Where a landlord's OWN policy is recorded. Frank, 2026-08-17: the Insurance Expiration
+  // field on the property directory. AppFolio has since added an owner-level field and
+  // WeLease will move to it, but property is the system of record today.
+  //
+  // The owner_insurance REPORT is still read as a secondary source, but it returns about one
+  // row on this account — treating it as primary would report an insured portfolio as
+  // uninsured. Whichever source shows coverage furthest out wins.
+  OWNER_FIELD_SOURCE: 'property_directory.insurance_expiration',
+
+  // ---- REMINDERS ----------------------------------------------------------------
+  // Only these two mailboxes may write to residents and owners. They are the FROM address
+  // the composer pre-selects; each must exist as a send-as alias on the account of whoever
+  // clicks, or Gmail will fall back to their own address.
+  FROM_RESIDENTS: 'residents@weleaseusa.com',
+  FROM_OWNERS: 'owners@weleaseusa.com',
+
+  // NOTHING IS SENT AUTOMATICALLY, and this is a deliberate design decision rather than a
+  // missing feature. The button opens a pre-filled Gmail compose window; a person reads it
+  // and presses Send. Three reasons:
+  //   1. Whether renters insurance is required, what a lapse permits, and what notice it
+  //      takes are LEASE TERMS and California questions. A dashboard must not generate
+  //      resident correspondence on a schedule.
+  //   2. The data is imperfect — 81 households have no carrier recorded at all. A wrong
+  //      reminder to a resident who IS insured costs trust that a blank cell does not.
+  //   3. An automated send has no author. Somebody should be able to say who sent it.
+  // The subject and body below are STARTING POINTS for counsel to review, not approved
+  // wording, and they say so in the panel.
+  REMINDER_SUBJECT: 'Renters insurance on file — WeLease Property Management',
+  OWNER_REMINDER_SUBJECT: 'Property insurance on file — WeLease Property Management',
+
+  // Buckets. Deliberately the same three words on both sides of the house so the view reads
+  // consistently: through us / their own / none on record.
+  THROUGH_US: 'through us',
+  OWN: 'their own',
+  NONE: 'none on record',
+  EXPIRED: 'expired'
+};
+
+/**
+ * A Gmail compose URL, pre-filled. Opens a draft; a person sends it.
+ *
+ * `su` and `body` are what Gmail expects. The FROM alias cannot be forced through this URL,
+ * so the panel says out loud which mailbox to pick — silently sending from the wrong
+ * address is exactly the failure this is meant to avoid.
+ */
+function insComposeUrl_(row) {
+  var isOwner = String(row.side || '').toLowerCase() === 'owner';
+  var subject = isOwner ? INSURANCE.OWNER_REMINDER_SUBJECT : INSURANCE.REMINDER_SUBJECT;
+  var name = String(row.name || '').split(',')[0].trim() || 'there';
+  var addr = String(row.address || 'your property');
+  var body = isOwner
+    ? 'Hi ' + name + ',\n\n' +
+      'We keep a record of property insurance for every home we manage. For ' + addr +
+      ', our records show: ' + String(row.reason || '') + '\n\n' +
+      'Could you send us a current declarations page when you have a moment? If you have ' +
+      'placed a new policy, the carrier name and expiry date are all we need.\n\n' +
+      'Thank you,\nWeLease Property Management'
+    : 'Hi ' + name + ',\n\n' +
+      'We keep a record of renters insurance for every home we manage. For ' + addr +
+      ', our records show: ' + String(row.reason || '') + '\n\n' +
+      'If you have a current policy, please send us a copy or the carrier name, policy ' +
+      'number and expiry date so we can update our records.\n\n' +
+      'Thank you,\nWeLease Property Management';
+
+  return 'https://mail.google.com/mail/?view=cm&fs=1' +
+    '&to=' + encodeURIComponent(String(row.email || '')) +
+    '&su=' + encodeURIComponent(subject) +
+    '&body=' + encodeURIComponent(body);
+}
+
+/**
+ * Records that a reminder went out. Called from the page via google.script.run.
+ *
+ * A record of WHO we chased and WHEN is the half of this Frank actually needs — a reminder
+ * nobody logged is one somebody sends again next month.
+ */
+function logInsuranceFollowup(payload) {
+  payload = payload || {};
+  // The chase log exists so a resident is not chased twice by two people. A write that
+  // fails quietly puts it back to being a memory question, which is what it replaced.
+  if (!canWrite_()) return { ok: false, error: writeBlockedMessage_() };
+  var row = {
+    logged_at: nowStamp_(),
+    logged_by: (function () {
+      try { return Session.getActiveUser().getEmail() || 'unknown'; }
+      catch (e) { return 'unknown'; }
+    })(),
+    side: payload.side || '',
+    name: payload.name || '',
+    address: payload.address || '',
+    email: payload.email || '',
+    reason: payload.reason || '',
+    action: payload.action || 'reminder composed',
+    note: payload.note || ''
+  };
+  appendTab_('Insurance_Followups', [row]);
+  return row.logged_at;
+}
+
+/** Everyone chased in the last N days, so nobody is chased twice in a week. */
+function insRecentFollowups_(days) {
+  var cutoff = ymd_(addDays_(today_(), -(days || 30)));
+  var out = {};
+  readTab_('Insurance_Followups').forEach(function (r) {
+    var d = ymd_(r.logged_at);
+    if (!d || d < cutoff) return;
+    var k = String(r.email || r.address || '').toLowerCase();
+    if (!k) return;
+    if (!out[k] || d > out[k]) out[k] = d;
+  });
+  return out;
+}
+
+/**
+ * Accents folded and lowercased, so "Piñata" and "Pinata" are the same carrier.
+ * AppFolio stores whatever was typed, and both spellings are in the data.
+ */
+function insFold_(s) {
+  var t = String(s === null || s === undefined ? '' : s).toLowerCase();
+  // normalize() exists in Apps Script's V8 runtime; the replace chain is a safety net.
+  try { t = t.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+  catch (e) {
+    t = t.replace(/[áàâä]/g, 'a').replace(/[éèêë]/g, 'e').replace(/[íìîï]/g, 'i')
+         .replace(/[óòôö]/g, 'o').replace(/[úùûü]/g, 'u').replace(/ñ/g, 'n');
+  }
+  return t;
+}
+
+/** Is this carrier name one of the RBP carriers? Empty config means "cannot tell". */
+function insIsRbpCarrier_(carrier) {
+  var c = insFold_(carrier);
+  if (!c) return false;
+  for (var i = 0; i < INSURANCE.RBP_CARRIERS.length; i++) {
+    if (c.indexOf(insFold_(INSURANCE.RBP_CARRIERS[i])) !== -1) return true;
+  }
+  return false;
+}
+
+/** Every property id that sits in a WeLease-placed insurance group (Surevestor). */
+function insWithUsProps_() {
+  var out = {};
+  readTab_('PM_Groups').forEach(function (r) {
+    if (!r.property_id) return;
+    var g = String(r.property_group_name || '').toLowerCase();
+    for (var i = 0; i < INSURANCE.OWNER_WITH_US_GROUPS.length; i++) {
+      if (g.indexOf(String(INSURANCE.OWNER_WITH_US_GROUPS[i]).toLowerCase()) !== -1) {
+        out[r.property_id] = r.property_group_name;
+        return;
+      }
+    }
+  });
+  return out;
+}
+
+/**
+ * First usable email out of AppFolio's multi-value field.
+ *
+ * Both directories came back with ZERO usable emails on 2026-08-17 across 727 rows, which
+ * is not credible for an account where the audit reports owner email at 284/284. The column
+ * name is the likely culprit — AppFolio is inconsistent about `emails` / `email` /
+ * `email_address` — so this takes the ROW and tries each, rather than being handed one
+ * field that may not exist.
+ */
+var INS_EMAIL_FIELDS = ['emails', 'email', 'email_address', 'email_addresses',
+                        'primary_email', 'tenant_email', 'owner_email', 'contact_email'];
+
+function insEmailOf_(row) {
+  if (!row) return null;
+  for (var i = 0; i < INS_EMAIL_FIELDS.length; i++) {
+    var hit = insFirstEmail_(row[INS_EMAIL_FIELDS[i]]);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Pulls the first address out of one value, which may hold several. */
+function insFirstEmail_(v) {
+  var s = String(v === null || v === undefined ? '' : v);
+  var m = s.match(/[^\s,;|<>()"]+@[^\s,;|<>()"]+\.[A-Za-z]{2,}/);
+  return m ? m[0] : null;
+}
+
+/**
+ * Owner (landlord) and resident (renters) insurance, as two compliance clocks.
+ *
+ * OWNER SIDE — two sources, and they disagree:
+ *   owner_insurance                      a proper policy record, but only 1 row exists
+ *   property_directory.insurance_expiration  a date on the property itself
+ * Both are read. A property counts as covered if EITHER shows an unexpired date, so a
+ * thin owner_insurance table cannot make a covered property look uninsured.
+ *
+ * RESIDENT SIDE — tenant_directory.insurance_expiration. The earlier conclusion that
+ * WeLease had zero renters policies came from insurance_usage, which is empty on this
+ * tenant. That was a reporting gap, not an absence of coverage.
+ *
+ * CALIFORNIA: whether renters insurance is required, and what happens if it lapses, is a
+ * LEASE TERM. This reports status only. It must never generate a notice, a fee, or a
+ * resident communication.
+ */
+function buildInsuranceCompliance() {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+  var soon = ymd_(addDays_(today_(), INSURANCE.EXPIRING_SOON_DAYS));
+  var pm = pmLookup_();
+
+  // ---- owner / landlord ----
+  var policyByProp = {};
+  var pol = [];
+  try {
+    pol = afReport_('owner_insurance', { expires_on_to: ymd_(addDays_(today_(), 730)) },
+                    { maxPages: 5 });
+  } catch (e) {
+    logError_('appfolio', 'owner_insurance', e.message);
+  }
+  pol.forEach(function (p) {
+    // "properties" is a display string, so match on the address rather than an id.
+    var key = norm_(cleanName_(String(p.properties || '')));
+    if (!key) return;
+    var exp = ymd_(p.expiration_date);
+    if (!policyByProp[key] || (exp && exp > policyByProp[key].expiration)) {
+      policyByProp[key] = { expiration: exp, provider: p.provider,
+                            policy: p.policy_number, type: p.type };
+    }
+  });
+
+  var withUs = insWithUsProps_();
+  var ownerEmail = {};
+  readTab_('Owners').forEach(function (o) {
+    var em = insEmailOf_(o);
+    if (!em) return;
+    // owner_directory keys vary between accounts, so index on every id-ish or name-ish field
+    // present. Names are normalised, because Properties_Units.owners is a display string
+    // ("Smith, John") and the owner record may hold it the other way round.
+    [o.owner_id, o.owner_ids, o.selected_owner_id, o.id].forEach(function (k) {
+      if (k) ownerEmail[String(k)] = em;
+    });
+    [o.name, o.owner, o.owner_name, o.company_name].forEach(function (k) {
+      if (k) ownerEmail[norm_(cleanName_(String(k)))] = em;
+    });
+  });
+
+  var ownerRows = dropTPO_(readTab_('Properties_Units')).map(function (p) {
+    var fromField = ymd_(p.insurance_expiration);
+    var match = policyByProp[norm_(cleanName_(String(p.property_name || '')))] ||
+                policyByProp[norm_(addr_(p))];
+    var fromPolicy = match ? match.expiration : null;
+
+    // Whichever source shows coverage furthest out wins — a sparse policy table must
+    // not make a covered property read as uninsured.
+    var best = (fromField && fromPolicy) ? (fromField > fromPolicy ? fromField : fromPolicy)
+             : (fromField || fromPolicy);
+
+    var status = !best ? 'NO RECORD'
+               : (best < t ? 'EXPIRED'
+               : (best <= soon ? 'EXPIRING SOON' : 'CURRENT'));
+
+    // WHO PLACED IT. Group membership is the authority for "with us" — a Surevestor
+    // property is insured through WeLease whether or not a date has been keyed onto the
+    // property record, which is exactly the case that would otherwise read as uninsured.
+    var withUsGroup = withUs[p.property_id] || null;
+    var placedBy = withUsGroup ? INSURANCE.THROUGH_US
+                 : (best ? (best < t ? INSURANCE.EXPIRED : INSURANCE.OWN) : INSURANCE.NONE);
+
+    return {
+      status: status,
+      placed_by: placedBy,
+      insurance_group: withUsGroup,
+      address: addr_(p),
+      pm_group: pmOf_(pm, p.property_id, null),
+      expires: best || null,
+      days_to_expiry: best ? daysBetween_(t, best) : null,
+      // The property directory field is the system of record today — Frank, 2026-08-17.
+      // owner_insurance returns about one row on this account, so it is a supplement, never
+      // the authority. Labelled either way so a figure resting on the thin source is visible.
+      source: withUsGroup ? 'property group (' + withUsGroup + ')'
+            : fromField ? 'property_directory.insurance_expiration'
+            : fromPolicy ? 'owner_insurance report (property field is blank)'
+            : 'none',
+      provider: match ? match.provider : null,
+      policy_number: match ? match.policy : null,
+      policy_type: match ? match.type : null,
+      owners: p.owners || null,
+      // A property can list several owners; try each before giving up.
+      owner_email: (function () {
+        var raw = String(p.owners || '');
+        if (!raw) return null;
+        var direct = ownerEmail[raw] || ownerEmail[norm_(cleanName_(raw))];
+        if (direct) return direct;
+        var parts = raw.split(/\s*(?:\||;|\band\b|&)\s*/);
+        for (var i = 0; i < parts.length; i++) {
+          var hit = ownerEmail[norm_(cleanName_(parts[i]))];
+          if (hit) return hit;
+        }
+        return null;
+      })(),
+      property_id: p.property_id
+    };
+  }).sort(function (a, b) {
+    var rank = { 'EXPIRED': 0, 'NO RECORD': 1, 'EXPIRING SOON': 2, 'CURRENT': 3 };
+    return rank[a.status] - rank[b.status] || (a.days_to_expiry || 0) - (b.days_to_expiry || 0);
+  });
+  writeTab_('Insurance_Owner', ownerRows);
+
+  // ---- resident / renters ----
+  var live = liveTenancy_();
+
+  // FIELD NAMES. tenant_directory uses `tenant`, `selected_tenant_id`, `status` and
+  // `tenant_type` — not name / tenant_id / role. Guessing those returns nulls silently.
+  //
+  // One policy covers the HOUSEHOLD, so this is measured per occupancy rather than per
+  // person. Counting every adult separately would show a covered household as half
+  // compliant.
+  var seenOcc = {};
+  var tenantRows = dropTPO_(readTab_('Tenants')).filter(function (r) {
+    var type = String(r.tenant_type || '').toLowerCase();
+    if (/co.?signer|guarantor/.test(type)) return false;   // they hold no renters policy
+    if (!isActiveTenancy_(r, live)) return false;
+    var occ = String(r.occupancy_id || '');
+    // Prefer the row that actually carries a policy, then the primary tenant.
+    if (seenOcc[occ]) {
+      var prev = seenOcc[occ];
+      var better = (!prev.insurance_expiration && r.insurance_expiration) ||
+                   (String(r.primary_tenant).toLowerCase() === 'yes' && !prev.insurance_expiration);
+      if (!better) return false;
+    }
+    seenOcc[occ] = r;
+    return true;
+  }).map(function (r) {
+    var exp = ymd_(r.insurance_expiration);
+    var status = !exp ? (r.insurance_company_name ? 'NO EXPIRY RECORDED' : 'NO RECORD')
+               : (exp < t ? 'EXPIRED'
+               : (exp <= soon ? 'EXPIRING SOON' : 'CURRENT'));
+
+    // THROUGH THE RBP, OR THEIR OWN? Decided on the carrier name. With no carriers
+    // configured this reports "covered" without splitting, because a guessed split is a
+    // number someone would email a resident about.
+    var carrier = r.insurance_company_name || null;
+    var covered = !!exp && exp >= t;
+    var placedBy;
+    if (!carrier && !exp) placedBy = INSURANCE.NONE;
+    else if (exp && exp < t) placedBy = INSURANCE.EXPIRED;
+    else if (!INSURANCE.RBP_CARRIERS.length) placedBy = 'covered — RBP split not configured';
+    else if (insIsRbpCarrier_(carrier)) placedBy = INSURANCE.THROUGH_US;
+    else if (covered || carrier) placedBy = INSURANCE.OWN;
+    else placedBy = INSURANCE.NONE;
+
+    return {
+      status: status,
+      placed_by: placedBy,
+      is_covered: covered ? 'YES' : '',
+      address: addr_(r),
+      email: insEmailOf_(r),
+      pm_group: pmOf_(pm, r.property_id, r.unit_id),
+      resident: r.tenant || '',
+      lease_to: ymd_(r.lease_to),
+      expires: exp || null,
+      days_to_expiry: exp ? daysBetween_(t, exp) : null,
+      provider: r.insurance_company_name || null,
+      policy_number: r.insurance_policy_number || null,
+      occupancy_id: r.occupancy_id || null
+    };
+  }).sort(function (a, b) {
+    var rank = { 'EXPIRED': 0, 'NO RECORD': 1, 'NO EXPIRY RECORDED': 2, 'EXPIRING SOON': 3, 'CURRENT': 4 };
+    return rank[a.status] - rank[b.status] || (a.days_to_expiry || 0) - (b.days_to_expiry || 0);
+  });
+  writeTab_('Insurance_Tenant', tenantRows);
+
+  // ---- outreach worklist -------------------------------------------------------
+  // Who to email, on one list, with the address to send to. Anything without a usable
+  // email is kept ON the list and marked, rather than filtered out — a missing email is
+  // itself the reason the policy never got chased.
+  //
+  // THIS IS A WORKLIST, NOT A NOTICE. Whether renters insurance is required, and what
+  // follows if it lapses, is a lease term and a California question. Nothing here drafts,
+  // sends, or schedules anything, and no wording is implied.
+  var outreach = [];
+  tenantRows.forEach(function (r) {
+    if (r.placed_by !== INSURANCE.NONE && r.placed_by !== INSURANCE.EXPIRED &&
+        r.status !== 'EXPIRING SOON' && r.status !== 'NO EXPIRY RECORDED') return;
+    outreach.push({
+      side: 'Resident', priority: r.status === 'EXPIRED' ? 1 : (r.status === 'NO RECORD' ? 2 : 3),
+      reason: r.status === 'EXPIRED' ? 'Policy expired ' + r.expires
+            : r.status === 'NO EXPIRY RECORDED' ? 'Carrier on file but no expiry date'
+            : r.status === 'EXPIRING SOON' ? 'Expires ' + r.expires + ' (' +
+                dayLabel_(r.days_to_expiry) + ')'
+            : 'No policy on record',
+      name: r.resident, address: r.address, unit_pm_group: r.pm_group,
+      email: r.email || '', email_missing: r.email ? '' : 'YES',
+      provider: r.provider || '', expires: r.expires || '',
+      lease_to: r.lease_to || '', occupancy_id: r.occupancy_id || ''
+    });
+  });
+  ownerRows.forEach(function (r) {
+    if (r.placed_by === INSURANCE.THROUGH_US) return;      // WeLease holds it already
+    if (r.status === 'CURRENT') return;
+    outreach.push({
+      side: 'Owner', priority: r.status === 'EXPIRED' ? 1 : (r.status === 'NO RECORD' ? 2 : 3),
+      reason: r.status === 'EXPIRED' ? 'Policy expired ' + r.expires
+            : r.status === 'NO RECORD' ? 'No policy on record'
+            : 'Expires ' + r.expires + ' (' + dayLabel_(r.days_to_expiry) + ')',
+      name: r.owners || '', address: r.address, unit_pm_group: r.pm_group,
+      email: r.owner_email || '', email_missing: r.owner_email ? '' : 'YES',
+      provider: r.provider || '', expires: r.expires || '',
+      lease_to: '', occupancy_id: ''
+    });
+  });
+  outreach.sort(function (a, b) {
+    return a.priority - b.priority || String(a.side).localeCompare(String(b.side)) ||
+           String(a.address).localeCompare(String(b.address));
+  });
+  writeTab_('Insurance_Outreach', outreach.length ? outreach
+    : [{ note: 'Nobody to chase — every resident and owner policy is current.' }]);
+
+  function tally(rows) {
+    var o = {};
+    rows.forEach(function (r) { o[r.status] = (o[r.status] || 0) + 1; });
+    return o;
+  }
+  function tallyBy(rows) {
+    var o = {};
+    rows.forEach(function (r) { o[r.placed_by] = (o[r.placed_by] || 0) + 1; });
+    return o;
+  }
+  var oc = tally(ownerRows), tc = tally(tenantRows);
+  var op = tallyBy(ownerRows), tp = tallyBy(tenantRows);
+  var summary = {
+    run_date: nowStamp_(),
+    owner_properties: ownerRows.length,
+    owner_current: oc['CURRENT'] || 0,
+    owner_expiring: oc['EXPIRING SOON'] || 0,
+    owner_expired: oc['EXPIRED'] || 0,
+    owner_no_record: oc['NO RECORD'] || 0,
+    owner_coverage_pct: ownerRows.length
+      ? round1_((oc['CURRENT'] || 0) / ownerRows.length * 100) : null,
+    tenant_households: tenantRows.length,
+    tenant_current: tc['CURRENT'] || 0,
+    tenant_expiring: tc['EXPIRING SOON'] || 0,
+    tenant_expired: tc['EXPIRED'] || 0,
+    tenant_no_record: tc['NO RECORD'] || 0,
+    tenant_coverage_pct: tenantRows.length
+      ? round1_((tc['CURRENT'] || 0) / tenantRows.length * 100) : null,
+    owner_policies_in_report: pol.length,
+
+    // The three-way split Frank asked to track, on both sides of the house.
+    owner_through_us: op[INSURANCE.THROUGH_US] || 0,
+    owner_own_policy: op[INSURANCE.OWN] || 0,
+    owner_expired_policy: op[INSURANCE.EXPIRED] || 0,
+    owner_none: op[INSURANCE.NONE] || 0,
+    tenant_through_rbp: tp[INSURANCE.THROUGH_US] || 0,
+    tenant_own_policy: tp[INSURANCE.OWN] || 0,
+    tenant_expired_policy: tp[INSURANCE.EXPIRED] || 0,
+    tenant_none: tp[INSURANCE.NONE] || 0,
+    tenant_covered_unsplit: tp['covered — RBP split not configured'] || 0,
+    rbp_split_configured: INSURANCE.RBP_CARRIERS.length ? 'YES' : '',
+    outreach_count: outreach.length,
+    outreach_without_an_email: outreach.filter(function (r) {
+      return r.email_missing === 'YES'; }).length
+  };
+  appendTab_('Insurance_History', [summary]);
+
+  logRun_('buildInsuranceCompliance', 'appfolio', 'Insurance_Owner',
+          ownerRows.length + tenantRows.length, new Date().getTime() - t0,
+          'owner ' + summary.owner_coverage_pct + '% · resident ' +
+          summary.tenant_coverage_pct + '% · owner_insurance rows=' + pol.length +
+          ' · through us: ' + summary.owner_through_us + ' owner / ' +
+          summary.tenant_through_rbp + ' resident · to chase: ' + outreach.length +
+          (summary.rbp_split_configured ? '' : ' · RBP SPLIT NOT CONFIGURED'));
+
+  if (!INSURANCE.RBP_CARRIERS.length) {
+    logError_('portfolio', 'insurance',
+      'INSURANCE.RBP_CARRIERS is empty, so residents insured through the RBP cannot be ' +
+      'told apart from residents who brought their own policy. ' +
+      (tenantRows.length ? tenantRows.filter(function (r) { return r.is_covered === 'YES'; }).length
+        : 0) + ' covered household(s) are reported together. Run diagnoseInsurance() to see ' +
+      'the carrier names in your data, then set the RBP carrier in Data_Quality.gs.');
+  }
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
+
+// ============================================================ FIELD AUDIT
+
+/**
+ * What else in the portfolio cannot be relied on, ranked by consequence rather than by
+ * how empty the column is. A blank field only matters if something depends on it.
+ */
+function buildDataQualityAudit() {
+  var t0 = new Date().getTime();
+  var out = [];
+
+  // The severity passed in is a CEILING — what this field costs you when it is badly
+  // populated — not a verdict. The verdict comes from the measurement.
+  //
+  // Owner email came back 284/284 and was still printed as MEDIUM with "Owner
+  // communication and packet delivery" under what_it_breaks. Nothing was broken. A clean
+  // field sitting on a to-do list teaches people to skim the list, which costs you the
+  // three findings on it that are real.
+  var SMALL_N = 20;
+
+  function check(area, field, filled, total, impact, fix, severity) {
+    var pct = total ? Math.round(filled / total * 100) : 0;
+    var missing = total - filled;
+    var sev = severity, note = '';
+
+    if (!total) {
+      sev = 'NO DATA';
+      impact = 'Nothing to measure — the source is empty. That is a pipeline question, ' +
+               'not a data-entry one.';
+    } else if (pct === 100) {
+      sev = 'CLEAN';
+      impact = 'Fully populated. Nothing to do.';
+      fix = '';
+    } else if (total < SMALL_N) {
+      // 6 of 8 is 75%, which ranks alongside a 75% failure across 300 records. It is not
+      // the same finding, and ranking it as one buries the ones that are.
+      sev = (sev === 'HIGH') ? 'LOW' : sev;
+      note = ' Only ' + total + ' record(s), so treat the percentage as indicative — ' +
+             missing + ' missing, not a trend.';
+    } else if (pct >= 95) {
+      sev = 'LOW';
+      note = ' ' + missing + ' record(s) short of complete.';
+    }
+
+    out.push({
+      severity: sev, area: area, field: field,
+      populated: filled + '/' + total + ' (' + pct + '%)',
+      pct: pct, missing: missing,
+      what_it_breaks: impact + note, how_to_fix: fix
+    });
+  }
+  function fill(rows, f) {
+    return rows.filter(function (r) {
+      return r[f] !== null && r[f] !== undefined && r[f] !== '';
+    }).length;
+  }
+
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+  var cur = rr.filter(function (r) {
+    return String(r.status || '').toLowerCase().indexOf('current') !== -1;
+  });
+  var stale = cur.filter(function (r) {
+    return num_(r.market_rent) !== null && num_(r.rent) > num_(r.market_rent);
+  }).length;
+  check('Pricing', 'market_rent (occupied units)', cur.length - stale, cur.length,
+    'Rent-to-market variance, renewal pricing. Portfolio-wide rent charged exceeds market ' +
+    'rent, so under-market units are invisible and renewals are priced off a stale figure.',
+    'Rent_Market_Variance lists every unit to correct, worst first.',
+    stale > cur.length * 0.2 ? 'HIGH' : 'MEDIUM');
+
+  var tick = dropTPO_(readTab_('Tenant_Tickler')).filter(isMoveOutEvent_);
+  check('Retention', 'move_out_reason', fill(tick, 'move_out_reason'), tick.length,
+    'Move-out reason mix. Without it you cannot separate churn you caused from churn you ' +
+    'could not.',
+    'Make the reason required on the move-out workflow in AppFolio.', 'HIGH');
+
+  var le = dropTPO_(readTab_('Lease_Expirations'));
+  check('Leasing', 'lease_expires', fill(le, 'lease_expires'), le.length,
+    'Expiring-lease countdown. Blank means month-to-month or holdover — real tenancies ' +
+    'that cannot appear on any renewal list.',
+    'Confirm which are genuinely month-to-month; enter dates for the rest.', 'HIGH');
+
+  var wo = dropTPO_(readTab_('Work_Orders'));
+  check('Maintenance', 'ai_resolved', fill(wo, 'ai_resolved'), wo.length,
+    '"Resolved without dispatch" KPI. Unused portfolio-wide, so the metric has no source.',
+    'Adopt AppFolio AI triage, or mark no-dispatch resolutions with a status convention.',
+    'LOW');
+  check('Maintenance', 'unit_turn_category', fill(wo, 'unit_turn_category'), wo.length,
+    'Separating Make Ready from Turnover. One value in use, so the two collapse into one ' +
+    'population.',
+    'Populate turn categories, or accept that they are reported together.', 'MEDIUM');
+  check('Maintenance', 'vendor (open work orders)',
+    fill(wo.filter(function (r) { return !r.completed_on && !r.canceled_on; }), 'vendor'),
+    wo.filter(function (r) { return !r.completed_on && !r.canceled_on; }).length,
+    'Aged work orders. "No vendor" on an old order is usually the reason it is old.',
+    'Assign a vendor when the order is created.', 'MEDIUM');
+
+  var insp = readTab_('Inspections');
+  var names = {};
+  insp.forEach(function (r) { if (r.inspection_name) names[r.inspection_name] = 1; });
+  var distinct = Object.keys(names).length;
+  out.push({
+    severity: distinct > 60 ? 'HIGH' : 'MEDIUM', area: 'Inspections',
+    field: 'inspection_name', populated: distinct + ' distinct names across ' + insp.length + ' records',
+    pct: null,
+    what_it_breaks: 'Free text, so inspection type has to be inferred. Records titled ' +
+      '"Please ERASE" and "Delete this" are in the production data.',
+    how_to_fix: 'A controlled template list in AppFolio. _inspection_junk has the cleanup list.'
+  });
+
+  var pmMap = pmLookup_();
+  // Test properties are not an assignment failure. zDUMMY records are already flagged for
+  // closure, and leaving them in the denominator meant this line could never reach 100%
+  // no matter how well the team did.
+  var props = dropTPO_(readTab_('Properties_Units')).filter(function (p) {
+    return !/^z/i.test(String(p.property_name || p.property_address || ''));
+  });
+  var assigned = props.filter(function (p) { return pmMap[p.property_id]; }).length;
+  check('Assignment', 'PM property group', assigned, props.length,
+    'Every per-manager filter on the dashboard. Unassigned active properties appear only ' +
+    'under "Unassigned" and never for any manager.',
+    'Add each active property to a PM-prefixed group.',
+    assigned < props.length * 0.9 ? 'HIGH' : 'MEDIUM');
+
+  var owners = readTab_('Owners');
+  check('Owners', 'email', fill(owners, 'email'), owners.length,
+    'Owner communication and packet delivery.', 'Collect at onboarding.', 'MEDIUM');
+
+  out.sort(function (a, b) {
+    // HIGH is rank 0, and `rank[x] || 9` turns that 0 into 9 — which sorted the most
+    // serious findings to the BOTTOM of the list. Check for the key, don't lean on truthiness.
+    var rank = { HIGH: 0, MEDIUM: 1, LOW: 2, 'NO DATA': 3, CLEAN: 4 };
+    var ra = (a.severity in rank) ? rank[a.severity] : 9;
+    var rb = (b.severity in rank) ? rank[b.severity] : 9;
+    return ra - rb || (a.pct || 0) - (b.pct || 0);
+  });
+  writeTab_('_data_quality', out);
+  logRun_('buildDataQualityAudit', 'derived', '_data_quality', out.length,
+          new Date().getTime() - t0,
+          out.filter(function (r) { return r.severity === 'HIGH'; }).length + ' high-severity, ' +
+          out.filter(function (r) { return r.severity === 'CLEAN'; }).length + ' clean');
+  Logger.log(JSON.stringify(out, null, 1));
+  return out;
+}
+
+// ============================================================ RUNNER
+
+function buildDataQuality() {
+  var done = [];
+  [['rent_market', buildRentMarketVariance], ['insurance', buildInsuranceCompliance],
+   ['audit', buildDataQualityAudit]].forEach(function (j) {
+    try { j[1](); done.push(j[0] + ' OK'); }
+    catch (e) { done.push(j[0] + ' FAILED: ' + e.message.slice(0, 150));
+                logError_('data_quality', j[0], e.message); }
+  });
+  Logger.log(done.join('\n'));
+  return done;
+}
