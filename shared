@@ -1,0 +1,579 @@
+/**
+ * WeLease Pipeline — SHARED CONVENTIONS  v1.0.0 · 2026-08-05
+ * Requires Core_v2.gs. Load before Dashboard.gs and Portfolio.gs.
+ *
+ * House rules that must behave identically everywhere:
+ *   addr_()        how a property is identified on screen
+ *   isTPO_()       tenant-placement-only exclusion
+ *   isEndingMgmt_() properties flagged for closure
+ *   isAcked_()     items a human has reviewed and cleared
+ */
+
+// ============================================================ ADDRESS
+
+/**
+ * ONE address format for the whole dashboard.
+ *
+ * Deriving the address per report was the mistake: each report exposes a different
+ * mix of street / street2 / unit / composite fields, so the same door rendered three
+ * ways ("154 Daisy Ave - D #D", "3667-71 41st St - 3671 #3671"). The fix is a master
+ * Unit Address Book keyed on unit_id, built once from unit_directory, that every
+ * report looks up instead of computing its own.
+ *
+ * addr_() checks the book first and only falls back to deriving when a row has no
+ * unit_id — which should be rare and is logged as a gap.
+ */
+
+/**
+ * Strips the operational prefixes and suffixes the team encodes in property names:
+ *   (TPO) 10012 Merry Brooke Trail   -> tenant placement only
+ *   z29614 Big Dipper Way (05/20/26) -> flagged for management closure
+ * Those markers are meaningful and are read elsewhere, but they do not belong in a
+ * street address on screen.
+ */
+function cleanName_(s) {
+  return String(s || '')
+    .replace(/^\(TPO\)\s*/i, '')
+    .replace(/^z\s*/i, '')
+    .replace(/\s*\(\d{1,2}\/\d{1,2}\/\d{2,4}\)?\s*$/, '')
+    .trim();
+}
+
+/** Case- and punctuation-insensitive comparison. */
+function norm_(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+
+/** True when `phrase` appears in `line` as a contiguous run of whole words. */
+function containsPhrase_(line, phrase) {
+  var L = ' ' + norm_(line) + ' ', P = ' ' + norm_(phrase) + ' ';
+  return P.trim().length > 0 && L.indexOf(P) !== -1;
+}
+
+/**
+ * True when EVERY word of `phrase` already appears in `line`, in any order.
+ *
+ * Order-insensitive on purpose. "1951 Rue Michelle" with the designator
+ * "Rue Michelle (1951)" holds exactly the same three words rearranged, and a
+ * contiguous-run test misses it — which produced "1951 Rue Michelle #Rue Michelle (1951)".
+ */
+function containsAllWords_(line, phrase) {
+  var words = norm_(phrase).split(' ').filter(function (w) { return w.length; });
+  if (!words.length) return false;
+  var L = ' ' + norm_(line) + ' ';
+  for (var i = 0; i < words.length; i++) {
+    if (L.indexOf(' ' + words[i] + ' ') === -1) return false;
+  }
+  return true;
+}
+
+/**
+ * The single normaliser. Everything that renders an address goes through this.
+ *
+ * AppFolio encodes the unit into the property name several different ways, and each
+ * needs different handling:
+ *   "154 Daisy Ave - D"                            -> unit suffix, becomes "#D"
+ *   "2666 Rhoades Rd - 2666 Rhoades Rd (Main House)" -> right side is the fuller form, use it
+ *   "1886 Manzana Way" + unit "Manzana Way"        -> already spelled out, do not repeat
+ *   "3166-80 Massachusetts Ave" + unit "3166"      -> street RANGE, unit still needed
+ */
+function normalizeAddress_(street, street2, unitName, composite) {
+  var line = cleanName_(String(street || '').trim());
+
+  if (!line && composite) {
+    // Composites read "Name - Full Address". The NAME often carries the unit, so drop
+    // only the trailing address segment.
+    var parts = String(composite).split(' - ');
+    line = cleanName_((parts.length > 1 ? parts.slice(0, -1).join(' - ') : parts[0]).trim());
+  }
+  if (!line) return null;
+
+  var trail = null;
+  var idx = line.lastIndexOf(' - ');
+  if (idx > 0) {
+    var left = line.slice(0, idx).trim(), right = line.slice(idx + 3).trim();
+    if (containsPhrase_(right, left)) line = right;              // right is the fuller form
+    else if (right.length <= 14) { line = left; trail = right; }  // right is a unit designator
+  }
+
+  var unit = cleanName_(String(street2 || unitName || trail || '').trim());
+  if (unit && unit.length <= 20 && norm_(unit) !== norm_(line)) {
+    var hasLetters = /[a-z]/i.test(unit);
+    var already = containsAllWords_(line, unit);
+    // A worded designator already spelled out adds nothing. A numeric one always
+    // appends — "3166" inside the range "3166-80" still has to be disambiguated.
+    if (!(hasLetters && already)) {
+      var esc = unit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (!new RegExp('#\\s*' + esc + '$', 'i').test(line)) line = line + ' #' + unit;
+    }
+  }
+  return line;
+}
+
+// ============================================================ APPFOLIO LINKS
+
+/**
+ * Deep links back into AppFolio, on the ADDRESS only — never on a resident.
+ *
+ * AppFolio nests units under their property:
+ *   multifamily unit  /properties/705/units/912
+ *   single-family     /properties/627
+ *
+ * Which form applies depends on whether the property has more than one unit, so the
+ * URL is resolved once in the address book rather than guessed at each render.
+ */
+var AF_LINKS = {
+  base: 'https://welease.appfolio.com',
+  property: '/properties/{pid}',
+  unit: '/properties/{pid}/units/{uid}',
+  enabled: true
+};
+
+function afUrlFor_(propertyId, unitId, multiUnit) {
+  if (!AF_LINKS.enabled || !propertyId) return null;
+  if (multiUnit && unitId) {
+    return AF_LINKS.base + AF_LINKS.unit.replace('{pid}', propertyId).replace('{uid}', unitId);
+  }
+  return AF_LINKS.base + AF_LINKS.property.replace('{pid}', propertyId);
+}
+
+/** Address rendered as a link when we can resolve one. Address cells only. */
+function addrLink_(r, label) {
+  label = label || addr_(r);
+  var book = addressBook_();
+  var entry = r && r.unit_id ? book[r.unit_id] : null;
+  var url = entry ? entry.url : afUrlFor_(r.property_id, r.unit_id, false);
+  if (!url) return esc_(label);
+  return '<a class="af" href="' + url + '" target="_blank" rel="noopener">' + esc_(label) + '</a>';
+}
+
+var _addrBook = null;
+
+function addressBook_() {
+  if (_addrBook) return _addrBook;
+  _addrBook = {};
+  readTab_('Unit_Address_Book').forEach(function (r) {
+    if (r.unit_id) _addrBook[r.unit_id] = { address: r.display_address, url: r.appfolio_url,
+                                            pm_group: r.pm_group };
+  });
+  return _addrBook;
+}
+
+/** THE display identifier. Book first, derive second. Never an id on screen. */
+function addr_(r) {
+  if (r && r.unit_id) {
+    var hit = addressBook_()[r.unit_id];
+    if (hit && hit.address) return hit.address;
+  }
+  var out = normalizeAddress_(
+    r.property_street || r.unit_street || r.street,
+    r.property_street2 || r.unit_street2 || r.street2,
+    r.unit_name || r.unit,
+    r.property || r.property_address || r.address || r.property_name);
+  return out || '\u2014';
+}
+
+/**
+ * Builds the book. Run inside rebuildPortfolio, after rebuildAll.
+ * unit_directory is the canon source: it carries unit_street, unit_street2 and
+ * unit_name for every door, with the property as fallback.
+ */
+function buildAddressBook() {
+  var t0 = new Date().getTime();
+  var units = readTab_('Unit_Directory');
+  var props = indexBy_(readTab_('Properties_Units'), 'property_id');
+  var pm = pmLookup_();
+
+  // AppFolio nests units under the property only when the property has several.
+  // Count first so each row gets the right URL shape.
+  var unitsPerProperty = {};
+  units.forEach(function (u) {
+    unitsPerProperty[u.property_id] = (unitsPerProperty[u.property_id] || 0) + 1;
+  });
+
+  var rows = units.map(function (u) {
+    var p = props[u.property_id] || {};
+    var display = normalizeAddress_(
+      u.unit_street || p.property_street,
+      u.unit_street2 || p.property_street2,
+      u.unit_name || u.unit,
+      u.unit_address || u.property || p.property || u.property_name);
+    var end = endingMgmt_(p.property_name ? p : u);
+    return {
+      unit_id: u.unit_id,
+      property_id: u.property_id,
+      display_address: display || cleanName_(u.property_name || '') || '\u2014',
+      unit_designator: cleanName_(String(u.unit_street2 || u.unit_name || u.unit || '')),
+      pm_group: pm[u.property_id] || UNASSIGNED,
+      is_tpo: isTPO_(u) || isTPO_(p) ? 'YES' : null,
+      units_at_property: unitsPerProperty[u.property_id] || 1,
+      appfolio_url: afUrlFor_(u.property_id, u.unit_id, (unitsPerProperty[u.property_id] || 1) > 1),
+      ending_mgmt_date: end ? end.date : null,
+      source: u.unit_street ? 'unit_directory' : (p.property_street ? 'property_directory' : 'composite')
+    };
+  });
+
+  writeTab_('Unit_Address_Book', rows);
+  _addrBook = null;
+
+  var derived = rows.filter(function (r) { return r.source === 'composite'; }).length;
+  var dupes = {};
+  rows.forEach(function (r) { dupes[r.display_address] = (dupes[r.display_address] || 0) + 1; });
+  var collisions = Object.keys(dupes).filter(function (k) { return dupes[k] > 1; });
+
+  logRun_('buildAddressBook', 'derived', 'Unit_Address_Book', rows.length,
+          new Date().getTime() - t0,
+          rows.length + ' units · ' + derived + ' from composite · ' +
+          collisions.length + ' duplicate addresses');
+  if (collisions.length) {
+    logError_('address', 'collisions',
+      collisions.length + ' addresses map to more than one unit — two doors will look identical ' +
+      'on screen. First few: ' + collisions.slice(0, 8).join(' | '));
+  }
+  return { units: rows.length, collisions: collisions.length };
+}
+
+// ============================================================ TPO
+
+/**
+ * Tenant Placement Only. WeLease found the resident but does not manage the property.
+ * Named "(TPO) 10012 Merry Brooke Trail".
+ *
+ * Excluded from EVERY count and report except vacancies and move-ins, and excluded
+ * from the door count — they are not doors under management.
+ */
+function isTPO_(r) {
+  var s = String(r.property_name || r.property || r.unit || r.unit_name || '');
+  return /\bTPO\b/i.test(s);
+}
+
+/** Standard filter. Pass allowTPO true only for vacancy and move-in lists. */
+function dropTPO_(rows, allowTPO) {
+  var useMaster = (typeof inMasterScope_ === 'function');
+  return rows.filter(function (r) {
+    if (isExcluded_(r)) return false;                 // always out, no exceptions
+
+    // Master_Units / Master_Tenancies are AUTHORITATIVE when present. Inferring
+    // "no longer managed" from management_end_date kept getting it wrong because that
+    // field is not maintained — which is why the team encodes closures in the property
+    // name instead. A human decision beats an unreliable signal.
+    if (useMaster) {
+      if (!inMasterScope_(r)) return false;
+    } else if (!isActiveProperty_(r)) {
+      return false;                                   // fallback until the master exists
+    }
+    return allowTPO ? true : !isTPO_(r);
+  });
+}
+
+/**
+ * Same scope filter, but keeps properties whose management has ended.
+ *
+ * Used ONLY by Performance (doors, growth, churn and the KPIs need the full history —
+ * excluding lost properties would erase the churn that makes the growth chart mean
+ * anything) and by Former residents with balances (money owed survives the property
+ * leaving management).
+ */
+function inScopeIncludingInactive_(rows, allowTPO) {
+  return rows.filter(function (r) {
+    if (isExcluded_(r)) return false;
+    return allowTPO ? true : !isTPO_(r);
+  });
+}
+
+// ============================================================ ACTIVE PROPERTIES
+
+/**
+ * A property is inactive once AppFolio records management as ended.
+ *
+ * This is what the 203 "Unassigned" rows mostly were: properties WeLease handed back,
+ * which keep their units and ledger history but have no PM group because nobody
+ * manages them. They belong in history, not on a worklist.
+ *
+ * property_directory.management_end_date is AppFolio's own record, so no naming
+ * convention is required — though it also catches the z-prefix properties once their
+ * closure date is actually entered.
+ */
+var _inactiveProps = null;
+
+function inactiveProperties_() {
+  if (_inactiveProps) return _inactiveProps;
+  _inactiveProps = {};
+  var t = ymd_(today_());
+  readTab_('Properties_Units').forEach(function (p) {
+    var end = ymd_(p.management_end_date);
+    if (end && end <= t) _inactiveProps[String(p.property_id)] = end;
+  });
+  return _inactiveProps;
+}
+
+function isActiveProperty_(r) {
+  if (!r || r.property_id === null || r.property_id === undefined) return true;
+  return !inactiveProperties_()[String(r.property_id)];
+}
+
+/** Counts, for the coverage note. */
+function inactiveCount_() { return Object.keys(inactiveProperties_()).length; }
+
+// ============================================================ ENDING MANAGEMENT
+
+/**
+ * Properties flagged for closure by naming convention:
+ *   z29614 Big Dipper Way (05/20/2026)
+ * A leading "z" plus a date in parentheses. The closing bracket is often missing,
+ * so the pattern tolerates it.
+ */
+function endingMgmt_(r) {
+  var name = String(r.property_name || r.property || '');
+  if (!/^\s*z/i.test(name)) return null;
+  var m = name.match(/\((\d{1,2})\/(\d{1,2})\/(\d{2,4})\)?/);
+  if (!m) return { date: null, raw: name };
+  var yr = m[3].length === 2 ? '20' + m[3] : m[3];
+  var iso = yr + '-' + ('0' + m[1]).slice(-2) + '-' + ('0' + m[2]).slice(-2);
+  return { date: iso, raw: name };
+}
+
+function isEndingMgmt_(r) { return !!endingMgmt_(r); }
+
+// ============================================================ ACKNOWLEDGMENTS
+
+/**
+ * Lets the team clear an item from an urgency list without touching AppFolio.
+ *
+ * Add a row to the _acknowledgments tab:
+ *   list           deposits | work_orders | renewals | inspections | ending_mgmt
+ *   key            the identifier shown in that list (occupancy id, WO number, address)
+ *   acknowledged_by / date / note
+ *
+ * The item disappears from the dashboard. It does NOT change anything in AppFolio,
+ * and the underlying metric still counts it — this hides a row from a worklist, it
+ * does not mark a compliance obligation as met.
+ */
+function ackSet_(listName) {
+  var set = {};
+  readTab_('_acknowledgments').forEach(function (r) {
+    if (String(r.list || '').toLowerCase() !== String(listName).toLowerCase()) return;
+    var k = String(r.key || '').trim();
+    if (!k) return;
+    // Blank expires_on means it stays cleared.
+    var exp = ymd_(r.expires_on);
+    if (exp && exp < ymd_(today_())) return;
+    set[k.toLowerCase()] = true;
+  });
+  return set;
+}
+
+function isAcked_(set, key) {
+  return !!set[String(key === null || key === undefined ? '' : key).trim().toLowerCase()];
+}
+
+/** Creates the tab with headers and a worked example. */
+function setupAcknowledgments() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('_acknowledgments') || ss.insertSheet('_acknowledgments');
+  if (sh.getLastRow() > 0) return 'already exists';
+  var hdr = ['list', 'key', 'acknowledged_by', 'acknowledged_on', 'expires_on', 'note'];
+  sh.getRange(1, 1, 1, hdr.length).setValues([hdr]).setFontWeight('bold');
+  sh.getRange(2, 1, 1, hdr.length).setValues([[
+    'deposits', '1234', 'example@weleaseusa.com', ymd_(today_()), '',
+    'Owner holds this deposit — confirmed returned 5/2. Delete this example row.'
+  ]]);
+  sh.setFrozenRows(1);
+  sh.getRange(4, 1).setValue(
+    'Lists: deposits · work_orders · renewals · inspections · ending_mgmt · vacancy · delinquency. ' +
+    'Key = the value shown in the dashboard row. Leave expires_on blank to hide permanently. ' +
+    'This hides a row from a worklist. It does not change AppFolio and does not satisfy a compliance obligation.');
+  return 'created';
+}
+
+
+// ============================================================ TENANCY
+
+/**
+ * Who is actually still in a unit.
+ *
+ * THE BUG THIS REPLACES: the old check fell back to the UNIT when it could not match
+ * a person. A unit stays "Current" because a NEW resident moved in — so a departed
+ * household matched on unit and rendered as active. 3168 Massachusetts #Unit A showed
+ * Michael, Craig as an active tenancy months after they left on 12/09/2025.
+ *
+ * AppFolio keys a household on occupancy_id. A partial move-out (one person leaves,
+ * the lease continues) KEEPS the occupancy_id. A full turnover creates a NEW one.
+ * So occupancy is the right unit of exclusion — never property, never unit.
+ */
+function liveTenancy_() {
+  var occ = {}, tenants = {}, closed = {}, moveOut = {};
+
+  // Closed households, from recorded move-outs. This is definitive and overrides
+  // everything else — a dated move-out in the past means gone.
+  var todayStr = ymd_(today_());
+  readTab_('Tenant_Tickler').forEach(function (r) {
+    if (!isMoveOutEvent_(r) || !r.occupancy_id) return;
+    var mo = ymd_(r.move_out_date);
+    if (!mo) return;
+    moveOut[r.occupancy_id] = mo;
+    if (mo <= todayStr) closed[r.occupancy_id] = mo;
+  });
+
+  readTab_('Rent_Roll').forEach(function (r) {
+    var st = String(r.status || '').toLowerCase();
+    // Current and Notice are both live. Notice means leaving, not gone.
+    if (st.indexOf('current') === -1 && st.indexOf('notice') === -1) return;
+    if (r.occupancy_id && !closed[r.occupancy_id]) occ[r.occupancy_id] = true;
+    if (r.tenant_id) tenants[r.tenant_id] = true;
+    // Co-tenants share the household but carry their own ids.
+    String(r.additional_tenant_ids || '').split(',').forEach(function (id) {
+      id = id.trim();
+      if (id) tenants[id] = true;
+    });
+  });
+
+  // Manual overrides for anything the data cannot settle.
+  var manual = {};
+  readTab_('_excluded_tenancies').forEach(function (r) {
+    if (r.occupancy_id) manual[String(r.occupancy_id).trim()] = true;
+  });
+
+  return { occupancies: occ, tenants: tenants, closed: closed,
+           moveOut: moveOut, excluded: manual };
+}
+
+/**
+ * True when a row belongs to a live household.
+ *
+ * NO UNIT FALLBACK. If we cannot identify the household, the row is treated as not
+ * live. Showing a departed resident as active is worse than omitting an ambiguous row,
+ * and the ambiguous case is rare — every relevant report carries occupancy_id.
+ */
+function isActiveTenancy_(r, live) {
+  var occId = r.occupancy_id ? String(r.occupancy_id).trim() : null;
+
+  if (occId && live.excluded[occId]) return false;    // manually excluded
+  if (occId && live.closed[occId]) return false;      // recorded move-out in the past
+  if (occId) return !!live.occupancies[occId];        // occupancy is definitive
+
+  if (r.tenant_id && live.tenants[r.tenant_id]) return true;
+
+  var st = String(r.tenant_status || r.status || '').toLowerCase();
+  if (/past|former|evicted|moved.?out|cancel/.test(st)) return false;
+  if (/current|notice|active|eligible/.test(st)) return true;
+
+  return false;
+}
+
+/** Recorded move-out date for a household, or null. */
+function moveOutDateOf_(r, live) {
+  var occId = r.occupancy_id ? String(r.occupancy_id).trim() : null;
+  return occId ? (live.moveOut[occId] || null) : null;
+}
+
+/** Creates the manual tenancy-exclusion tab. */
+function setupExcludedTenancies() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('_excluded_tenancies') || ss.insertSheet('_excluded_tenancies');
+  if (sh.getLastRow() > 0) return 'already exists';
+  sh.getRange(1, 1, 1, 5).setValues([['occupancy_id', 'address', 'resident',
+                                      'excluded_by', 'reason']]).setFontWeight('bold');
+  sh.getRange(2, 1, 1, 5).setValues([['', '3168 Massachusetts Ave #Unit A', 'Michael, Craig',
+    'example@weleaseusa.com',
+    'Example row — put the occupancy_id in column A. Address and resident are for your reference only.']]);
+  sh.setFrozenRows(1);
+  sh.getRange(4, 1).setValue(
+    'Excludes an entire HOUSEHOLD from every list. AppFolio keys a household on ' +
+    'occupancy_id: a partial move-out keeps the same id, a full turnover creates a new one. ' +
+    'Most departed households are detected automatically from recorded move-outs — use this ' +
+    'only when a move-out was never entered in AppFolio. Nothing here changes AppFolio.');
+  return 'created';
+}
+
+
+// ============================================================ EXCLUSIONS
+
+/**
+ * Properties kept out of the entire dashboard — training records, demo data, anything
+ * that would distort a count.
+ *
+ * TWO WAYS, both checked:
+ *   1. NAME_PATTERNS below, for anything permanent.
+ *   2. The _excluded_properties tab — a property_id or a name fragment plus a reason.
+ *      No code change, takes effect on the next page load.
+ *
+ * Different from an acknowledgment: that clears one row from one worklist. An exclusion
+ * removes the property from every list, count and metric. For a departed HOUSEHOLD use
+ * _excluded_tenancies instead — property-level exclusion is the wrong tool for that.
+ */
+var EXCLUDE = {
+  NAME_PATTERNS: [
+    /\bsample\b/i,        // AppFolio ships "Sample Office Property"
+    /\bdummy\b/i,
+    /\btraining\b/i,
+    /\btest property\b/i,
+    /\bdemo\b/i
+  ]
+};
+
+var _exclusions = null;
+
+function exclusions_() {
+  if (_exclusions) return _exclusions;
+  _exclusions = { ids: {}, fragments: [] };
+  readTab_('_excluded_properties').forEach(function (r) {
+    if (r.property_id) _exclusions.ids[String(r.property_id).trim()] = true;
+    var f = String(r.name_contains || '').trim();
+    if (f) _exclusions.fragments.push(f.toLowerCase());
+  });
+  return _exclusions;
+}
+
+function isExcluded_(r) {
+  var name = String(r.property_name || r.property || r.unit || '');
+  for (var i = 0; i < EXCLUDE.NAME_PATTERNS.length; i++) {
+    if (EXCLUDE.NAME_PATTERNS[i].test(name)) return true;
+  }
+  var ex = exclusions_();
+  if (r.property_id && ex.ids[String(r.property_id).trim()]) return true;
+  var lower = name.toLowerCase();
+  for (var j = 0; j < ex.fragments.length; j++) {
+    if (lower.indexOf(ex.fragments[j]) !== -1) return true;
+  }
+  return false;
+}
+
+function setupExclusions() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('_excluded_properties') || ss.insertSheet('_excluded_properties');
+  if (sh.getLastRow() > 0) return 'already exists';
+  sh.getRange(1, 1, 1, 4).setValues([['property_id', 'name_contains', 'excluded_by', 'reason']])
+    .setFontWeight('bold');
+  sh.getRange(2, 1, 1, 4).setValues([['', 'Sample Office Property', 'example@weleaseusa.com',
+    'AppFolio demo record used for training. Delete this row or replace it with your own.']]);
+  sh.setFrozenRows(1);
+  sh.getRange(4, 1).setValue(
+    'Fill EITHER property_id (exact) OR name_contains (case-insensitive fragment). ' +
+    'Excluded properties disappear from every list, count and metric. ' +
+    'To exclude a departed HOUSEHOLD, use _excluded_tenancies instead. ' +
+    'Nothing here changes AppFolio.');
+  return 'created';
+}
+
+// ============================================================ MONTH LABELS
+
+/** "2025-08" or "2025-08-01" or a Date -> "August 2025". Never a timezone string. */
+var MONTH_NAMES = ['January','February','March','April','May','June',
+                   'July','August','September','October','November','December'];
+
+function monthLabel_(v, short) {
+  if (!v) return '';
+  // monthNorm_ handles the case this function used to get wrong: a month cell that Sheets
+  // turned into a Date, where reading .getMonth() off it lands a day early and names the
+  // month before. See monthNorm_ in Core_v2.gs.
+  var str = monthNorm_(v) || String(v);
+  var m = str.match(/^(\d{4})-(\d{2})/);
+  if (!m) {
+    var d = parseDate_(v);
+    if (!d) return String(str);
+    return (short ? MONTH_NAMES[d.getMonth()].slice(0, 3) : MONTH_NAMES[d.getMonth()]) +
+           ' ' + d.getFullYear();
+  }
+  var idx = parseInt(m[2], 10) - 1;
+  var name = MONTH_NAMES[idx] || m[2];
+  return (short ? name.slice(0, 3) : name) + ' ' + m[1];
+}
