@@ -1,0 +1,510 @@
+/**
+ * WeLease Pipeline — NOTICE MERGE FEED  v1.0.0 · 2026-08-26
+ * Requires Core_v2.gs, Shared.gs.
+ *
+ * The one seam between the dashboard and the PDF notice filler.
+ *
+ * WHY A FEED AND NOT A SHARED LIBRARY. The filler is a separate web app on purpose (see
+ * NOTICE_TOOL.md). It needs resident and owner details keyed by occupancy. It could call
+ * AppFolio itself, which would mean a second copy of the pull code, a second set of
+ * credentials, and two systems that can disagree about who lives where. Instead the
+ * dashboard — which already pulls this nightly and already knows which tenancies are live
+ * — writes one flat tab into the filler's own spreadsheet. The filler stays a thin client
+ * that reads a sheet. Nothing to break at 8pm on a Friday.
+ *
+ * WHAT GOES ON A LEGAL NOTICE. Only the people who signed for the money. Cosigners,
+ * guarantors, minors and non-responsible occupants are excluded, because naming them on a
+ * notice is a mistake of a different order from a wrong figure on a dashboard.
+ *
+ * BLANKS ARE NAMED, NEVER GUESSED. Every row carries `merge_gaps` listing the contract
+ * fields we do not hold for that household. The filler shows it before anyone prints. A
+ * notice with a silently empty city line is worse than one that refuses to generate.
+ */
+
+var NOTICE_FEED = {
+  // The filler's own spreadsheet — "Notices_Log". This dashboard writes into it.
+  SHEET_ID: '1Ryhs17Jdrfn3nhuDooF-xVK6RKMD-RJ3KyRzXlivvoY',
+  TAB: 'Residents',
+
+  // The data contract, confirmed with Frank. Order is the column order.
+  KEYS: ['occupancy_id', 'resident_name', 'property_address', 'unit',
+         'city', 'state', 'zip',
+         'owner_name', 'owner_phone', 'owner_email',
+         'resident_phone', 'resident_email',
+         'security_deposit',
+         'owner_address', 'lease_from', 'lease_to', 'current_rent', 'balance',
+         'property_id', 'unit_id', 'tenancy_status', 'merge_gaps', 'pulled_at'],
+
+  // A blank in any of these stops a notice. The rest are useful, not essential.
+  REQUIRED: ['resident_name', 'property_address', 'city', 'state', 'zip', 'owner_name'],
+
+  // Nobody on this list signed for the rent, so nobody on this list is named on a notice.
+  NOT_RESPONSIBLE: /co.?signer|guarantor|minor|child|dependent|occupant only|non.?responsible/i,
+
+  // Columns that must reach the sheet as plain text. AppFolio ids are small integers and
+  // Sheets will happily read 5 in a date-formatted cell as 4 January 1900 — which is
+  // exactly what came back from getMergeData. Same class of defect as the rent tile
+  // reading August's money under a July heading. Pinned to '@' rather than argued about.
+  TEXT_COLS: ['occupancy_id', 'property_id', 'unit_id', 'unit', 'zip',
+              'lease_from', 'lease_to', 'owner_phone', 'resident_phone', 'pulled_at'],
+
+  // Entries the tenant list carries that are not people, and must never appear on a
+  // notice. "…and all others in possession" on the form already covers them.
+  NOT_A_NAME: /^\s*(?:\d+\s+additional|additional\s|kids?\b|children\b|occupants?\b|tenants?\b|unknown\b|n\/?a\b)/i
+};
+
+// Street suffixes, used to cut a combined label back to the street. Longest forms first
+// so "Street" is not matched as "St" with "reet" left behind.
+var NOTICE_STREET_TYPES = 'Street|Avenue|Boulevard|Drive|Place|Lane|Court|Road|Terrace|' +
+  'Circle|Glen|Trail|Parkway|Highway|Square|Crossing|Alley|Plaza|Point|Cove|Bend|' +
+  'St|Ave|Blvd|Dr|Pl|Ln|Ct|Rd|Way|Ter|Cir|Gln|Trl|Pkwy|Hwy|Sq|Row|Walk|Path|Pt|Cv|' +
+  'Loop|Run|Bnd|Xing|Aly|Plz';
+
+/**
+ * Builds the Residents feed and writes it into the filler's spreadsheet.
+ * Runs nightly, after rebuildPortfolio and before the dashboard cache.
+ */
+function buildNoticeMergeFeed() {
+  var t0 = new Date().getTime();
+  var stamp = nowStamp_();
+
+  if (!NOTICE_FEED.SHEET_ID) {
+    logError_('notices', 'buildNoticeMergeFeed',
+      'No NOTICE_FEED.SHEET_ID configured — the filler has no data and will show an empty list.');
+    return { rows: 0 };
+  }
+
+  var live = liveTenancy_();
+  var tenants = dropTPO_(readTab_('Tenants'));
+  var rr = indexBy_(readTab_('Rent_Roll'), 'occupancy_id');
+  var props = indexBy_(readTab_('Properties_Units'), 'property_id');
+  var ownerContact = noticeOwnerContacts_();
+  var balance = {};
+  readTab_('Delinquency_Aged').forEach(function (d) {
+    if (d.occupancy_id) balance[String(d.occupancy_id)] = num_(d.amount_receivable) || 0;
+  });
+
+  // ---- one row per household, names combined ----
+  var byOcc = {};
+  var skippedNotResponsible = 0, skippedNotLive = 0;
+
+  tenants.forEach(function (r) {
+    var occ = r.occupancy_id ? String(r.occupancy_id).trim() : '';
+    if (!occ) return;
+    if (!isActiveTenancy_(r, live)) { skippedNotLive++; return; }
+    if (NOTICE_FEED.NOT_RESPONSIBLE.test(String(r.tenant_type || ''))) {
+      skippedNotResponsible++; return;
+    }
+
+    var b = byOcc[occ] || (byOcc[occ] = { names: [], emails: [], phones: [], row: r });
+    // One tenant row can itself carry several names joined with "and", so it goes through
+    // the same formatter as the whole household rather than being trusted as one person.
+    var nm = formatNoticeName_(r.tenant);
+    if (nm && b.names.indexOf(nm) === -1) {
+      // The primary tenant leads, so the notice reads the way the lease does.
+      if (String(r.primary_tenant).toLowerCase() === 'yes') b.names.unshift(nm);
+      else b.names.push(nm);
+    }
+    var em = insFirstEmail_(r.emails);
+    if (em && b.emails.indexOf(em) === -1) b.emails.push(em);
+    var ph = noticeFirstPhone_(r.phone_numbers);
+    if (ph && b.phones.indexOf(ph) === -1) b.phones.push(ph);
+    if (String(r.primary_tenant).toLowerCase() === 'yes') b.row = r;
+  });
+
+  var out = Object.keys(byOcc).sort().map(function (occ) {
+    var b = byOcc[occ];
+    var t = b.row;
+    var lease = rr[occ] || {};
+    var pid = String(t.property_id || lease.property_id || '');
+    var prop = props[pid] || {};
+
+    // STREET, NOT THE DISPLAY ADDRESS. addr_() deliberately appends the unit, because on
+    // a dashboard "1042 Grand Ave" is ambiguous across four doors. On a notice the street
+    // and the unit are separate printed fields, so the discrete AppFolio street field is
+    // what belongs here — and formatStreet_ is only a fallback for the properties that
+    // carry a combined label instead.
+    var rawStreet = t.property_street || lease.property_street || prop.property_street || '';
+    var street = formatStreet_(rawStreet) ||
+                 formatStreet_(addr_({ unit_id: t.unit_id,
+                   property_street: t.property_street, property_street2: t.property_street2,
+                   unit: t.unit, property_name: t.property_name,
+                   property_address: prop.property_address }));
+    var place = noticeSplitCityStateZip_(prop.property_address, prop.property_street);
+
+    var oc = ownerContact[pid] || {};
+    var row = {
+      occupancy_id: occ,
+      // Comma-separated, natural order. The forms already read "…and all others in
+      // possession", so an extra "and" between the signers reads badly on the page.
+      resident_name: b.names.join(', '),
+      property_address: (street === '—' ? '' : street),
+      unit: formatUnit_(t.unit || lease.unit || t.property_street2 || ''),
+      city: place.city, state: place.state, zip: place.zip,
+      owner_name: cleanName_(prop.owners || '') || '',
+      owner_phone: oc.phone || '',
+      owner_email: oc.email || '',
+      resident_phone: b.phones.join(' / '),
+      resident_email: b.emails.join(' / '),
+      security_deposit: num_(t.deposit) || 0,
+      owner_address: oc.address || '',
+      lease_from: ymd_(t.lease_from || lease.lease_from) || '',
+      lease_to: ymd_(t.lease_to || lease.lease_to) || '',
+      current_rent: num_(t.rent) || num_(lease.rent) || 0,
+      balance: balance[occ] || 0,
+      property_id: pid,
+      // Explicitly a string. AppFolio ids are small integers, and a small integer is what
+      // Sheets turns into 4 January 1900 given half a chance.
+      unit_id: String(t.unit_id || lease.unit_id || ''),
+      tenancy_status: lease.status || t.status || '',
+      pulled_at: stamp
+    };
+
+    var gaps = NOTICE_FEED.REQUIRED.filter(function (k) {
+      return row[k] === '' || row[k] === null || row[k] === undefined;
+    });
+    row.merge_gaps = gaps.join(', ');
+    return row;
+  });
+
+  noticeWriteFeed_(out);
+
+  var incomplete = out.filter(function (r) { return r.merge_gaps; }).length;
+  var note = out.length + ' households · ' + incomplete + ' with missing required fields · ' +
+    skippedNotResponsible + ' cosigners/minors excluded · ' + skippedNotLive + ' not live';
+  logRun_('buildNoticeMergeFeed', 'derived', NOTICE_FEED.TAB, out.length,
+          new Date().getTime() - t0, note);
+
+  // Loud on purpose. A gap here is a blank on a legal document.
+  if (incomplete) {
+    logError_('notices', 'buildNoticeMergeFeed',
+      incomplete + ' of ' + out.length + ' households are missing a field a notice needs ' +
+      '(see merge_gaps in the Residents tab). The filler will refuse these until they are fixed.');
+  }
+  Logger.log(note);
+  return { rows: out.length, incomplete: incomplete };
+}
+
+/**
+ * Writes the feed into the filler's spreadsheet, not this one.
+ *
+ * THE FORMATTING IS PART OF THE WRITE, not decoration. `getMergeData` came back with
+ * `unit_id = Thu Jan 04 1900`, which is Sheets reading the number 5 in a cell it had
+ * decided was a date. Every value the filler stamps onto a notice goes through this
+ * sheet, so a coerced cell is a wrong line on a served document.
+ *
+ * The column layout itself cannot shift — rows are written by NAME against the header
+ * (`head.map(k => r[k])`), so a missing or extra field writes blank rather than sliding
+ * its neighbours along. That was worth confirming, because a shifted write is the other
+ * way this symptom appears and it is the more dangerous one.
+ */
+function noticeWriteFeed_(rows) {
+  var ss = SpreadsheetApp.openById(NOTICE_FEED.SHEET_ID);
+  var sh = ss.getSheetByName(NOTICE_FEED.TAB) || ss.insertSheet(NOTICE_FEED.TAB);
+  var head = NOTICE_FEED.KEYS;
+
+  sh.clear();                       // content AND formats, so nothing survives a rebuild
+
+  // Pin the text columns BEFORE the values land. Setting the format afterwards is too
+  // late — Sheets has already parsed the cell and thrown the original away.
+  NOTICE_FEED.TEXT_COLS.forEach(function (k) {
+    var c = head.indexOf(k);
+    if (c === -1) return;
+    try { sh.getRange(2, c + 1, Math.max(1, rows.length), 1).setNumberFormat('@'); }
+    catch (e) { /* a brand new sheet may not have the rows yet; the values still land */ }
+  });
+
+  var vals = [head].concat(rows.map(function (r) {
+    return head.map(function (k) {
+      var v = r[k];
+      return (v === undefined || v === null) ? '' : v;
+    });
+  }));
+  sh.getRange(1, 1, vals.length, head.length).setValues(vals);
+  sh.getRange(1, 1, 1, head.length).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  return rows.length;
+}
+
+/**
+ * Owner name, phone, email and address per property.
+ *
+ * owner_directory field names vary between AppFolio accounts, so nothing is hardcoded —
+ * the first key that looks like a phone, an email or an address wins. Guessing a single
+ * name and getting null is how a contact block ends up blank on a served notice.
+ */
+function noticeOwnerContacts_() {
+  var byProp = {};
+  readTab_('Owners').forEach(function (o) {
+    var phone = null, email = insEmailOf_(o), address = null;
+    Object.keys(o).forEach(function (k) {
+      if (!phone && /phone|mobile|cell|tel/i.test(k)) phone = noticeFirstPhone_(o[k]);
+      if (!address && /(^|_)(address|street|mailing)/i.test(k) && !/email/i.test(k)) {
+        var a = String(o[k] || '').trim();
+        if (a) address = a;
+      }
+    });
+    var ids = String(o.properties_owned_i_ds || o.property_i_ds || '').split(',');
+    ids.forEach(function (pid) {
+      pid = pid.trim();
+      if (!pid) return;
+      var cur = byProp[pid] || (byProp[pid] = {});
+      // First owner with a value wins; a co-owner without contact details must not
+      // overwrite the one who has them.
+      if (!cur.phone && phone) cur.phone = phone;
+      if (!cur.email && email) cur.email = email;
+      if (!cur.address && address) cur.address = address;
+    });
+  });
+  return byProp;
+}
+
+/* ============================ HOW IT PRINTS =============================
+ * These three run at the point the row is built, not in the filler.
+ *
+ * WHY HERE. The filler stamps feed values onto the PDF verbatim — that is the whole
+ * design, and it is the right one. It means the feed is the last place anything can be
+ * corrected, and it means one fix serves every form and every notice type instead of
+ * being re-implemented per template.
+ */
+
+/**
+ * "Arias, Cindy C. and Leyva, Cari M."  ->  "Cindy C. Arias, Cari M. Leyva"
+ *
+ * TWO CHANGES, BOTH BECAUSE OF WHAT THE FORM ALREADY SAYS.
+ *
+ * Natural order, because a served notice is addressed to a person, not filed under them.
+ * AppFolio stores "Last, First" for sorting; that is a database convention, not how a
+ * name is written on a document.
+ *
+ * Commas rather than "and", because the notices already read "…and all others in
+ * possession". "A and B and all others in possession" is one "and" too many, and the
+ * comma list is what the forms are laid out for.
+ *
+ * And the entries that are not people are dropped. The tenant list carries rows like
+ * "3 additional occupants" and "Kids" — harmless in a directory, wrong on a legal
+ * document, and the form's own wording already covers them.
+ */
+function formatNoticeName_(raw) {
+  raw = String(raw === null || raw === undefined ? '' : raw).trim();
+  if (!raw) return '';
+  return raw.split(/\s+and\s+|\s*;\s*/i).map(function (p) {
+    p = cleanName_(p).trim();
+    if (!p || NOTICE_FEED.NOT_A_NAME.test(p)) return '';
+    var c = p.indexOf(',');
+    if (c === -1) return p;                       // already "First Last"
+    var last = p.slice(0, c).trim();
+    var first = p.slice(c + 1).trim();
+    if (!last || !first) return (last || first);
+    return (first + ' ' + last).trim();           // "Last, First M." -> "First M. Last"
+  }).filter(String).join(', ');
+}
+
+/**
+ * "235 Market St #Unit 212"  ->  "235 Market St"
+ *
+ * The discrete AppFolio street field is preferred and this is only the fallback, but the
+ * fallback has to be right because a handful of properties only carry the combined label.
+ *
+ * Cut at the '#' first, then at the street suffix — which is what catches
+ * "1362 S Grade Road #South Grade Rd", where the segment after the hash repeats the
+ * street rather than naming a unit.
+ */
+function formatStreet_(raw) {
+  raw = String(raw === null || raw === undefined ? '' : raw).trim();
+  if (!raw) return '';
+  var hash = raw.indexOf('#');
+  var base = (hash > -1 ? raw.slice(0, hash) : raw).trim();
+  var m = base.match(new RegExp('^(.*?\\b(?:' + NOTICE_STREET_TYPES + '))\\b', 'i'));
+  return (m ? m[1] : base).replace(/[,\s]+$/, '').trim();
+}
+
+/**
+ * "235 Market St #212"  ->  "212".  A value that is already just "212" or "A" is kept.
+ *
+ * THE CASE THAT MATTERS: a house with no unit whose '#' segment repeats the street, like
+ * "1362 S Grade Road #South Grade Rd". Returning "Rd" there would print a unit number on
+ * a notice for a property that has none. So a parsed result that still looks like part of
+ * an address is discarded, and the field comes back empty — which is correct, because it
+ * IS empty.
+ */
+function formatUnit_(raw) {
+  raw = String(raw === null || raw === undefined ? '' : raw).trim();
+  if (!raw) return '';
+
+  // Already discrete. A single token with no hash is a unit designator, not an address —
+  // an address always carries a space. Length-capped so a stray sentence cannot qualify.
+  // "212" and "A" pass here; "235 Market St #212" does not.
+  if (raw.length <= 12 && raw.indexOf('#') === -1 && !/\s/.test(raw)) return raw;
+
+  var seg = '';
+  var h = raw.indexOf('#');
+  if (h > -1) seg = raw.slice(h + 1);
+  else {
+    var m = raw.match(/\b(?:Unit|Apt|Ste|Suite)\s*([A-Za-z0-9\-\/]+)\s*$/i);
+    if (m) seg = m[1];
+  }
+  seg = seg.replace(/\b(?:Unit|Apt|Ste|Suite)\b\.?/ig, '').replace(/#/g, '').trim();
+  if (!seg) return '';
+
+  var tokens = seg.split(/\s+/).filter(String);
+  var last = tokens[tokens.length - 1];
+  // The segment repeated the street rather than naming a unit.
+  if (new RegExp('^(?:' + NOTICE_STREET_TYPES + ')$', 'i').test(last)) return '';
+  if (tokens.length > 2) return '';
+  return last;
+}
+
+/** First plausible phone number out of a field that may hold several. */
+function noticeFirstPhone_(v) {
+  var s = String(v === null || v === undefined ? '' : v);
+  var m = s.match(/(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/);
+  return m ? m[0].trim() : null;
+}
+
+/**
+ * Splits "36318 Antoinette Lane Winchester, CA 92596" into its city, state and ZIP.
+ *
+ * AppFolio writes the whole thing as one string with a comma only before the state, so
+ * there is nothing separating the street from the city. The street IS known separately,
+ * though, so removing it from the front leaves the city exactly — no word-count guessing.
+ *
+ *   "7056 Park Mesa Way Unit 41 San Diego, CA 92111"
+ *    minus street "7056 Park Mesa Way"   -> "Unit 41 San Diego"
+ *    minus the unit designator            -> "San Diego"
+ *
+ * Anything this cannot read returns blanks, which become a named gap. A guessed city on a
+ * notice of entry is worse than a refusal to print one.
+ */
+function noticeSplitCityStateZip_(full, street) {
+  var out = { city: '', state: '', zip: '' };
+  var s = String(full === null || full === undefined ? '' : full).trim();
+  if (!s) return out;
+
+  var m = s.match(/^(.*),\s*([A-Za-z]{2})\.?\s+(\d{5})(?:-\d{4})?\s*$/);
+  if (!m) return out;
+  out.state = m[2].toUpperCase();
+  out.zip = m[3];
+
+  var head = m[1].trim();
+  var st = String(street === null || street === undefined ? '' : street).trim();
+
+  // THE STREET MUST MATCH, or we stop here. Without it there is nothing separating the
+  // street from the city, and the only alternative is counting words off the end — which
+  // gets "Bonita Canyon Road Bonita" wrong in the direction that looks plausible.
+  if (!st || head.toLowerCase().indexOf(st.toLowerCase()) !== 0) return out;
+  head = head.slice(st.length).trim();
+
+  // Drop a unit designator left behind between the street and the city. It comes in two
+  // shapes: labelled ("Unit 41") and bare ("4281 Lowell St 8 La Mesa"). A bare one is only
+  // removed when the token carries a digit — no California city name starts with one, so
+  // this cannot eat a real city.
+  head = head.replace(/^(?:#|unit|apt|apartment|ste|suite|no\.?)\s*[-\w]*\s*/i, '').trim();
+  head = head.replace(/^[a-z]?\d+[a-z]?\b\s*/i, '').trim();
+  head = head.replace(/^[,\-–]\s*/, '').trim();
+
+  // A remainder that still carries a digit, or is too long to be a city, means the parse
+  // did not land. Report no city rather than a wrong one.
+  if (!head || head.length > 40 || /\d/.test(head)) return out;
+  out.city = head;
+  return out;
+}
+
+/**
+ * Read-back check. Run after a build to see what the filler will actually offer.
+ *
+ * Three sections, in the order the questions get asked:
+ *   1. how many households are usable, and what is blocking the rest
+ *   2. ONE ROW EXACTLY AS THE FILLER READS IT, with each cell's JavaScript type
+ *   3. anything that came back as a Date but should be text
+ *
+ * Section 2 is the one that settles arguments. `unit_id = Thu Jan 04 1900` was reported
+ * as a column-mapping problem; it is a formatting one, and the only way to tell those
+ * apart is to look at the type of the cell rather than at the value.
+ *
+ * Pass an occupancy id to inspect a specific household.
+ */
+function diagnoseNoticeFeed(occupancyId) {
+  var ss = SpreadsheetApp.openById(NOTICE_FEED.SHEET_ID);
+  var sh = ss.getSheetByName(NOTICE_FEED.TAB);
+  if (!sh || sh.getLastRow() < 2) {
+    Logger.log('No Residents tab yet — run buildNoticeMergeFeed().');
+    return 'No Residents tab yet — run buildNoticeMergeFeed().';
+  }
+  var v = sh.getDataRange().getValues();
+  var h = v.shift().map(String);
+  var iGap = h.indexOf('merge_gaps');
+  var iOcc = h.indexOf('occupancy_id');
+
+  var lines = ['Residents feed: ' + v.length + ' households'];
+
+  // ---- 1 · usable versus blocked ----
+  var byGap = {};
+  v.forEach(function (r) {
+    String(r[iGap] || '').split(',').forEach(function (g) {
+      g = g.trim();
+      if (g) byGap[g] = (byGap[g] || 0) + 1;
+    });
+  });
+  var complete = v.filter(function (r) { return !String(r[iGap] || '').trim(); }).length;
+  lines.push('  ready to fill a notice: ' + complete);
+  lines.push('  blocked by a missing field: ' + (v.length - complete));
+  Object.keys(byGap).sort(function (a, b) { return byGap[b] - byGap[a]; }).forEach(function (g) {
+    lines.push('    ' + g + ': ' + byGap[g]);
+  });
+  if (!Object.keys(byGap).length) lines.push('    nothing missing.');
+
+  // ---- 2 · one row, with types ----
+  var pick = null;
+  if (occupancyId) {
+    for (var i = 0; i < v.length; i++) {
+      if (String(v[i][iOcc]) === String(occupancyId)) { pick = v[i]; break; }
+    }
+    if (!pick) lines.push('\n  No household with occupancy_id ' + occupancyId + '.');
+  }
+  if (!pick) pick = v[0];
+
+  if (pick) {
+    lines.push('\nOne row, exactly as the filler reads it:');
+    h.forEach(function (k, i) {
+      if (!k) return;
+      var cell = pick[i];
+      var type = (cell instanceof Date) ? 'DATE'
+               : (cell === '' || cell === null) ? 'empty' : typeof cell;
+      var shown = (cell instanceof Date) ? cell.toString() : String(cell);
+      if (shown.length > 60) shown = shown.slice(0, 57) + '...';
+      var flag = (cell instanceof Date && NOTICE_FEED.TEXT_COLS.indexOf(k) > -1)
+        ? '   <-- COERCED. This prints as a full date string on a notice.' : '';
+      lines.push('  ' + pad_(k, 20) + pad_(type, 8) + shown + flag);
+    });
+  }
+
+  // ---- 3 · coercion sweep across every row ----
+  var coerced = {};
+  v.forEach(function (r) {
+    h.forEach(function (k, i) {
+      if (NOTICE_FEED.TEXT_COLS.indexOf(k) === -1) return;
+      if (r[i] instanceof Date) coerced[k] = (coerced[k] || 0) + 1;
+    });
+  });
+  var bad = Object.keys(coerced);
+  lines.push('');
+  if (bad.length) {
+    lines.push('COERCED CELLS — Sheets turned these into dates:');
+    bad.forEach(function (k) { lines.push('  ' + k + ': ' + coerced[k] + ' rows'); });
+    lines.push('  Re-run buildNoticeMergeFeed(). It now pins these columns to plain text ' +
+               'before the values land.');
+  } else {
+    lines.push('No coerced cells. Every id and date column is plain text.');
+  }
+
+  Logger.log(lines.join('\n'));
+  return lines.join('\n');
+}
+
+/** Left-pads a label so the diagnostic reads as columns rather than a wall. */
+function pad_(s, n) {
+  s = String(s === null || s === undefined ? '' : s);
+  while (s.length < n) s += ' ';
+  return s;
+}
