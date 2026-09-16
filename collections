@@ -1,0 +1,317 @@
+/**
+ * WeLease Pipeline — COLLECTIONS  v1.0.0 · 2026-08-06
+ * Requires Core.gs, Shared.gs.
+ *
+ * Every dollar owed to WeLease, or stuck inside it, in one place.
+ *
+ * FOUR SOURCES, ONE VIEW:
+ *   1. Vendor bills unpaid past 30 days       aged_payables_summary
+ *   2. Bills stalled awaiting owner approval  bill_detail.days_pending_approval
+ *   3. Owner accounts that cannot cover them  trust_account_balance
+ *   4. Former residents with balances         Delinquency_Aged (moved here from Delinquency)
+ *
+ * WHY TOGETHER: they are usually the same problem seen from different ends. An unpaid
+ * vendor bill is normally not an oversight — it is an owner account without the funds
+ * to pay it. Split across three views nobody connects them; side by side the cause is
+ * obvious and one call fixes several rows.
+ *
+ * CALIFORNIA: reporting only. Collections activity, notices and eviction records are
+ * compliance-sensitive and legally governed. Nothing here triggers an action.
+ */
+
+var COLLECT = {
+  BILL_AGED_DAYS: 30,
+  APPROVAL_STALLED_DAYS: 14,
+  LOOKBACK_DAYS: 400,
+  // An owner is short when available funds will not cover what is already owed.
+  // Reserve is deliberately included — spending it is a decision, not a default.
+  SHORTFALL_INCLUDES_RESERVE: true
+};
+
+// ============================================================ BUILD
+
+function buildCollections() {
+  var t0 = new Date().getTime();
+  var t = ymd_(today_());
+  var from = ymd_(addDays_(today_(), -COLLECT.LOOKBACK_DAYS));
+  var pm = pmLookup_();
+
+  // ---- 1 & 2. bills ----------------------------------------------------------
+  var bills = [], billsFailed = false;
+  try {
+    // Windowed, not paginated. 400 days of bills is well over the 5,000-row page limit,
+    // and paging depends on the server accepting a second request — which it was refusing
+    // with a 404. Each 90-day window is its own first-page POST, the request shape that
+    // has always worked, so this does not rely on that being fixed.
+    bills = afReportWindowed_('bill_detail', {}, 'occurred_on_from', 'occurred_on_to',
+                              from, t, { windowDays: 90 });
+  } catch (e) { billsFailed = true; logError_('appfolio', 'bill_detail', e.message); }
+
+  // An empty bill_detail is worth saying out loud rather than rendering as a clean zero.
+  // WeLease pays vendors every week, so "no bills in the last " + LOOKBACK + " days" is
+  // a broken pull, not a quiet month — and the two used to look identical on the view.
+  if (!bills.length) {
+    logError_('appfolio', 'bill_detail',
+      billsFailed
+        ? 'The pull failed outright, so vendor bill and approval lists are EMPTY — they ' +
+          'are not zero. Check the failing URL logged just above.'
+        : 'The pull succeeded but returned no rows for ' + from + ' to ' + t + '. For a ' +
+          'portfolio this size that is almost certainly a filter or permission problem, ' +
+          'not an empty period — the vendor-bill lists below will render blank.');
+  }
+
+  var aged = [];
+  try {
+    aged = afReport_('aged_payables_summary', { occurred_on_to: t }, { maxPages: 10 });
+  } catch (e) { logError_('appfolio', 'aged_payables_summary', e.message); }
+  sleepFor_('appfolio');
+
+  // ---- 3. owner funds --------------------------------------------------------
+  var trust = [];
+  try {
+    trust = afReport_('trust_account_balance', { occurred_on_to: t }, { maxPages: 10 });
+  } catch (e) { logError_('appfolio', 'trust_account_balance', e.message); }
+
+  var fundsByProp = {};
+  inScopeIncludingInactive_(trust).forEach(function (r) {
+    var avail = num_(r.available_funds) || 0;
+    var unpaid = num_(r.unpaid_bills_amount) || 0;
+    var reserve = num_(r.reserve_amount) || 0;
+    var usable = COLLECT.SHORTFALL_INCLUDES_RESERVE ? avail - reserve : avail;
+    fundsByProp[String(r.property_id)] = {
+      owner: r.owner, owner_ids: r.owner_ids, available: avail, unpaid: unpaid,
+      reserve: reserve, usable: usable, shortfall: round2_(unpaid - usable)
+    };
+  });
+
+  // ---- unpaid vendor bills, aged ---------------------------------------------
+  var unpaidRows = dropTPO_(bills).filter(function (b) {
+    var unpaid = num_(b.unpaid);
+    if (unpaid === null || unpaid <= 0) return false;
+    var due = ymd_(b.due_date) || ymd_(b.bill_date);
+    return due && daysBetween_(due, t) > COLLECT.BILL_AGED_DAYS;
+  }).map(function (b) {
+    var due = ymd_(b.due_date) || ymd_(b.bill_date);
+    var age = daysBetween_(due, t);
+    var f = fundsByProp[String(b.property_id)] || {};
+    return {
+      category: 'Vendor bill unpaid',
+      address: addr_(b), property_id: b.property_id,
+      pm_group: pmOf_(pm, b.property_id, b.unit_id),
+      party: b.payee_name || '', owner: f.owner || '',
+      reference: b.reference_number || b.txn_id || '',
+      dated: due, days_overdue: age,
+      amount: round2_(num_(b.unpaid)),
+      // The bill is the symptom. Owner funds are usually the cause.
+      cause: (f.usable !== undefined && f.usable < num_(b.unpaid))
+        ? 'owner account short by ' + money_(f.shortfall)
+        : 'funds available — process it',
+      description: String(b.description || '').slice(0, 70)
+    };
+  }).sort(function (a, b) { return b.days_overdue - a.days_overdue; });
+
+  // ---- bills stalled awaiting approval ---------------------------------------
+  var stalledRows = dropTPO_(bills).filter(function (b) {
+    var st = String(b.approval_status || '').toLowerCase();
+    if (st.indexOf('approv') === 0 && st.indexOf('pending') === -1) return false;
+    if (/reject|cancel/.test(st)) return false;
+    var d = num_(b.days_pending_approval);
+    return d !== null && d > COLLECT.APPROVAL_STALLED_DAYS;
+  }).map(function (b) {
+    var f = fundsByProp[String(b.property_id)] || {};
+    return {
+      category: 'Awaiting owner approval',
+      address: addr_(b), property_id: b.property_id,
+      pm_group: pmOf_(pm, b.property_id, b.unit_id),
+      party: b.payee_name || '', owner: f.owner || '',
+      reference: b.reference_number || b.txn_id || '',
+      dated: ymd_(b.bill_date), days_overdue: num_(b.days_pending_approval),
+      amount: round2_(num_(b.unpaid) || num_(b.paid)),
+      cause: 'waiting on ' + (b.next_approvers || 'the owner') +
+             ' — chase the person, not the money',
+      description: String(b.description || b.work_order_issue || '').slice(0, 70)
+    };
+  }).sort(function (a, b) { return b.days_overdue - a.days_overdue; });
+
+  // ---- owner accounts that cannot cover what they owe ------------------------
+  var shortRows = Object.keys(fundsByProp).map(function (pid) {
+    var f = fundsByProp[pid];
+    if (f.shortfall <= 0) return null;
+    return {
+      category: 'Owner account short',
+      address: null, property_id: pid,
+      pm_group: pmOf_(pm, pid, null),
+      party: f.owner || '', owner: f.owner || '',
+      reference: f.owner_ids || '',
+      dated: t, days_overdue: null,
+      amount: f.shortfall,
+      cause: money_(f.unpaid) + ' in bills against ' + money_(f.usable) + ' usable' +
+             (f.reserve ? ' (after a ' + money_(f.reserve) + ' reserve)' : ''),
+      description: 'Available ' + money_(f.available) + ' · unpaid ' + money_(f.unpaid)
+    };
+  }).filter(function (x) { return x; })
+    .sort(function (a, b) { return b.amount - a.amount; });
+
+  // address needs a property lookup — trust_account_balance carries one, use it
+  var propAddr = {};
+  trust.forEach(function (r) { propAddr[String(r.property_id)] = addr_(r); });
+  shortRows.forEach(function (r) { r.address = propAddr[String(r.property_id)] || '—'; });
+
+  // ---- former residents ------------------------------------------------------
+  var live = liveTenancy_();
+  var formerRows = inScopeIncludingInactive_(readTab_('Delinquency_Aged')).filter(function (r) {
+    return !isActiveTenancy_(r, live) && (num_(r.amount_receivable) || 0) > 0;
+  }).map(function (r) {
+    var mo = moveOutDateOf_(r, live) || ymd_(r.move_out);
+    return {
+      category: 'Former resident',
+      address: addr_(r), property_id: r.property_id,
+      pm_group: pmOf_(pm, r.property_id, r.unit_id),
+      party: r.name || '', owner: '',
+      reference: r.occupancy_id || '',
+      dated: mo, days_overdue: mo ? daysBetween_(mo, t) : null,
+      amount: round2_(num_(r.amount_receivable)),
+      cause: r.in_collections ? (r.collections_agency || 'with an agency')
+                              : 'NOT placed with an agency — recoverable',
+      description: String(r.delinquency_notes || '').slice(0, 70)
+    };
+  }).sort(function (a, b) { return b.amount - a.amount; });
+
+  var all = unpaidRows.concat(stalledRows, shortRows, formerRows);
+  writeTab_('Collections', all.length ? all : [{ note: 'Nothing outstanding' }]);
+
+  function sum(rows) { return round2_(rows.reduce(function (s, r) { return s + (r.amount || 0); }, 0)); }
+  var summary = {
+    run_date: nowStamp_(),
+    vendor_bills_count: unpaidRows.length,     vendor_bills_amount: sum(unpaidRows),
+    stalled_approvals_count: stalledRows.length, stalled_approvals_amount: sum(stalledRows),
+    owners_short_count: shortRows.length,      owners_short_amount: sum(shortRows),
+    former_residents_count: formerRows.length, former_residents_amount: sum(formerRows),
+    total_count: all.length, total_amount: sum(all),
+    // The number that matters: bills we cannot pay because the owner has no funds.
+    blocked_on_owner_funds: unpaidRows.filter(function (r) {
+      return String(r.cause).indexOf('short by') !== -1; }).length
+  };
+  appendTab_('Collections_History', [summary]);
+
+  logRun_('buildCollections', 'appfolio', 'Collections', all.length,
+          new Date().getTime() - t0,
+          'vendor ' + summary.vendor_bills_count + ' · stalled ' + summary.stalled_approvals_count +
+          ' · owners short ' + summary.owners_short_count + ' · former ' +
+          summary.former_residents_count + ' · total ' + money_(summary.total_amount));
+  Logger.log(JSON.stringify(summary, null, 1));
+  return summary;
+}
+
+// ============================================================ DASHBOARD BLOCKS
+
+function collectionsBlocks_(pm) {
+  var rows = readTab_('Collections').filter(function (r) { return r.category; });
+  var B = [];
+
+  function pick(cat, ackList, headers, note, id, sevFn) {
+    var ack = ackSet_(ackList);
+    var list = rows.filter(function (r) {
+      return r.category === cat && !isAcked_(ack, r.reference);
+    }).map(function (r) {
+      return {
+        days: num_(r.amount) || 0, sort: -(num_(r.amount) || 0),
+        pm: r.pm_group || UNASSIGNED, key: r.reference, src: r,
+        cells: [r.address || '—', r.party || '', r.dated || '—',
+                (r.days_overdue === null || r.days_overdue === '') ? '—' : daySpan_(num_(r.days_overdue)),
+                r.cause || '', money_(r.amount)],
+        sev: sevFn(r)
+      };
+    });
+    var total = list.reduce(function (s, r) { return s + (num_(r.days) || 0); }, 0);
+    B.push(block_(cat + ' — ' + money_(total), list, headers, note, id, 'collections', 'Collections'));
+  }
+
+  pick('Vendor bill unpaid', 'collect_vendor',
+    ['Address', 'Vendor', 'Due', 'Overdue', 'Why', 'Amount'],
+    'Unpaid past ' + COLLECT.BILL_AGED_DAYS + ' days. The "why" column tells you whether this ' +
+    'is a processing gap or an owner without funds — those need completely different calls. ' +
+    'An aged vendor bill is also a vendor-relationship risk, not just an accounting one.',
+    'collect_vendor', function (r) { return num_(r.days_overdue) > 60 ? 'bad' : 'warn'; });
+
+  pick('Awaiting owner approval', 'collect_approval',
+    ['Address', 'Vendor', 'Bill date', 'Pending', 'Waiting on', 'Amount'],
+    'Stalled more than ' + COLLECT.APPROVAL_STALLED_DAYS + ' days. Work is quoted or done and ' +
+    'nothing can proceed. Chase the person, not the money.',
+    'collect_approval', function (r) { return num_(r.days_overdue) > 30 ? 'bad' : 'warn'; });
+
+  pick('Owner account short', 'collect_owner',
+    ['Address', 'Owner', 'As of', 'Age', 'Shortfall detail', 'Short by'],
+    'Unpaid bills exceed usable funds, after reserve. This is the ROOT CAUSE behind most of ' +
+    'the unpaid vendor bills above — fix it here and several rows there clear at once.',
+    'collect_owner', function (r) { return num_(r.amount) > 1000 ? 'bad' : 'warn'; });
+
+  pick('Former resident', 'collect_former',
+    ['Address', 'Resident', 'Moved out', 'Since', 'Collections status', 'Balance'],
+    '"NOT placed with an agency" are the recoverable ones — money nobody is working. ' +
+    'Held apart from current delinquency so it never distorts that rate. ' +
+    'CALIFORNIA: collections and eviction records are compliance-sensitive; reporting only.',
+    'collect_former', function (r) {
+      return (num_(r.days_overdue) > 180 || /agency/.test(String(r.cause))) ? 'bad' : 'warn'; });
+
+  return B;
+}
+
+/** Summary panel above the collections tables. */
+function collectionsPanel_() {
+  var hist = readTab_('Collections_History');
+  if (!hist.length) {
+    return '<section class="card"><h2>Collections</h2>' +
+      emptyState_('waiting', {
+        title: 'No collections data yet',
+        body: 'Not the same as having nothing in collections \u2014 the figures have not ' +
+              'been built.',
+        adminAction: 'The <code>Collections</code> tab is empty. Run ' +
+          '<code>buildCollections()</code>.'
+      }) + '</section>';
+  }
+  var s = hist[hist.length - 1];
+  var prev = hist.length > 1 ? hist[hist.length - 2] : null;
+
+  function card(amount, count, label, tone) {
+    var d = '';
+    if (prev) {
+      var was = num_(prev[label.key]) || 0, now = num_(s[label.key]) || 0;
+      var diff = now - was;
+      if (diff) d = '<span class="sc-s ' + (diff > 0 ? 'bad' : 'good') + '">' +
+        (diff > 0 ? '▲' : '▼') + money_(Math.abs(diff)) + ' vs last run</span>';
+    }
+    return '<div class="sc ' + tone + '"><span class="sc-n">' + money_(amount) + '</span>' +
+      '<span class="sc-l">' + label.text + '</span>' +
+      '<span class="sc-s">' + count + ' item(s)</span>' + d + '</div>';
+  }
+
+  var h = ['<section class="card"><h2>Collections</h2>'];
+  h.push('<p class="note">Every dollar owed to WeLease or stuck inside it. These four are ' +
+    'usually the same problem from different ends — an unpaid vendor bill is normally an ' +
+    'owner account without the funds, not an oversight. Side by side, one call often clears ' +
+    'several rows.</p>');
+  h.push('<div class="cards">');
+  h.push(card(s.vendor_bills_amount, s.vendor_bills_count,
+    { text: 'Vendor bills unpaid', key: 'vendor_bills_amount' },
+    num_(s.vendor_bills_count) ? 'bad' : 'clear'));
+  h.push(card(s.stalled_approvals_amount, s.stalled_approvals_count,
+    { text: 'Stalled approvals', key: 'stalled_approvals_amount' },
+    num_(s.stalled_approvals_count) ? 'warn' : 'clear'));
+  h.push(card(s.owners_short_amount, s.owners_short_count,
+    { text: 'Owner accounts short', key: 'owners_short_amount' },
+    num_(s.owners_short_count) ? 'bad' : 'clear'));
+  h.push(card(s.former_residents_amount, s.former_residents_count,
+    { text: 'Former residents owing', key: 'former_residents_amount' },
+    num_(s.former_residents_count) ? 'warn' : 'clear'));
+  h.push(card(s.total_amount, s.total_count, { text: 'Total exposure', key: 'total_amount' }, ''));
+  h.push('</div>');
+
+  if (num_(s.blocked_on_owner_funds)) {
+    h.push('<p class="note"><strong>' + s.blocked_on_owner_funds + ' vendor bills are blocked ' +
+      'on owner funds</strong>, not on processing. Those will not clear by working the vendor ' +
+      'list — they clear when the owner account is funded.</p>');
+  }
+  h.push('</section>');
+  return h.join('');
+}
