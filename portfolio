@@ -1,0 +1,1265 @@
+/**
+ * WeLease Pipeline — PORTFOLIO  v1.0.0 · 2026-08-05
+ * Requires Core_v2.gs, Jobs.gs, Metrics.gs.
+ *
+ * Two things the metric layer could not do:
+ *
+ *   1. PORTFOLIO SUMMARY — the point-in-time tiles (total units, active vs
+ *      non-revenue, market rent on active and occupied units, average rent).
+ *
+ *   2. DOOR HISTORY — new doors, lost doors, total doors, growth and churn by month.
+ *      This is REBUILT FROM SOURCE, not accumulated going forward:
+ *        unit_directory.created_on          -> when a door arrived
+ *        property_directory.management_start_date / management_end_date
+ *                                           -> when a property joined or left
+ *        property_directory.management_end_reason
+ *                                           -> why we lost it
+ *      So the entire history exists today. No waiting for snapshots to pile up.
+ *
+ * Run buildPortfolio() after rebuildAll().
+ */
+
+// ============================================================ SUMMARY TILES
+
+function buildPortfolioSummary() {
+  var t0 = new Date().getTime();
+  // TPO = tenant placement only. WeLease placed the resident but does not manage the
+  // property, so these are not doors and must not inflate any count.
+  var allUnits = readTab_('Unit_Directory');
+  var units = dropTPO_(allUnits);
+  var tpoCount = allUnits.length - units.length;
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+
+  // Non-revenue = a door we manage that cannot earn rent (owner-occupied, down,
+  // model, storage). AppFolio flags this on the unit, not the lease.
+  function isNonRevenue(u) {
+    var rentable = String(u.rentable === null || u.rentable === undefined ? '' : u.rentable).toLowerCase();
+    var rs = String(u.rent_status || '').toLowerCase();
+    if (rentable === 'no' || rentable === 'false') return true;
+    if (/non.?revenue|not rentable|down|model|storage|owner occupied/.test(rs)) return true;
+    return false;
+  }
+  var nonRevenue = units.filter(isNonRevenue);
+  var active = units.length - nonRevenue.length;
+
+  var byUnit = indexBy_(rr, 'unit_id');
+  function mkt(u) {
+    var r = byUnit[u.unit_id];
+    return num_((r && r.market_rent) || u.market_rent || u.computed_market_rent) || 0;
+  }
+  var activeUnits = units.filter(function (u) { return !isNonRevenue(u); });
+  var marketActive = activeUnits.reduce(function (s, u) { return s + mkt(u); }, 0);
+
+  var occupied = rr.filter(function (r) {
+    return String(r.status || '').toLowerCase().indexOf('current') !== -1;
+  });
+  var marketOccupied = occupied.reduce(function (s, r) { return s + (num_(r.market_rent) || 0); }, 0);
+  var rentCharged = occupied.reduce(function (s, r) { return s + (num_(r.rent) || 0); }, 0);
+  var rents = occupied.map(function (r) { return num_(r.rent); })
+                      .filter(function (x) { return x !== null && x > 0; });
+
+  var row = {
+    as_of: ymd_(today_()),
+    total_units: units.length,
+    tpo_units_excluded: tpoCount,
+    active_units: active,
+    non_revenue_units: nonRevenue.length,
+    occupied_units: occupied.length,
+    market_rent_active: round2_(marketActive),
+    market_rent_occupied: round2_(marketOccupied),
+    rent_charged: round2_(rentCharged),
+    average_rent: rents.length ? round2_(rents.reduce(function (a, b) { return a + b; }, 0) / rents.length) : null,
+    median_rent: median_(rents),
+    // Every dollar of market rent an active unit is not currently earning.
+    revenue_gap: round2_(marketActive - rentCharged),
+    status_breakdown: Object.keys(groupBy_(rr, function (r) { return r.status || 'unknown'; }))
+      .map(function (k) { return k; }).join(' · ')
+  };
+
+  writeTab_('Portfolio_Summary', [row]);
+  appendTab_('Portfolio_Summary_History', [row]);
+  logRun_('buildPortfolioSummary', 'derived', 'Portfolio_Summary', 1, new Date().getTime() - t0,
+    'units=' + units.length + ' active=' + active + ' non-revenue=' + nonRevenue.length +
+    ' · TPO excluded=' + tpoCount);
+  Logger.log(JSON.stringify(row, null, 1));
+  return row;
+}
+
+// ============================================================ DOOR HISTORY
+
+/**
+ * Monthly door movement, rebuilt from creation and management dates.
+ *
+ * A "door" is a unit under management. It arrives when the unit is created (or its
+ * property's management starts, whichever is knowable) and leaves when its property's
+ * management ends. Resident move-outs are NOT lost doors — the unit stays under
+ * management. Conflating the two is the classic error here.
+ */
+function buildDoorHistory(monthsBack) {
+  var t0 = new Date().getTime();
+  monthsBack = monthsBack || 60;
+
+  /**
+   * DOORS ARE COUNTED PROPERTY-FIRST.
+   *
+   * management_end_date lives on the PROPERTY row. There is no unit-level equivalent —
+   * units can only be hidden. So a departure is a property-level event, and any model
+   * that goes looking for an end date on a unit finds nothing and reports no churn.
+   *
+   * Worse, AppFolio hides an offboarded property, and hidden records are absent from
+   * the default report. The property carrying the end date had already dropped out of
+   * the pull. Properties_All / Unit_Directory_All are the same two reports fetched
+   * with property_visibility:"all" so history can see them.
+   *
+   * The invariant that keeps the running balance honest: whatever door count a property
+   * contributes on arrival is exactly what it gives back on departure.
+   */
+  var props = readTab_('Properties_All');
+  var units = readTab_('Unit_Directory_All');
+  var fallback = '';
+  if (!props.length) {
+    props = readTab_('Properties_Units');
+    units = readTab_('Unit_Directory');
+    fallback = 'Properties_All is empty, so door history fell back to the visible-only ' +
+               'pull and departures are undercounted. Re-run rebuildAll().';
+  }
+  props = inScopeIncludingInactive_(props);
+  units = inScopeIncludingInactive_(units);
+
+  var pm = pmLookup_();
+  var propById = indexBy_(props, 'property_id');
+
+  var unitsByProp = {};
+  units.forEach(function (u) {
+    if (!u.property_id) return;
+    (unitsByProp[String(u.property_id)] = unitsByProp[String(u.property_id)] || []).push(u);
+  });
+
+  // Arrival, per property. Unit created_on where the unit is visible, because a
+  // property that grew from two doors to four did not gain both on day one. Where the
+  // property declares more units than we can see, the shortfall arrives with the
+  // property — that is the hidden-unit recovery.
+  var added = {}, lost = {}, lostReason = {}, doorsOf = {}, placedUnits = {};
+  var hiddenRecovered = 0, endedProps = 0;
+
+  props.forEach(function (p) {
+    var id = String(p.property_id || '');
+    if (!id) return;
+    var mine = unitsByProp[id] || [];
+    var start = ymd_(p.management_start_date);
+    var startM = monthKey_(start);
+    var placed = 0;
+    var perUnitMonths = [];
+
+    mine.forEach(function (u) {
+      var a = monthKey_(ymd_(u.created_on) || start);
+      if (!a) return;
+      added[a] = (added[a] || 0) + 1;
+      perUnitMonths.push(a);
+      placed++;
+    });
+
+    var shortfall = Math.max(0, (num_(p.units) || 0) - mine.length);
+    if (shortfall && startM) {
+      hiddenRecovered += shortfall;
+      added[startM] = (added[startM] || 0) + shortfall;
+      placed += shortfall;
+      for (var k = 0; k < shortfall; k++) perUnitMonths.push(startM);
+    }
+
+    doorsOf[id] = placed;
+    placedUnits[id] = perUnitMonths;
+
+    // Only doors actually placed in a month can be taken away again.
+    var endM = monthKey_(ymd_(p.management_end_date));
+    if (endM && placed) {
+      endedProps++;
+      lost[endM] = (lost[endM] || 0) + placed;
+      var reason = p.management_end_reason || 'not recorded';
+      lostReason[endM] = lostReason[endM] || {};
+      lostReason[endM][reason] = (lostReason[endM][reason] || 0) + placed;
+    }
+  });
+
+  var months = [];
+  var cursor = new Date();
+  cursor.setDate(1);
+  for (var i = monthsBack - 1; i >= 0; i--) {
+    var d = new Date(cursor.getTime());
+    d.setMonth(d.getMonth() - i);
+    months.push(Utilities.formatDate(d, CFG.TZ, 'yyyy-MM'));
+  }
+
+  // Opening balance: doors that arrived before the window and had not yet left.
+  var first = months[0];
+  var opening = 0;
+  props.forEach(function (p) {
+    var id = String(p.property_id || '');
+    if (!id) return;
+    var endM = monthKey_(ymd_(p.management_end_date));
+    if (endM && endM < first) return;                  // left before the window opened
+    (placedUnits[id] || []).forEach(function (a) { if (a < first) opening++; });
+  });
+
+  var running = opening;
+  var rows = months.map(function (m) {
+    var add = added[m] || 0, rm = lost[m] || 0;
+    var start = running;
+    running = running + add - rm;
+    var reasons = lostReason[m]
+      ? Object.keys(lostReason[m]).map(function (k) { return k + ': ' + lostReason[m][k]; }).join(' · ')
+      : null;
+    return {
+      month: m,
+      doors_start: start,
+      new_doors: add,
+      lost_doors: rm,
+      net_change: add - rm,
+      total_doors: running,
+      growth_rate_pct: start ? round2_(add / start * 100) : null,
+      churn_rate_pct: start ? round2_(rm / start * 100) : null,
+      net_growth_pct: start ? round2_((add - rm) / start * 100) : null,
+      lost_reasons: reasons
+    };
+  });
+
+  writeTab_('Door_History', rows);
+
+  // by PM group, current state
+  var byGroup = {};
+  var todayY = ymd_(today_());
+  units.forEach(function (u) {
+    var p = propById[String(u.property_id)];
+    var l = p ? ymd_(p.management_end_date) : null;
+    if (l && l <= todayY) return;                      // already gone
+    var g = pm[u.property_id] || UNASSIGNED;
+    byGroup[g] = byGroup[g] || { pm_group: g, units: 0, properties: {}, market_rent: 0 };
+    byGroup[g].units++;
+    byGroup[g].properties[u.property_id] = true;
+    byGroup[g].market_rent += num_(u.market_rent) || num_(u.computed_market_rent) || 0;
+  });
+
+  var owners = readTab_('Owners');
+  var ownerByGroup = {};
+  owners.forEach(function (o) {
+    // AppFolio's odd field name: properties_owned_i_ds, comma separated
+    var ids = String(o.properties_owned_i_ds || '').split(',').map(function (x) { return x.trim(); })
+      .filter(function (x) { return x; });
+    var seen = {};
+    ids.forEach(function (pid) {
+      var g = pm[pid];
+      if (!g || seen[g]) return;
+      seen[g] = true;
+      ownerByGroup[g] = (ownerByGroup[g] || 0) + 1;
+    });
+  });
+
+  var groupRows = Object.keys(byGroup).sort().map(function (g) {
+    return {
+      pm_group: g,
+      properties: Object.keys(byGroup[g].properties).length,
+      units: byGroup[g].units,
+      owners: ownerByGroup[g] || 0,
+      market_rent: round2_(byGroup[g].market_rent),
+      units_per_property: round1_(byGroup[g].units / Object.keys(byGroup[g].properties).length)
+    };
+  });
+  writeTab_('Portfolio_By_Group', groupRows);
+
+  var last = rows[rows.length - 1];
+  var lostTotal = rows.reduce(function (a, r) { return a + (r.lost_doors || 0); }, 0);
+
+  logRun_('buildDoorHistory', 'derived', 'Door_History', rows.length, new Date().getTime() - t0,
+    'total_doors=' + (last ? last.total_doors : '?') + ' · groups=' + groupRows.length +
+    ' · opening=' + opening + ' · lost doors ' + lostTotal + ' from ' + endedProps +
+    ' ended propert' + (endedProps === 1 ? 'y' : 'ies') + ' · ' + hiddenRecovered +
+    ' door(s) recovered from properties whose units are hidden' +
+    (fallback ? ' · DEGRADED' : ''));
+
+  if (fallback) logError_('portfolio', 'door history', fallback);
+  if (!endedProps) {
+    logError_('portfolio', 'door history',
+      'No property carries a management_end_date, so churn reads 0%. Either nothing has ' +
+      'finished offboarding, or property_visibility:"all" is not returning hidden ' +
+      'properties. Run diagnoseDoorHistory() — it separates the two.');
+  }
+
+  Logger.log('Door history: ' + rows.length + ' months. Current doors: ' +
+             (last ? last.total_doors : '?') + '. PM groups: ' + groupRows.length +
+             '. Lost doors: ' + lostTotal + '.');
+  return { months: rows.length, current_doors: last ? last.total_doors : null,
+           groups: groupRows.length, lost_doors: lostTotal,
+           ended_properties: endedProps, hidden_doors_recovered: hiddenRecovered,
+           source: fallback ? 'visible-only (degraded)' : 'all (including hidden)' };
+}
+
+// ============================================================ LEASING ACTIVITY
+
+/** Monthly leasing activity — applications, move-ins, move-outs, notices, renewals. */
+function buildLeasingActivity() {
+  var t0 = new Date().getTime();
+  var apps = inScopeIncludingInactive_(readTab_('Applications'));
+  var tick = readTab_('Tenant_Tickler');              // move-ins include TPO by policy
+  var ren = inScopeIncludingInactive_(readTab_('Renewals'));
+
+  var m = {};
+  function bump(key, field) {
+    if (!key) return;
+    m[key] = m[key] || { month: key, applications: 0, approved: 0, move_ins: 0,
+                         move_outs: 0, notices: 0, renewals: 0 };
+    m[key][field]++;
+  }
+
+  apps.forEach(function (a) {
+    var k = monthKey_(a.received);
+    bump(k, 'applications');
+    if (/approv|convert/i.test(String(a.application_status || ''))) bump(k, 'approved');
+  });
+  tick.forEach(function (r) {
+    var e = String(r.event || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (e.indexOf('notice') !== -1) { bump(monthKey_(r.occurred_date), 'notices'); return; }
+    if (e.indexOf('movein') !== -1) bump(monthKey_(r.move_in_date), 'move_ins');
+    if (e.indexOf('moveout') !== -1) bump(monthKey_(r.move_out_date), 'move_outs');
+  });
+  ren.forEach(function (r) { bump(monthKey_(r.lease_start), 'renewals'); });
+
+  var rows = Object.keys(m).sort().map(function (k) {
+    var r = m[k];
+    r.approval_rate_pct = r.applications ? round1_(r.approved / r.applications * 100) : null;
+    r.net_flow = r.move_ins - r.move_outs;
+    return r;
+  });
+
+  writeTab_('Leasing_Activity', rows);
+  logRun_('buildLeasingActivity', 'derived', 'Leasing_Activity', rows.length,
+          new Date().getTime() - t0, 'months=' + rows.length);
+  return rows.length;
+}
+
+// ============================================================ RENT TIMING
+
+/**
+ * WHEN residents pay, not just whether they owe.
+ *
+ * A past-due snapshot pulled on the 5th says almost nothing — most of that balance is
+ * people inside the grace period. What matters operationally is the shape: how many
+ * paid on the 1st, how many drifted to the 3rd, how many are still out after the 5th.
+ *
+ * WeLease bands (Frank, 2026-08-05):
+ *   GREEN   paid on the 1st
+ *   YELLOW  balance outstanding, today is the 2nd to the 5th
+ *   RED     still delinquent after the 5th
+ *
+ * Source: receivables_activity.txn_receipt_date. Per occupancy per month we take the
+ * EARLIEST receipt — the day they started paying. Partial payments are a separate
+ * question and are not modelled here.
+ */
+var RENT_BANDS = { green_day: 1, yellow_through: 5 };
+
+function buildRentTiming() {
+  var t0 = new Date().getTime();
+  var rec = inScopeIncludingInactive_(readTab_('Receivables_Activity'));
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+  var pm = pmLookup_();
+
+  // Monthly rent per household, so a receipt can be judged against what is owed.
+  var rentByOcc = {};
+  rr.forEach(function (r) {
+    if (r.occupancy_id) rentByOcc[r.occupancy_id] = num_(r.rent) || 0;
+  });
+
+  // WHICH RECEIPT IS RENT.
+  // receivables_activity carries every receipt — deposits, utilities, late fees, pet
+  // fees. Treating the earliest of those as "rent paid" put most residents after the
+  // 5th, which is wrong. Instead: walk a household's receipts for the month in date
+  // order and mark the day their cumulative total reaches RENT_THRESHOLD of the rent.
+  // Amount-based, so it does not depend on how remarks were typed.
+  var RENT_THRESHOLD = 0.5;
+
+  // ============================================================ PREPAYMENT
+  //
+  // THIS IS THE BUG FRANK REPORTED SIX TIMES, AND HE WAS RIGHT EVERY TIME.
+  //
+  // Most of WeLease's residents pay BEFORE the month they are paying for. The September
+  // general ledger settles it: on 1 September, $894,431 was moved out of account 2300
+  // Prepayment and applied to rent, across 419 lines and 172 distinct payers — money
+  // that arrived in August. Only 135 payers sent cash during 1-2 September.
+  //
+  // The receipts feed dates a payment when the money ARRIVED, not the month it pays for.
+  // So a resident who paid on 28 August filed under 2026-08, and September saw no rent
+  // receipt from them at all. They then landed in one of two places, both wrong:
+  //
+  //   · no September receipt at all  -> dropped from the month entirely
+  //   · a small September receipt for RBP, pet rent or utilities (there are 422 Resident
+  //     Benefits Package lines this month) -> pulled INTO the month, measured against
+  //     full rent, found short, and counted as `short_paid`, which `after_5th_pct` adds
+  //     to "after the 5th".
+  //
+  // The second one is the killer. Paying early and then paying a $50 benefits charge on
+  // time got a resident reported as paying late. Roughly 290 of 404 households owe
+  // nothing at all today; the dashboard was calling 72% of them late. That number was
+  // very nearly the exact complement of the truth.
+  //
+  // THE FIX: a receipt in the closing days of the previous month counts toward this
+  // month, and is recorded as day 0 — "before the 1st" — which is its own bucket rather
+  // than being folded into "on the 1st". Frank asked for that distinction explicitly and
+  // it is the most flattering true thing this chart can say about the portfolio.
+  //
+  // HOW, WITHOUT DOUBLE COUNTING. The obvious fix — also offer a late-month receipt to
+  // the following month — lets one payment satisfy two months. So instead the whole thing
+  // is modelled the way AppFolio's own ledger models it: a rolling balance per household.
+  //
+  // Walk a household's months in order carrying whatever they overpaid. If the carried
+  // credit already covers this month's rent before the month starts, the month is
+  // satisfied on DAY 0 — that is the prepayment, and it is exactly the 2300 Prepayment
+  // account being applied on the 1st. Otherwise walk this month's receipts until the
+  // threshold is reached. Whatever is left over carries forward.
+  //
+  // One dollar is spent once. That is the property the naive version could not hold.
+  var byOccMonth = {};
+  rec.forEach(function (r) {
+    var d = parseDate_(r.txn_receipt_date);
+    if (!d || !r.occupancy_id) return;
+    var amt = num_(r.txn_amount) || 0;
+    if (amt <= 0) return;
+    var k = r.occupancy_id + '|' + monthKey_(r.txn_receipt_date);
+    (byOccMonth[k] = byOccMonth[k] || []).push({ day: d.getDate(), amt: amt });
+  });
+
+  /**
+   * ACCURACY LIMITS OF THE HISTORICAL TREND — read before trusting older months.
+   *
+   * Frank flagged that previous months look wrong. They are, and there are three
+   * separate reasons, all of them structural rather than arithmetic:
+   *
+   * 1. THE RENT FIGURE IS TODAY'S. rentByOcc comes from the current rent roll and is
+   *    applied to every month in history. After a renewal increase, older months get
+   *    judged against a rent that was never charged then, so the threshold is reached
+   *    later — or never — and residents drift into "after the 5th".
+   *
+   * 2. FORMER RESIDENTS HAVE NO RENT ON FILE AT ALL. Anyone who moved out is absent
+   *    from the current rent roll, so every one of their historical months fell to the
+   *    largest-single-receipt fallback. In a move-out month that receipt is often a
+   *    deposit refund or a final balance on an arbitrary day.
+   *
+   * 3. NON-PAYERS WERE INVISIBLE. A household that never reached the threshold was
+   *    dropped from the month entirely rather than counted as unpaid, so every
+   *    percentage was computed over payers only.
+   *
+   * Fixed here: months are restricted to occupancies whose rent is actually known, the
+   * fallback is removed rather than guessed, and households that paid nothing are
+   * counted in their own bucket instead of vanishing. What is NOT fixed is (1) — the
+   * rent in force per historical month is not stored anywhere in this pipeline, so the
+   * trend is published with a coverage figure and the chart says so.
+   *
+   * Frank's specific case — utilities posted after the 5th and paid later — is handled
+   * correctly and always was: the cumulative reaches the rent threshold on the day rent
+   * landed, so a later utility payment cannot move the household into "after the 5th".
+   * The distortion is coming from 1 and 2, not from utilities.
+   */
+  var firstDay = {}, noRentMatch = 0, unpaid = {}, skippedNoRent = 0, prepaidCount = {};
+
+  // Group the keys by household so each one can be walked in month order.
+  var monthsByOcc = {};
+  Object.keys(byOccMonth).forEach(function (k) {
+    var p = k.split('|');
+    (monthsByOcc[p[0]] = monthsByOcc[p[0]] || []).push(p[1]);
+  });
+
+  // THE QUIET PREPAYER. Somebody who paid on 27 August and has sent nothing since has no
+  // September receipt, so there is no September key and the walk would never reach their
+  // September at all — they would vanish from the month rather than count as paid early.
+  // That is 172 households this month.
+  //
+  // So the current month is added for every household on the rent roll, receipts or not.
+  // Deliberately ONLY the current month: filling every gap backwards would re-judge old
+  // months against today's rent, which the note above already warns is unsafe.
+  var curMonthKey = monthKey_(ymd_(today_()));
+  Object.keys(rentByOcc).forEach(function (occId) {
+    var list = monthsByOcc[occId];
+    if (!list) return;                       // never paid anything, ever — not our story
+    if (list.indexOf(curMonthKey) === -1) list.push(curMonthKey);
+    if (!byOccMonth[occId + '|' + curMonthKey]) byOccMonth[occId + '|' + curMonthKey] = [];
+  });
+
+  Object.keys(monthsByOcc).forEach(function (occId) {
+    var rent = rentByOcc[occId] || 0;
+    var months = monthsByOcc[occId].sort();
+    if (!rent) {
+      // No rent on file. Previously this guessed from the largest receipt; that guess
+      // is what polluted the history with former residents' final payments.
+      noRentMatch += months.length;
+      skippedNoRent += months.length;
+      return;
+    }
+
+    var carry = 0;
+    months.forEach(function (month) {
+      var k = occId + '|' + month;
+      var list = byOccMonth[k].sort(function (a, b) { return a.day - b.day; });
+      var need = rent * RENT_THRESHOLD;
+      var day = null;
+
+      // Already covered before the month began — the prepayment case, and the single
+      // biggest source of the wrong answer. Day 0 is its own bucket.
+      if (carry >= need) {
+        day = 0;
+        prepaidCount[month] = (prepaidCount[month] || 0) + 1;
+      } else {
+        var cum = carry;
+        for (var i = 0; i < list.length; i++) {
+          cum += list[i].amt;
+          if (cum >= need) { day = list[i].day; break; }
+        }
+      }
+
+      var received = list.reduce(function (s, x) { return s + x.amt; }, 0);
+      carry = Math.max(0, carry + received - rent);   // one dollar, spent once
+
+      if (day !== null) firstDay[k] = day;
+      else unpaid[month] = (unpaid[month] || 0) + 1;  // received something, never enough
+    });
+  });
+
+  // WHO ACTUALLY OWES, TODAY. The receipts feed can only say what arrived; the aged
+  // receivables say what is outstanding, and that is the authority on whether somebody
+  // has paid. A household with no delinquent rent has paid — whatever the receipts do or
+  // do not show — and must never be counted as unpaid in the current month.
+  //
+  // This is the guard that would have caught the reported number on its own.
+  var owesRentNow = {};
+  try {
+    readTab_('Delinquency_Aged').forEach(function (d) {
+      if (!d.occupancy_id) return;
+      if ((num_(d.delinquent_rent) || 0) > 0) owesRentNow[String(d.occupancy_id)] = true;
+    });
+  } catch (e) { owesRentNow = null; }   // no aging held: fall back to receipts alone
+
+  var thisMonth = monthKey_(ymd_(today_()));
+  var dayToday = today_().getDate();
+
+  // monthly story
+  var months = {};
+  Object.keys(firstDay).forEach(function (k) {
+    var m = k.split('|')[1], day = firstDay[k];
+    months[m] = months[m] || { month: m, before_1st: 0, on_1st: 0, on_2nd: 0, on_3rd: 0,
+                               on_4th: 0, on_5th: 0, after_5th: 0, payers: 0 };
+    months[m].payers++;
+    if (day === 0) months[m].before_1st++;
+    else if (day === 1) months[m].on_1st++;
+    else if (day === 2) months[m].on_2nd++;
+    else if (day === 3) months[m].on_3rd++;
+    else if (day === 4) months[m].on_4th++;
+    else if (day === 5) months[m].on_5th++;
+    else months[m].after_5th++;
+  });
+
+  // Households short of the threshold in the CURRENT month who nonetheless owe no rent.
+  // These are the prepayers whose only receipt this month was a benefits or utility
+  // charge. They are not late; they are early, and the ledger already knows it.
+  var rescued = 0;
+  if (owesRentNow) {
+    Object.keys(monthsByOcc).forEach(function (occId) {
+      var k = occId + '|' + thisMonth;
+      if (!byOccMonth[k]) return;
+      if (firstDay[k] !== undefined) return;          // already counted as paid
+      if (owesRentNow[String(occId)]) return;         // genuinely owes
+      if (!rentByOcc[occId]) return;
+      rescued++;
+    });
+    if (rescued && months[thisMonth]) {
+      months[thisMonth].before_1st += rescued;
+      months[thisMonth].payers += rescued;
+      unpaid[thisMonth] = Math.max(0, (unpaid[thisMonth] || 0) - rescued);
+    }
+  }
+
+  var rows = Object.keys(months).sort().map(function (m) {
+    var r = months[m];
+    r.short_paid = unpaid[m] || 0;
+    r.prepaid = prepaidCount[m] || 0;
+    // Households that paid something but never reached the rent threshold belong in
+    // the denominator. Leaving them out flattered every percentage.
+    var base = r.payers + r.short_paid;
+    r.households = base;
+    var onTime = r.before_1st + r.on_1st + r.on_2nd + r.on_3rd + r.on_4th + r.on_5th;
+    r.by_1st_pct    = base ? round1_((r.before_1st + r.on_1st) / base * 100) : null;
+    r.by_5th_pct    = base ? round1_(onTime / base * 100) : null;
+    r.after_5th_pct = base ? round1_((r.after_5th + r.short_paid) / base * 100) : null;
+
+    // A MONTH THAT HAS NOT FINISHED CANNOT REPORT HOW IT ENDED.
+    //
+    // On 2 September, "72% paid after the 5th" is not a wrong number — it is a number
+    // about an event that has not happened. Anyone still to pay this month is counted as
+    // late by arithmetic alone. The row is flagged and the panel refuses to draw the
+    // distribution until the window has actually closed.
+    r.is_partial = (m === thisMonth) ? 'YES' : '';
+    r.as_of_day = (m === thisMonth) ? dayToday : null;
+    r.window_closed = (m === thisMonth && dayToday <= RENT_BANDS.yellow_through) ? 'NO' : 'YES';
+    return r;
+  });
+  writeTab_('Rent_Timing', rows);
+
+  if (skippedNoRent) {
+    logError_('portfolio', 'rent timing',
+      skippedNoRent + ' occupancy-month(s) had no rent on the current rent roll and were ' +
+      'excluded rather than guessed at. These are almost all former residents, whose ' +
+      'historical months previously fell to a largest-receipt fallback and distorted the ' +
+      'trend. Also note the rent used is TODAY\u2019s figure — months before a renewal ' +
+      'increase are judged against a rent that was not charged then. Run ' +
+      'diagnoseRentTiming() for the per-month coverage.');
+  }
+
+  // current month, per household with a balance
+  var live = liveTenancy_();
+
+  var detail = rr.filter(function (r) {
+    return (num_(r.past_due) || 0) > 0 && isActiveTenancy_(r, live);
+  }).map(function (r) {
+    var day = firstDay[r.occupancy_id + '|' + thisMonth];
+
+    // BAND ON THE BALANCE, not on when the first dollar arrived.
+    //
+    // This list exists only because past_due > 0 — everyone on it owes money. The old
+    // rule handed out green whenever the FIRST payment landed on the 1st, so a resident
+    // who paid part on the 1st and still owed $254 seven days after the 5th rendered
+    // green. Green reads as "fine" to anyone glancing at the page, and they were not.
+    //
+    // First-payment day is still the right measure for the monthly Rent_Timing
+    // distribution above, which answers "what share paid on the 1st". It is the wrong
+    // measure for a per-household list of outstanding balances.
+    var band = (dayToday > RENT_BANDS.yellow_through) ? 'red' : 'yellow';
+
+    // Paid something on the 1st and still owes: worth naming, because the conversation
+    // is different from someone who has paid nothing.
+    var partial = !!(day && (num_(r.past_due) || 0) > 0);
+    return {
+      occupancy_id: r.occupancy_id, unit_id: r.unit_id, property_id: r.property_id,
+      property_street: r.property_street, property_street2: r.property_street2, unit: r.unit,
+      tenant: r.tenant, tenant_id: r.tenant_id, status: r.status,
+      past_due: num_(r.past_due), rent: num_(r.rent),
+      paid_on_day: day || null,
+      is_partial: partial ? 'YES' : '',
+      days_late: (dayToday > RENT_BANDS.yellow_through) ? (dayToday - RENT_BANDS.yellow_through) : 0,
+      band: band, pm_group: pm[r.property_id] || 'Unassigned', month: thisMonth
+    };
+  }).sort(function (a, b) { return (b.past_due || 0) - (a.past_due || 0); });
+
+  writeTab_('Rent_Timing_Current', detail);
+
+  var reds = detail.filter(function (r) { return r.band === 'red'; }).length;
+  logRun_('buildRentTiming', 'derived', 'Rent_Timing', rows.length, new Date().getTime() - t0,
+    'months=' + rows.length + ' · outstanding=' + detail.length + ' · red=' + reds +
+    ' · rent-threshold ' + Math.round(RENT_THRESHOLD * 100) + '% · no-rent-on-file fallbacks=' + noRentMatch);
+  return { months: rows.length, outstanding: detail.length, red: reds, fallbacks: noRentMatch };
+}
+
+// ============================================================ RUNNER
+
+/** Run after rebuildAll / rebuildLeasing / rebuildCompliance. */
+function buildPortfolio() {
+  var out = [];
+  // Address book FIRST — every downstream display depends on it.
+  // rent_collection runs AFTER summary, because it reads the history row summary
+  // appends on this same run.
+  [['addresses', buildAddressBook], ['summary', buildPortfolioSummary],
+   ['doors', function () { return buildDoorHistory(60); }],
+   ['leasing', buildLeasingActivity], ['rent_timing', buildRentTiming],
+   ['rent_collection', function () { return buildRentCollection(12); }]].forEach(function (j) {
+    try { j[1](); out.push(j[0] + ' OK'); }
+    catch (e) { out.push(j[0] + ' FAILED: ' + e.message.slice(0, 150)); logError_('portfolio', j[0], e.message); }
+  });
+  Logger.log(out.join('\n'));
+  return out;
+}
+
+/**
+ * Properties on their way out — scheduled, not gone.
+ *
+ * The z-prefix naming convention marks a property that is offboarding while still
+ * being managed: residents in place, rent collected, maintenance running. It is a
+ * forward-looking pipeline, which is why it is kept out of churn.
+ *
+ * Overdue matters here. A closure date that has passed with no management_end_date
+ * is a property still being managed and billed past its own handover date — the one
+ * thing on this list that costs money to ignore.
+ */
+function offboardingPipeline_() {
+  var t = ymd_(today_());
+  var props = readTab_('Properties_All');
+  if (!props.length) props = readTab_('Properties_Units');
+  var units = readTab_('Unit_Directory_All');
+  if (!units.length) units = readTab_('Unit_Directory');
+
+  var unitCount = {};
+  units.forEach(function (u) {
+    if (u.property_id) unitCount[u.property_id] = (unitCount[u.property_id] || 0) + 1;
+  });
+
+  var seen = {}, out = [];
+  props.forEach(function (p) {
+    if (!p.property_id || seen[p.property_id]) return;
+    seen[p.property_id] = true;
+    if (ymd_(p.management_end_date)) return;          // already confirmed gone
+    var e = (typeof endingMgmt_ === 'function') ? endingMgmt_(p) : null;
+    if (!e) return;
+    if (typeof isExcluded_ === 'function' && isExcluded_(p)) return;
+    out.push({
+      property_id: String(p.property_id),
+      name: p.property_name || p.property || '',
+      owners: p.owners || '',
+      units: unitCount[p.property_id] || num_(p.units) || 0,
+      closes_on: e.date || '',
+      days: e.date ? daysBetween_(t, e.date) : null,
+      overdue: !!(e.date && e.date < t)
+    });
+  });
+
+  out.sort(function (a, b) {
+    if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;   // overdue first
+    if (a.days === null) return 1;
+    if (b.days === null) return -1;
+    return a.days - b.days;
+  });
+
+  var doors = out.reduce(function (a, r) { return a + r.units; }, 0);
+  var overdue = out.filter(function (r) { return r.overdue; });
+  return {
+    rows: out,
+    properties: out.length,
+    doors: doors,
+    overdue_properties: overdue.length,
+    overdue_doors: overdue.reduce(function (a, r) { return a + r.units; }, 0),
+    undated: out.filter(function (r) { return !r.closes_on; }).length
+  };
+}
+
+// ============================================================ RENT COLLECTION
+
+/**
+ * Charged versus collected, by month.
+ *
+ * WHAT "COLLECTED" CAN AND CANNOT MEAN HERE. receivables_activity records receipts, not
+ * what each receipt was applied to. A payment settles a balance; nothing in the export
+ * says "this $150 was the water bill". So a month's collections are ALL money received
+ * from residents — rent, utilities, deposits, fees — and cannot be split into rent and
+ * not-rent without a charge-level feed.
+ *
+ * That means collected can exceed charged in a month where arrears are cleared, and
+ * fall short in one where a resident prepays. It is a cash figure, not an accrual one,
+ * and the panel says so rather than presenting a tidy percentage that implies otherwise.
+ *
+ * Charged comes from Portfolio_Summary_History, which appends on every nightly run, so
+ * a month only has a charged figure once the pipeline has run inside it. Months before
+ * the pipeline existed will show collections with no charge to compare against.
+ */
+function buildRentCollection(monthsBack) {
+  var t0 = new Date().getTime();
+  monthsBack = monthsBack || 12;
+
+  var rec = inScopeIncludingInactive_(readTab_('Receivables_Activity'));
+  var collected = {}, receipts = {}, households = {}, refunds = {};
+  rec.forEach(function (r) {
+    var d = parseDate_(r.txn_receipt_date);
+    var amt = num_(r.txn_amount);
+    if (!d || amt === null) return;
+    var m = monthKey_(r.txn_receipt_date);
+    // Negatives were being skipped. For a COLLECTED figure the net is the point — a
+    // refund or a reversed payment is money that did not stay collected, and dropping
+    // it overstates the month. Counted separately so the two are visible apart.
+    collected[m] = (collected[m] || 0) + amt;
+    if (amt < 0) refunds[m] = (refunds[m] || 0) + amt;
+    if (amt > 0) receipts[m] = (receipts[m] || 0) + 1;
+    if (r.occupancy_id && amt > 0) (households[m] = households[m] || {})[r.occupancy_id] = 1;
+  });
+
+  // Latest snapshot per month from the nightly history.
+  var charged = {}, mktActive = {}, mktOccupied = {}, asOf = {};
+  readTab_('Portfolio_Summary_History').forEach(function (r) {
+    var m = monthKey_(r.as_of);
+    if (!m) return;
+    var stamp = ymd_(r.as_of) || '';
+    if (asOf[m] && asOf[m] > stamp) return;      // keep the last run in that month
+    asOf[m] = stamp;
+    charged[m] = num_(r.rent_charged);
+    mktActive[m] = num_(r.market_rent_active);
+    mktOccupied[m] = num_(r.market_rent_occupied);
+  });
+
+  var months = [];
+  var cursor = new Date(); cursor.setDate(1);
+  for (var i = monthsBack - 1; i >= 0; i--) {
+    var d2 = new Date(cursor.getTime());
+    d2.setMonth(d2.getMonth() - i);
+    months.push(Utilities.formatDate(d2, CFG.TZ, 'yyyy-MM'));
+  }
+
+  /**
+   * A MONTH THAT IS NOT OVER IS NOT COMPARABLE.
+   *
+   * The current month always reads low — on the 13th you are looking at ten days of
+   * receipts against a full month of charges, which produced "$315,152 collected
+   * against $1M charged" and looked like a collections collapse. The first month in
+   * the window is clipped the same way at the other end.
+   *
+   * Both are marked partial, kept in the table so the trend is continuous, and left
+   * out of the headline tile and the comparison percentage.
+   */
+  var thisMonth = monthKey_(ymd_(today_()));
+  var windowStart = monthKey_(ymd_(addDays_(today_(), -365)));
+
+  // Rent income from the LEDGER, by month. This is the comparison line the chart actually
+  // needs — see the note on rent_charged below.
+  var glIncome = {};
+  readTab_('Rent_Income_GL').forEach(function (r) {
+    var k = monthNorm_(r.month);
+    if (k) glIncome[k] = num_(r.rent_income);
+  });
+
+  var rows = months.map(function (m) {
+    var ch = charged[m] === undefined ? null : charged[m];
+    var co = collected[m] || 0;
+    var partial = (m === thisMonth) || (m === windowStart);
+    return {
+      month: m,
+      is_partial: partial ? 'YES' : '',
+      market_rent_active: mktActive[m] === undefined ? null : round2_(mktActive[m]),
+      market_rent_occupied: mktOccupied[m] === undefined ? null : round2_(mktOccupied[m]),
+      // WHY THERE ARE TWO COMPARISON FIGURES, and why one of them is mostly blank.
+      //
+      // rent_charged is read from Portfolio_Summary_History — a snapshot the nightly job
+      // appends. It therefore only exists for months the dashboard has been RUNNING. There
+      // is no way to recover what was charged in October 2025: AppFolio's rent roll is
+      // as-of-now, nobody recorded it then, and inventing it is not an option. So the
+      // charged line on a twelve-month chart is one or two dots and eleven gaps, which
+      // reads as a broken chart rather than as a young dataset.
+      //
+      // rent_income is the general ledger, and the ledger remembers. Thirteen months of it,
+      // from source, no snapshot required. That is the line to compare receipts against.
+      rent_charged: ch === null ? null : round2_(ch),
+      rent_income: glIncome[m] === undefined ? null : round2_(glIncome[m]),
+      rent_collected: round2_(co),
+      // Receipts against what the ledger earned. Over a long window these should be close;
+      // month to month they will not be, because prepayment shifts cash a month earlier
+      // than the income it funds.
+      collected_vs_income_pct: (glIncome[m] && glIncome[m] > 0)
+        ? round1_(co / glIncome[m] * 100) : null,
+      refunds_and_reversals: round2_(refunds[m] || 0),
+      // Meaningless on a part-month, and actively misleading when it reads 31%.
+      collected_vs_charged_pct: (!partial && ch && ch > 0) ? round1_(co / ch * 100) : null,
+      households_paying: households[m] ? Object.keys(households[m]).length : 0,
+      receipts: receipts[m] || 0,
+      basis: 'collected = net of every resident receipt that month, cash basis, not rent only'
+    };
+  });
+
+  // A collections figure far below what was charged is almost never a collections
+  // problem — it is missing receipts. Say so rather than letting the tile imply the
+  // portfolio only paid a third of its rent.
+  //
+  // THIS BLOCK USED TO RUN AFTER writeTab_. household_coverage_pct was computed onto
+  // objects that had already been written, so the column never reached the sheet and every
+  // downstream coverage check read undefined — silently passing. The one guard that would
+  // have caught August's missing receipts was itself disabled by a line ordering.
+  var billed = dropTPO_(readTab_('Rent_Roll')).filter(function (r) {
+    return String(r.status || '').toLowerCase().indexOf('current') !== -1;
+  }).length;
+
+  // THE RUNNING MONTH IS JUDGED AGAINST ITSELF, NOT AGAINST A FIXED FLOOR.
+  //
+  // My first version flagged the current month whenever household coverage fell under 70%
+  // after the 10th. That assumed almost everyone has transacted by mid-month — an assumption,
+  // not a measurement, and if it is wrong the guard cries wolf every single month. A guard
+  // that fires every month is worse than no guard: it teaches people to scroll past it.
+  //
+  // So the baseline comes from the data. How much had arrived by THIS day of the month, in
+  // each of the last six months? A running month at 80% of that median is normal. One at 40%
+  // of it, with the households simply absent, is missing rows.
+  var todayYmd = ymd_(today_());
+  var dayOfMonth = Number(todayYmd.slice(8, 10));
+  var COVERAGE_FLOOR = 70;          // closed months only — a finished month has no excuse
+  var RUNNING_FLOOR_PCT = 60;       // running month, as a share of the same-day median
+
+  var sameDayHh = {}, sameDayAmt = {};
+  rec.forEach(function (r) {
+    var d = ymd_(r.txn_receipt_date);
+    var a = num_(r.txn_amount);
+    if (!d || a === null) return;
+    if (Number(d.slice(8, 10)) > dayOfMonth) return;    // past this day-of-month, ignore
+    var m = monthNorm_(d);
+    sameDayAmt[m] = (sameDayAmt[m] || 0) + a;
+    if (r.occupancy_id) (sameDayHh[m] = sameDayHh[m] || {})[r.occupancy_id] = 1;
+  });
+  var priorKeys = Object.keys(sameDayHh).filter(function (m) {
+    return m !== thisMonth && m !== windowStart;
+  }).sort().slice(-6);
+  var medSameDayHh = priorKeys.length >= 3
+    ? median_(priorKeys.map(function (m) { return Object.keys(sameDayHh[m]).length; })) : null;
+  var medSameDayAmt = priorKeys.length >= 3
+    ? median_(priorKeys.map(function (m) { return sameDayAmt[m]; })) : null;
+
+  rows.forEach(function (r) {
+    r.household_coverage_pct = (billed && r.households_paying)
+      ? round1_(r.households_paying / billed * 100) : null;
+
+    var running = (r.month === thisMonth);
+    var cov = r.household_coverage_pct;
+
+    r.data_confidence = 'ok';
+    r.pace_vs_same_day_median_pct = null;
+
+    if (r.month === windowStart) {
+      r.data_confidence = 'partial window — this month is clipped by the 365-day lookback';
+    } else if (running) {
+      var curHh = Object.keys(sameDayHh[thisMonth] || {}).length;
+      var pace = medSameDayHh ? round1_(curHh / medSameDayHh * 100) : null;
+      r.pace_vs_same_day_median_pct = pace;
+      if (pace === null) {
+        r.data_confidence = 'month still running — not enough history to judge its pace';
+      } else if (pace < RUNNING_FLOOR_PCT) {
+        r.data_confidence = 'SUSPECT — by day ' + dayOfMonth + ', ' + curHh + ' household(s) ' +
+          'have paid against a same-day median of ' + medSameDayHh + ' (' + pace + '%). ' +
+          'Collections trouble makes households pay LESS, not disappear, so read this as ' +
+          'missing rows until proven otherwise.';
+      } else {
+        r.data_confidence = 'month still running — pace is ' + pace + '% of the same-day ' +
+          'median, which is normal for day ' + dayOfMonth;
+      }
+    } else if (cov !== null && cov < COVERAGE_FLOOR) {
+      // A CLOSED month with a third of its households missing is missing rows, full stop.
+      r.data_confidence = 'SUSPECT — a closed month with receipts from only ' + cov + '% of ' +
+        billed + ' billed households. Treat the amount as incomplete, not low.';
+    }
+    r.is_suspect = /^SUSPECT/.test(r.data_confidence) ? 'YES' : '';
+  });
+
+  writeTab_('Rent_Collection', rows);
+
+  // Part-months are expected to be thin ONLY before the 10th. After that, thin coverage on
+  // the running month is the same missing-rows problem as on a closed one.
+  var thin = rows.filter(function (r) { return r.is_suspect === 'YES'; });
+  if (thin.length) {
+    logError_('portfolio', 'rent collection',
+      thin.length + ' month(s) look like missing rows rather than low collections — ' +
+      thin.slice(0, 4).map(function (r) {
+        return r.month + ' (' + (r.month === thisMonth
+          ? 'pace ' + r.pace_vs_same_day_median_pct + '% of the same-day median'
+          : r.household_coverage_pct + '% household coverage') + ')'; }).join(', ') +
+      '. receivables_activity is roughly 500 rows a month against a 5,000-row page cap, so ' +
+      'check the windowed pull ran, then diagnoseRentCollection() — its same-day-of-month ' +
+      'section settles whether the running month is actually behind.');
+  }
+
+  var withCharge = rows.filter(function (r) { return r.rent_charged !== null; }).length;
+  var withIncome = rows.filter(function (r) { return r.rent_income !== null; }).length;
+  logRun_('buildRentCollection', 'derived', 'Rent_Collection', rows.length,
+          new Date().getTime() - t0,
+          withIncome + ' of ' + rows.length + ' months have LEDGER income to compare ' +
+          'against · ' + withCharge + ' have a charged snapshot');
+
+  if (!withIncome) {
+    logError_('portfolio', 'rent collection',
+      'No month has a rent income figure from the ledger, so the twelve-month chart has ' +
+      'nothing to compare receipts against except rent_charged — which only exists for the ' +
+      (withCharge || 0) + ' month(s) the dashboard has been running. Run ' +
+      'buildRentIncomeGL(), then rebuildPortfolio().');
+  }
+
+  if (!withCharge) {
+    logError_('portfolio', 'rent collection',
+      'No month has a rent_charged figure. Portfolio_Summary_History is empty or has no ' +
+      'as_of dates, so collections cannot be compared to what was billed. It fills in from ' +
+      'the next nightly run onward.');
+  }
+  return { months: rows.length, months_with_charge: withCharge };
+}
+
+// ============================================================ RENT INCOME (GL)
+
+/**
+ * Rent income the way the income statement means it — and why it is not the same number as
+ * "money that arrived".
+ *
+ * WHAT THE GENERAL LEDGER SHOWED (August 2026, verified against Frank's export):
+ *
+ *   4100 Rent Income, 1-17 August        490 rows      $1,036,163 net
+ *   of which posted on 08/01 alone       325 rows        $740,271   71%
+ *   2300 Prepayment, debits in August                    $478,022
+ *
+ * Rent income is recognised WHEN THE RENT PERIOD STARTS, not when the money turned up. A
+ * resident paying on 28 July for August credits 2300 Prepayment in July; on 1 August that
+ * balance is transferred into 4100 Rent Income. That is why 71% of the month's rent income
+ * appears on the 1st, and why a receipt-date series can never agree with it month by month.
+ *
+ * Receivables_Activity is the other thing: cash on the date it arrived, and ALL of it —
+ * rent, Resident Benefits Package, pet rent, late fees, utility reimbursements, application
+ * fees, deposits. Calling that "rent collected" was wrong on both counts, timing and scope.
+ *
+ * So this builds the accountant's figure from the ledger itself, and the receipts series
+ * keeps its own honest name. Two measures, both correct, neither pretending to be the other.
+ */
+var INCOME_GL = {
+  // Set `id` from discoverGlAccounts() to make this a cheap filtered pull across a full
+  // year. Without ids it still works — it falls back to unfiltered monthly windows over a
+  // shorter horizon — but it costs far more rows.
+  // Both ids confirmed from discoverGlAccounts() on 2026-08-19, once the window was widened
+  // to span a month start — subsidised rent posts on the 1st and the first sample missed it.
+  ACCOUNTS: [
+    { id: 27, number: '4100', name: 'Rent Income',     kind: 'rent' },
+    { id: 28, number: '4105', name: 'Subsidized Rent', kind: 'rent' }
+  ],
+  MONTHS: 13,              // when ids are configured
+  FALLBACK_MONTHS: 3,      // unfiltered pull: enough for the tile, not the whole chart
+  // Accrual reads the ledger as posted. The income statement WeLease exports reconciles to
+  // this; the Cash default would re-derive a receipt-date view and defeat the point.
+  BASIS: 'Accrual'
+};
+
+function incomeGlIds_() {
+  return INCOME_GL.ACCOUNTS.filter(function (a) { return a.id; })
+                           .map(function (a) { return String(a.id); });
+}
+
+/** Resolve a ledger row to one of the income accounts. Number first, then name. */
+function incomeResolveGl_(row) {
+  var num = String(row.account_number || '').trim();
+  var i;
+  if (num) {
+    for (i = 0; i < INCOME_GL.ACCOUNTS.length; i++) {
+      if (INCOME_GL.ACCOUNTS[i].number === num) return INCOME_GL.ACCOUNTS[i];
+    }
+  }
+  // account_number comes back null on this account, so the name is the working key.
+  var nm = String(row.account_name || '').trim().toLowerCase();
+  if (!nm) return null;
+  for (i = 0; i < INCOME_GL.ACCOUNTS.length; i++) {
+    if (INCOME_GL.ACCOUNTS[i].name.toLowerCase() === nm) return INCOME_GL.ACCOUNTS[i];
+  }
+  var m = nm.match(/^(\d{4})\b/);          // "4100 Rent Income" in one field
+  if (m) {
+    for (i = 0; i < INCOME_GL.ACCOUNTS.length; i++) {
+      if (INCOME_GL.ACCOUNTS[i].number === m[1]) return INCOME_GL.ACCOUNTS[i];
+    }
+  }
+  return null;
+}
+
+function buildRentIncomeGL(monthsBack) {
+  var t0 = new Date().getTime();
+  var ids = incomeGlIds_();
+  var months = monthsBack || (ids.length ? INCOME_GL.MONTHS : INCOME_GL.FALLBACK_MONTHS);
+
+  // THE WINDOW STARTS ON THE 1ST OF A MONTH. It used to start "396 days ago", which on a
+  // run dated the 2nd began the oldest month on its SECOND day — and 93% of this
+  // portfolio's rent posts on the 1st. August 2025 came back as $71,702 against an actual
+  // $1,114,663: not a missing account, not a broken pull, just one clipped day carrying
+  // almost the whole month.
+  //
+  // Counting back in days can never align to a month. Counting back in MONTHS always can.
+  var t = today_();
+  var startM = new Date(t.getFullYear(), t.getMonth() - (months - 1), 1);
+  var from = ymd_(startM);
+  var to = ymd_(t);
+  // The current month is only as complete as today. Named here so the rows can say so
+  // rather than leaving a reader to notice that the newest bar is short.
+  var runningMonth = monthKey_(to);
+
+  // A HALF-CONFIGURED FILTER SILENTLY DROPS THE REST.
+  // With ids set for some accounts and not others, gl_account_ids returns only the ones
+  // named — so Subsidized Rent would vanish from rent income without a word. Say so.
+  var missingIds = INCOME_GL.ACCOUNTS.filter(function (a) { return !a.id; });
+  if (ids.length && missingIds.length) {
+    logError_('appfolio', 'rent income',
+      'Filtering the ledger to account id(s) ' + ids.join(', ') + ', which EXCLUDES ' +
+      missingIds.map(function (a) { return a.number + ' ' + a.name; }).join(' and ') +
+      ' because no id is configured for them. Rent income will be understated by whatever ' +
+      'those accounts hold. Run discoverGlAccounts(35) — a 35-day window spans a month ' +
+      'start, which is when those postings occur — and set the id.');
+  }
+
+  var rows = [];
+  try {
+    if (ids.length) {
+      // Cheap: the server filters to the two accounts.
+      rows = afReport_('general_ledger', {
+        posted_on_from: from, posted_on_to: to,
+        gl_account_ids: ids,
+        property_visibility: 'all',
+        accounting_basis: INCOME_GL.BASIS
+      }, { maxRows: 60000 });
+    } else {
+      // No ids configured: pull month by month unfiltered and resolve client-side. Roughly
+      // 10,000 rows a month on this portfolio, which is why the horizon is short.
+      rows = afReportWindowed_('general_ledger', {
+        property_visibility: 'all', accounting_basis: INCOME_GL.BASIS
+      }, 'posted_on_from', 'posted_on_to', from, to,
+         { windowDays: 31, maxRows: 60000, maxPages: 3 });
+    }
+  } catch (e) {
+    logError_('appfolio', 'general_ledger / rent income', e.message);
+    writeTab_('Rent_Income_GL', [{ note: 'The general_ledger pull failed: ' + e.message }]);
+    return null;
+  }
+
+  var byMonth = {}, matched = 0, seenAccounts = {};
+  rows.forEach(function (r) {
+    var nm = String(r.account_name || r.account_number || '(blank)').trim();
+    seenAccounts[nm] = (seenAccounts[nm] || 0) + 1;
+    var gl = incomeResolveGl_(r);
+    if (!gl) return;
+    matched++;
+    var m = monthNorm_(ymd_(r.post_date || r.posted_on || r.date));
+    if (!m) return;
+    var b = byMonth[m] || (byMonth[m] = { credit: 0, debit: 0, n: 0 });
+    // Income is a CREDIT balance. Reversals arrive as debits and must net off, or a month
+    // with heavy NSF reversals reads better than it was.
+    b.credit += (num_(r.credit) || 0);
+    b.debit += (num_(r.debit) || 0);
+    b.n++;
+  });
+
+  if (!matched) {
+    var names = Object.keys(seenAccounts).sort(function (a, b) {
+      return seenAccounts[b] - seenAccounts[a]; }).slice(0, 12);
+    logError_('appfolio', 'rent income',
+      'Pulled ' + rows.length + ' ledger row(s) but none resolved to ' +
+      INCOME_GL.ACCOUNTS.map(function (a) { return a.number + ' ' + a.name; }).join(' / ') +
+      '. Account names seen: ' + names.join(', ') + '. Run discoverGlAccounts() and correct ' +
+      'INCOME_GL.ACCOUNTS in Portfolio.gs.');
+    writeTab_('Rent_Income_GL', [{
+      note: 'No ledger row matched the configured income accounts. Run discoverGlAccounts().' }]);
+    return null;
+  }
+
+  var keys = Object.keys(byMonth).sort();
+  var oldest = keys[0];
+  var out = keys.map(function (m) {
+    // A month is only whole if the window covered all of it. The oldest month is whole
+    // now that the window snaps to the 1st — but if a future change breaks that, or the
+    // server clips the range, the row says so instead of publishing a sixth of a month
+    // as though it were the month.
+    var partial = (m === runningMonth) ? 'YES — month still running'
+                : (m === oldest && monthNorm_(from) !== m) ? 'YES — window starts mid-month'
+                : '';
+    var b = byMonth[m];
+    return {
+      month: m,
+      rent_income: round2_(b.credit - b.debit),
+      credits: round2_(b.credit),
+      reversals_and_adjustments: round2_(b.debit),
+      postings: b.n,
+      is_partial: partial,
+      basis: 'GL ' + INCOME_GL.ACCOUNTS.map(function (a) { return a.number; }).join('+') +
+             ', accrual — recognised in the month the rent covers, which is what the income ' +
+             'statement reports'
+    };
+  });
+
+  // A CLIPPED MONTH IS RECOGNISABLE BY ITS SHAPE, so recognise it rather than shipping it.
+  // Rent is overwhelmingly a first-of-the-month posting here, so a month missing its 1st
+  // comes back at single-digit percentages of its neighbours — a signature nothing else
+  // produces. Anything under half the median of the complete months is not a bad month,
+  // it is not a whole month.
+  var whole = out.filter(function (r) { return !r.is_partial; })
+                 .map(function (r) { return r.rent_income; });
+  var mid = median_(whole) || 0;
+  if (mid) {
+    out.forEach(function (r) {
+      if (r.is_partial) return;
+      if (r.rent_income < mid * 0.5) {
+        r.is_partial = 'SUSPECT — ' + Math.round(r.rent_income / mid * 100) +
+                       '% of a normal month';
+        logError_('appfolio', 'rent income',
+          r.month + ' came back at $' + Math.round(r.rent_income) + ', which is ' +
+          Math.round(r.rent_income / mid * 100) + '% of the ' + Math.round(mid) +
+          ' median. Rent posts on the 1st here, so a month this small is almost always a ' +
+          'clipped window rather than a real collapse. It is flagged and excluded from ' +
+          'the reconciliation.');
+      }
+    });
+  }
+
+  writeTab_('Rent_Income_GL', out);
+  logRun_('buildRentIncomeGL', 'appfolio', 'Rent_Income_GL', out.length,
+          new Date().getTime() - t0,
+          matched + ' of ' + rows.length + ' ledger rows matched · ' + out.length + ' month(s)' +
+          (ids.length ? ' · filtered pull' : ' · UNFILTERED fallback, ' + months + ' months — ' +
+            'set INCOME_GL.ACCOUNTS[].id from discoverGlAccounts() for a full year'));
+  return out;
+}
+
+/**
+ * Every GL account in a short window, with row counts and net amounts.
+ *
+ * One-off. Its job is to let you read the exact account names and numbers off your own
+ * ledger rather than have me guess them, and to confirm whether account_number comes back
+ * populated or null on this account.
+ */
+function discoverGlAccounts(days) {
+  var to = ymd_(today_());
+  // 35 days by default so the window ALWAYS spans a month start. The first run used 14 days
+  // ending on the 17th, which began on the 3rd — and rent income posts on the 1st, so it
+  // showed 5 rows of Rent Income and no Subsidized Rent at all. A sampling window that can
+  // miss the busiest day of the month is not a sample.
+  var from = ymd_(addDays_(today_(), -(days || 35)));
+  var out = ['--- GL ACCOUNTS, ' + from + ' to ' + to + ' ---', ''];
+  var rows;
+  try {
+    // WINDOWED. A flat 14-day pull came back at exactly 5,000 rows — the page cap — and the
+    // ledger is ordered by account, so it never reached the 4000-series income accounts at
+    // all. The discovery listed only balance-sheet accounts and looked like proof that Rent
+    // Income was absent. Three-day windows keep each request under the cap.
+    rows = afReportWindowed_('general_ledger',
+      { property_visibility: 'all', accounting_basis: INCOME_GL.BASIS },
+      'posted_on_from', 'posted_on_to', from, to,
+      { windowDays: 3, maxRows: 60000, maxPages: 3 });
+  } catch (e) {
+    out.push('The pull failed: ' + e.message);
+    Logger.log(out.join('\n'));
+    return out.join('\n');
+  }
+
+  out.push('rows returned: ' + rows.length);
+  var keys = rows.length ? Object.keys(rows[0]) : [];
+  out.push('columns: ' + keys.join(', '));
+  var hasNumber = rows.filter(function (r) { return r.account_number; }).length;
+  out.push('rows with account_number populated: ' + hasNumber + ' of ' + rows.length +
+           (hasNumber ? '' : '   <- null, so matching must use account_name'));
+  out.push('');
+
+  // account_id IS returned by this report — it is in the column list above. That is the
+  // value INCOME_GL.ACCOUNTS[].id wants, and with it the nightly pull becomes a filtered
+  // one instead of dragging the whole ledger through a 5,000-row cap.
+  var acc = {};
+  rows.forEach(function (r) {
+    var k = (String(r.account_number || '').trim() + ' ' +
+             String(r.account_name || '').trim()).trim() || '(blank)';
+    var b = acc[k] || (acc[k] = { n: 0, credit: 0, debit: 0, ids: {} });
+    b.n++; b.credit += (num_(r.credit) || 0); b.debit += (num_(r.debit) || 0);
+    if (r.account_id) b.ids[String(r.account_id)] = 1;
+  });
+  out.push('account                                  id      rows        credit' +
+           '         debit           net   matched?');
+  Object.keys(acc).sort(function (a, b) { return acc[b].n - acc[a].n; }).forEach(function (k) {
+    var b = acc[k];
+    var hit = incomeResolveGl_({ account_name: k.replace(/^\d{4}\s*/, ''),
+                                 account_number: (k.match(/^(\d{4})/) || [])[1] || '' });
+    out.push('  ' + k.slice(0, 36).padEnd(38) +
+             Object.keys(b.ids).join('/').slice(0, 8).padEnd(9) +
+             String(b.n).padStart(6) +
+             money_(Math.round(b.credit)).padStart(14) +
+             money_(Math.round(b.debit)).padStart(14) +
+             money_(Math.round(b.credit - b.debit)).padStart(14) +
+             (hit ? '   <- ' + hit.kind : ''));
+  });
+  out.push('');
+  out.push('The `id` column above is account_id. Paste the ids for the rent accounts into');
+  out.push('INCOME_GL.ACCOUNTS in Portfolio.gs and the nightly pull becomes a filtered one —');
+  out.push('a full year of rent income for a fraction of the rows.');
+  out.push('');
+  out.push('NOTE: account_number comes back null on this account and the NUMBER is carried');
+  out.push('inside account_name ("4100 - Rent Income"), which is why matching reads the');
+  out.push('leading four digits off the name.');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
