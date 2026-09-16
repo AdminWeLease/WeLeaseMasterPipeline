@@ -1,0 +1,2649 @@
+/**
+ * WeLease Pipeline — DIAGNOSTIC  v3.0.0 · 2026-08-06
+ * Requires Core.gs and Shared.gs.
+ *
+ * Everything you run BY HAND to check something. Nothing here runs on a trigger.
+ * Consolidated from four files — Diagnostic, Discover, Sanity and Cleanup — because
+ * they are all the same job: answering a question about the data or the project.
+ *
+ * WHAT TO RUN, AND WHEN
+ *   verifyProject()            after any paste. Names the missing file instead of
+ *                              failing with a bare ReferenceError halfway through a job.
+ *   sanityCheck()              after computeMetrics. Catches numbers that computed
+ *                              cleanly but are wrong.
+ *   auditSheet()               lists every tab and flags orphans. Deletes nothing.
+ *   cleanupSheet()             deletes what the audit flagged, after you review it.
+ *   auditScriptFiles()         which .gs files should exist in this project.
+ *   discover()                 field discovery. Run when AppFolio changes.
+ *   diagnoseExpiringLeases()   the filter funnel, stage by stage.
+ *   diagnoseDepositFlow()      where deposit money actually goes in the ledger.
+ *   diagnoseWorkOrderHistory() confirms the status filter returns completed work.
+ *   diagnoseTicklerEvents()    real event values, when move-out counts look wrong.
+ */
+
+// ============================================================ 1. PROJECT VERIFY
+var REQUIRED_FUNCTIONS = {
+  'Core.gs': ['afReport_', 'afCall_', 'httpWithRetry_', 'writeTab_', 'appendTab_',
+                 'readTab_', 'invalidateTab_', 'logRun_', 'logError_', 'nowStamp_',
+                 'parseDate_', 'ymd_', 'daysBetween_', 'addDays_', 'monthKey_', 'num_',
+                 'median_', 'p90_', 'vsBenchmark_', 'groupBy_', 'indexBy_',
+                 'round1_', 'round2_', 'esc_', 'money_', 'sleepFor_', 'finding_',
+                 'distinctWithCounts_', 'fillRate_', 'setupSheets', 'installTriggers',
+                 'verifyConnections', 'buildDepositCompliance'],
+  'Shared.gs': ['addr_', 'addrLink_', 'normalizeAddress_', 'cleanName_', 'norm_',
+                'containsPhrase_', 'containsAllWords_', 'addressBook_', 'buildAddressBook',
+                'isTPO_', 'dropTPO_', 'inScopeIncludingInactive_', 'endingMgmt_',
+                'ackSet_', 'isAcked_', 'isExcluded_', 'monthLabel_',
+                'liveTenancy_', 'isActiveTenancy_', 'moveOutDateOf_', 'isActiveProperty_'],
+  'Master scope.gs': ['buildMasterScope', 'inMasterScope_', 'masterUnits_', 'masterTenancies_'],
+  'Jobs.gs': ['rebuildAll', 'rebuildFinancials', 'rebuildLeasing', 'rebuildCompliance',
+              'rebuildEverything', 'pull_'],
+  'Metrics.gs': ['computeMetrics', 'dataContext_'],
+  'Portfolio.gs': ['buildPortfolio', 'buildPortfolioSummary', 'buildDoorHistory',
+                   'buildLeasingActivity', 'buildRentTiming'],
+  'Inspections.gs': ['classifyInspection_', 'buildMoveOutAssessment', 'isMoveOutEvent_',
+                     'getMoveOuts_'],
+  'Data quality.gs': ['buildDataQuality', 'buildRentMarketVariance',
+                      'buildInsuranceCompliance', 'buildDataQualityAudit'],
+  'Diagnostic.gs (sanity)': ['sanityCheck'],
+  'Dashboard.gs': ['doGet', 'renderPage_', 'urgencies_', 'block_', 'pmLookup_', 'pmOf_',
+                   'buildDashboardCache', 'lineChart_', 'css_', 'js_']
+};
+
+var REQUIRED_GLOBALS = ['CFG', 'SYSTEMS', 'TABS_ACTIVE', 'VIEWS', 'BRAND', 'URGENT',
+                        'COLS', 'MASTER', 'UNASSIGNED', 'DEPOSIT_GL'];
+
+function verifyProject() {
+  var missingFns = [], missingGlobals = [], ok = 0;
+
+  Object.keys(REQUIRED_FUNCTIONS).forEach(function (file) {
+    REQUIRED_FUNCTIONS[file].forEach(function (fn) {
+      var found = false;
+      try { found = (typeof this[fn] === 'function') || (eval('typeof ' + fn) === 'function'); }
+      catch (e) { found = false; }
+      if (found) ok++;
+      else missingFns.push({ file: file, fn: fn });
+    });
+  });
+
+  REQUIRED_GLOBALS.forEach(function (g) {
+    var found = false;
+    try { found = (eval('typeof ' + g) !== 'undefined'); } catch (e) { found = false; }
+    if (!found) missingGlobals.push(g);
+  });
+
+  // Optional modules — absent is fine, half-present is not.
+  var optional = {
+    'Utility schedule.gs': ['buildUtilitySchedule', 'utilityScheduleSummary_'],
+    'Dashboard utilities patch.gs': ['utilityScheduleBlocks_', 'utilitySchedulePanel_'],
+    'Diagnostic.gs': ['diagnoseDepositFlow', 'diagnoseExpiringLeases'],
+    'Diagnostic.gs (discovery)': ['discover', 'discoverAppFolio'],
+    'Diagnostic.gs (cleanup)': ['auditSheet', 'cleanupSheet']
+  };
+  var partial = [];
+  Object.keys(optional).forEach(function (file) {
+    var present = optional[file].filter(function (fn) {
+      try { return eval('typeof ' + fn) === 'function'; } catch (e) { return false; }
+    });
+    if (present.length && present.length < optional[file].length) {
+      partial.push(file + ' — ' + present.length + '/' + optional[file].length + ' present');
+    }
+  });
+
+  var byFile = {};
+  missingFns.forEach(function (m) { (byFile[m.file] = byFile[m.file] || []).push(m.fn); });
+
+  var report = [];
+  if (!missingFns.length && !missingGlobals.length && !partial.length) {
+    report.push('PROJECT OK — ' + ok + ' required functions present, all globals defined.');
+  } else {
+    report.push('PROJECT INCOMPLETE');
+    Object.keys(byFile).forEach(function (f) {
+      report.push('  PASTE ' + f + ' — missing: ' + byFile[f].join(', '));
+    });
+    if (missingGlobals.length) report.push('  MISSING GLOBALS: ' + missingGlobals.join(', '));
+    partial.forEach(function (p) { report.push('  PARTIAL: ' + p); });
+    report.push('');
+    report.push('Apps Script shares one global scope, so file ORDER does not matter — ' +
+                'but every file must be present. A function that moved between files ' +
+                'exists nowhere until both are pasted.');
+  }
+
+  var text = report.join('\n');
+  Logger.log(text);
+  try {
+    writeTab_('_project_verify', missingFns.length || missingGlobals.length
+      ? missingFns.map(function (m) { return { status: 'MISSING', file: m.file, item: m.fn }; })
+          .concat(missingGlobals.map(function (g) {
+            return { status: 'MISSING GLOBAL', file: '?', item: g }; }))
+      : [{ status: 'OK', file: 'all', item: ok + ' functions verified' }]);
+  } catch (e) {}
+  return text;
+}
+
+
+// ============================================================ 2. SHEET AUDIT & CLEANUP
+
+/**
+ * Which AppFolio-sourced tabs look truncated?
+ *
+ * Report pagination was broken — a GET on the report route 404s, so any report that filled
+ * a page lost everything past it. The tell is a row count sitting exactly on a page
+ * boundary: real data almost never lands on a round 5,000.
+ *
+ * Run this once after re-pulling. A tab that was truncated will grow; one that was always
+ * complete will not move.
+ */
+/**
+ * Why is the Onboarding group blank?
+ *
+ * There are only a few possible answers and they need different things done about them:
+ * no onboarding process type matched; processes exist but none has closed; processes have
+ * closed but LS_Processes never received them; or the tasks are there but carry no step
+ * names because they were seeded before the step.description fix. Those four looked
+ * identical from the dashboard.
+ */
+/**
+ * The two things the insurance view needs configured, read off your own data.
+ *
+ * Rather than me guessing which carrier is the RBP one and which property group means
+ * "insured through WeLease", this prints what is actually in the account with counts, so
+ * the answer is a reading exercise rather than a guess.
+ */
+function diagnoseInsurance() {
+  var out = ['--- INSURANCE CONFIGURATION ---', ''];
+  var t = ymd_(today_());
+
+  out.push('INSURANCE.RBP_CARRIERS        = ' + JSON.stringify(INSURANCE.RBP_CARRIERS));
+  out.push('INSURANCE.OWNER_WITH_US_GROUPS = ' + JSON.stringify(INSURANCE.OWNER_WITH_US_GROUPS));
+
+  // ---- resident carriers ----
+  out.push('');
+  out.push('--- 1. RESIDENT CARRIERS IN YOUR DATA ---');
+  out.push('Set RBP_CARRIERS to whichever of these is the Resident Benefits Package carrier.');
+  out.push('');
+  var live = liveTenancy_();
+  var seen = {}, carriers = {}, noCarrier = 0, households = 0;
+  dropTPO_(readTab_('Tenants')).forEach(function (r) {
+    var type = String(r.tenant_type || '').toLowerCase();
+    if (/co.?signer|guarantor/.test(type)) return;
+    if (!isActiveTenancy_(r, live)) return;
+    var occ = String(r.occupancy_id || '');
+    if (occ && seen[occ]) return;
+    if (occ) seen[occ] = 1;
+    households++;
+    var c = String(r.insurance_company_name || '').trim();
+    if (!c) { noCarrier++; return; }
+    var exp = ymd_(r.insurance_expiration);
+    var b = carriers[c] || (carriers[c] = { n: 0, current: 0, expired: 0, noDate: 0 });
+    b.n++;
+    if (!exp) b.noDate++; else if (exp < t) b.expired++; else b.current++;
+  });
+  out.push('active households: ' + households + '   with no carrier named: ' + noCarrier);
+  out.push('');
+  out.push('carrier                                   total  current  expired  no date   RBP?');
+  var names = Object.keys(carriers).sort(function (a, b) { return carriers[b].n - carriers[a].n; });
+  names.forEach(function (c) {
+    var b = carriers[c];
+    out.push('  ' + c.slice(0, 38).padEnd(40) + String(b.n).padStart(5) +
+             String(b.current).padStart(9) + String(b.expired).padStart(9) +
+             String(b.noDate).padStart(9) + '   ' + (insIsRbpCarrier_(c) ? 'YES' : ''));
+  });
+  if (!names.length) {
+    out.push('  NONE. No active household carries an insurance_company_name.');
+    out.push('  >> Either coverage is not recorded in AppFolio, or the tenant_directory');
+    out.push('     columns filter dropped it — insurance_company_name must be in COLS.');
+  } else if (!INSURANCE.RBP_CARRIERS.length) {
+    out.push('');
+    out.push('>> RBP_CARRIERS is empty, so none of the above is marked. A carrier holding a');
+    out.push('   large share of households is the likely RBP one. Set it, re-run');
+    out.push('   buildInsuranceCompliance(), and the three-way split goes live.');
+  }
+
+  // ---- property groups ----
+  out.push('');
+  out.push('--- 2. PROPERTY GROUPS (which one means "insured through WeLease"?) ---');
+  var groups = {};
+  readTab_('PM_Groups').forEach(function (r) {
+    var g = String(r.property_group_name || '(blank)');
+    groups[g] = (groups[g] || 0) + 1;
+  });
+  var gnames = Object.keys(groups).sort(function (a, b) { return groups[b] - groups[a]; });
+  out.push('group                                     properties   matched as "through us"');
+  gnames.forEach(function (g) {
+    var low = g.toLowerCase();
+    var hit = INSURANCE.OWNER_WITH_US_GROUPS.some(function (w) {
+      return low.indexOf(String(w).toLowerCase()) !== -1; });
+    out.push('  ' + g.slice(0, 38).padEnd(40) + String(groups[g]).padStart(8) +
+             '        ' + (hit ? 'YES' : ''));
+  });
+  var withUs = insWithUsProps_();
+  out.push('');
+  out.push('properties matched into a WeLease-placed insurance group: ' +
+           Object.keys(withUs).length);
+  if (!Object.keys(withUs).length) {
+    out.push('>> NONE matched. Check the exact group name above against');
+    out.push('   INSURANCE.OWNER_WITH_US_GROUPS. Matching is a case-insensitive substring.');
+  }
+
+  // ---- emails ----
+  out.push('');
+  out.push('--- 3. CAN WE ACTUALLY EMAIL THEM? ---');
+  // "0 with an email" has two completely different causes and one useless message. Either
+  // the source column is absent, or it is present and empty. Say which.
+  function emailReport_(label, tabName, sourceTab) {
+    var rows = readTab_(tabName);
+    var src = readTab_(sourceTab);
+    var withEmail = rows.filter(function (r) { return insEmailOf_(r); }).length;
+    out.push(label.padEnd(18) + String(rows.length).padStart(5) + ' rows   with an email: ' +
+             withEmail);
+    if (!rows.length || withEmail) return;
+
+    // Which candidate columns actually exist on the SOURCE tab, and are any populated?
+    var present = [], populated = [];
+    if (src.length) {
+      var keys = {};
+      src.slice(0, 200).forEach(function (r) {
+        Object.keys(r).forEach(function (k) { keys[k] = 1; });
+      });
+      INS_EMAIL_FIELDS.forEach(function (f) {
+        if (!keys[f]) return;
+        present.push(f);
+        var n = src.filter(function (r) { return insFirstEmail_(r[f]); }).length;
+        if (n) populated.push(f + '=' + n);
+      });
+      // Anything else that smells like an email column.
+      Object.keys(keys).forEach(function (k) {
+        if (INS_EMAIL_FIELDS.indexOf(k) === -1 && /e.?mail/i.test(k)) {
+          present.push(k + ' (unexpected name)');
+          var n2 = src.filter(function (r) { return insFirstEmail_(r[k]); }).length;
+          if (n2) populated.push(k + '=' + n2);
+        }
+      });
+    }
+    out.push('   ' + sourceTab + ' has ' + src.length + ' row(s). Email-ish columns present: ' +
+             (present.length ? present.join(', ') : 'NONE'));
+    if (!present.length) {
+      out.push('   >> THE COLUMN IS ABSENT. Add it to COLS.' +
+               (sourceTab === 'Tenants' ? 'tenant_directory' : 'owner_directory') +
+               ' in Jobs.gs, then re-run the pull. The columns filter drops anything not');
+      out.push('      listed, silently.');
+    } else if (!populated.length) {
+      out.push('   >> The column exists and is EMPTY on every row. That is a data-entry');
+      out.push('      question in AppFolio, not a wiring one — nothing here can recover it.');
+    } else {
+      out.push('   >> Populated in the source (' + populated.join(', ') + ') but not carried');
+      out.push('      through. Re-run buildInsuranceCompliance() — this tab predates the fix.');
+    }
+  }
+  emailReport_('Insurance_Tenant', 'Insurance_Tenant', 'Tenants');
+  emailReport_('Insurance_Owner', 'Insurance_Owner', 'Owners');
+  out.push('');
+  out.push('Insurance_Outreach rows: ' + readTab_('Insurance_Outreach').length +
+           '  (the chase list; a missing email is flagged, not filtered out)');
+
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function diagnoseOnboarding() {
+  var out = ['--- ONBOARDING ---', ''];
+
+  var procs = readTab_('LS_Processes');
+  var tasks = readTab_('LS_Tasks_All');
+  out.push('LS_Processes rows: ' + procs.length + '   LS_Tasks_All rows: ' + tasks.length);
+
+  var types = {};
+  procs.forEach(function (r) {
+    var t = String(r.process_type || '(none)');
+    types[t] = (types[t] || 0) + 1;
+  });
+  // typeof guard: Apps Script files load in an arbitrary order, and if LeadSimple.gs has not
+  // been pasted this file used to die with "LS_ONBOARDING is not defined" — a stack trace
+  // instead of the one sentence that says what to do.
+  if (typeof LS_ONBOARDING === 'undefined') {
+    out.push('');
+    out.push('LS_ONBOARDING is not defined, which means LeadSimple.gs has not been pasted (or');
+    out.push('is an older copy). Paste the current LeadSimple.gs and run this again.');
+    Logger.log(out.join('\n'));
+    return out.join('\n');
+  }
+
+  var onbTypes = Object.keys(types).filter(function (t) {
+    return LS_ONBOARDING.ALSO_MATCHING.test(t); });
+  out.push('');
+  out.push('--- 1. WHICH TYPE ARE WE MEASURING? ---');
+  out.push('  measuring: ' + LS_ONBOARDING.TYPES.join(' / '));
+  out.push('');
+  if (!onbTypes.length) {
+    out.push('  NO type contains "onboard". ' + Object.keys(types).length + ' type(s) present.');
+    out.push('  >> Run lsListProcessTypes(). Either the seed has not run or the names differ.');
+  } else {
+    onbTypes.forEach(function (t) {
+      out.push('  ' + t.padEnd(44) + String(types[t]).padStart(5) + ' in LS_Processes   ' +
+               (lsIsOnboardingType_(t) ? '<- MEASURED' : 'excluded on purpose'));
+    });
+    if (!onbTypes.some(lsIsOnboardingType_)) {
+      out.push('');
+      out.push('  >> NOTHING MATCHES LS_ONBOARDING.TYPES. The owner onboarding process has');
+      out.push('     probably been renamed — copy the exact name from the list above.');
+    }
+  }
+
+  out.push('');
+  out.push('--- 2. OPEN VS CLOSED IN LS_Processes ---');
+  var onb = procs.filter(function (r) { return lsIsOnboardingType_(r.process_type); });
+  var withClose = onb.filter(function (r) { return r.closed_date; }).length;
+  var stages = {};
+  onb.forEach(function (r) {
+    var k = String(r.stage_status || '(blank)');
+    stages[k] = (stages[k] || 0) + 1;
+  });
+  out.push('  onboarding rows: ' + onb.length + '   with a closed_date: ' + withClose);
+  out.push('  stage_status: ' + Object.keys(stages).map(function (k) {
+    return k + '=' + stages[k]; }).join(', '));
+  if (onb.length && !withClose) {
+    out.push('  >> None carries a close date. If stage_status shows completed rows anyway,');
+    out.push('     closed_at is not coming through. If there are NO completed rows at all,');
+    out.push('     /processes is returning open ones only — which section 3 can confirm.');
+  }
+
+  out.push('');
+  out.push('--- 3. WHAT THE TASKS KNOW (the fallback source) ---');
+  var union = lsOnboardingProcs_();
+  var closedU = union.filter(function (p) { return p.created && p.closed; });
+  var tasksOnly = union.filter(function (p) { return p.sources.indexOf('processes') === -1; });
+  out.push('  onboarding processes across both tabs : ' + union.length);
+  out.push('  with both an open and a close date    : ' + closedU.length);
+  out.push('  known ONLY through their tasks        : ' + tasksOnly.length);
+  if (tasksOnly.length) {
+    out.push('  >> Confirms it: ' + tasksOnly.length + ' closed onboarding process(es) never');
+    out.push('     reached LS_Processes. The metric reads both tabs now, so it works anyway.');
+  }
+  if (closedU.length) {
+    var ds = [];
+    closedU.forEach(function (p) {
+      var g = daysBetween_(p.created, p.closed);
+      if (g !== null && g >= 0) ds.push(g);
+    });
+    out.push('  median cycle time: ' + median_(ds) + ' days  (n=' + ds.length + ')');
+  }
+
+  out.push('');
+  out.push('--- 4. STEP NAMES (the three step metrics need these) ---');
+  var createdOf = {};
+  union.forEach(function (p) { if (p.created) createdOf[p.id] = p.created; });
+  var onbTasks = tasks.filter(function (t) { return createdOf[t.process_id]; });
+  var named = onbTasks.filter(function (t) { return String(t.step || ''); }).length;
+  out.push('  tasks on onboarding processes: ' + onbTasks.length + '   with a step name: ' + named);
+  if (onbTasks.length && !named) {
+    out.push('  >> Every step is blank. These were seeded before the step.description fix —');
+    out.push('     re-run lsSeedCompletedTasks().');
+  }
+  var pats = [[/inform.*collect|collect.*inform|gather.*inform/i, 'information collected'],
+              [/in\s*(the\s*)?system|enter.*(appfolio|system)|set\s*up.*system/i, 'in the system'],
+              [/insurance|proof\s*of\s*ins/i, 'proof of insurance']];
+  pats.forEach(function (pr) {
+    var hits = {}, done = 0;
+    onbTasks.forEach(function (t) {
+      var st = String(t.step || '');
+      if (!st || !pr[0].test(st)) return;
+      hits[st] = (hits[st] || 0) + 1;
+      if (ymd_(t.completed_date)) done++;
+    });
+    var names = Object.keys(hits);
+    out.push('');
+    out.push('  ' + pr[1] + ' -> ' + names.length + ' step name(s), ' + done + ' completed');
+    names.slice(0, 6).forEach(function (n) {
+      out.push('      ' + String(n).slice(0, 60).padEnd(62) + hits[n]);
+    });
+    if (!names.length) {
+      out.push('      NO MATCH. Run lsListSteps() and send the list so the pattern can widen.');
+    }
+  });
+
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function diagnoseTruncation() {
+  var PAGE = 5000;
+  var out = ['--- TABS THAT MAY HAVE BEEN TRUNCATED BY THE PAGINATION 404 ---', ''];
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var suspect = 0, checked = 0;
+
+  ss.getSheets().forEach(function (sh) {
+    var name = sh.getName();
+    if (name.charAt(0) === '_') return;
+    var n = Math.max(0, sh.getLastRow() - 1);          // minus the header
+    if (!n) return;
+    checked++;
+    var onBoundary = (n % PAGE === 0);
+    var justUnder = (n % PAGE >= PAGE - 5 && n >= PAGE);
+    if (onBoundary || justUnder) {
+      suspect++;
+      out.push('  ' + name.padEnd(30) + String(n).padStart(7) + ' rows   <<< sits on a page ' +
+               'boundary — very likely cut short at page ' + Math.round(n / PAGE));
+    } else if (n >= PAGE) {
+      out.push('  ' + name.padEnd(30) + String(n).padStart(7) + ' rows   (over one page, but ' +
+               'not on a boundary — probably complete)');
+    }
+  });
+
+  out.push('');
+  out.push(suspect
+    ? suspect + ' tab(s) look truncated out of ' + checked + ' checked. Re-run the job that ' +
+      'writes each one and compare — if the count grows, it was being cut short.'
+    : 'Nothing sits on a page boundary. No sign any other report was truncated.');
+  out.push('');
+  out.push('bill_detail is pulled in 90-day windows now and does not depend on pagination ' +
+           'at all. Everything else still uses it, with a POST fallback and a ' +
+           'no-progress guard.');
+
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function knownTabs_() {
+  var known = {};
+  TABS_ACTIVE.forEach(function (t) { known[t] = 'active pipeline'; });
+  if (typeof TABS_DEFERRED !== 'undefined') {
+    Object.keys(TABS_DEFERRED).forEach(function (sys) {
+      TABS_DEFERRED[sys].forEach(function (t) {
+        known[t] = 'deferred — ' + sys + (systemEnabled_(sys) ? ' (live)' : ' (disabled)');
+      });
+    });
+  }
+  // Written by optional modules that may not be installed.
+  ['Utility_Schedule', 'Utility_Schedule_Alerts', 'Utility_Schedule_Overrides',
+   'Utility_Schedule_History', 'Utility_Schedule_Anomalies', 'Utility_Schedule_Dropped',
+   '_uschedule_events', '_utility_field_discovery',
+   'Master_Units', 'Master_Tenancies',
+   'Rent_Market_Variance', 'Insurance_Owner', 'Insurance_Tenant', 'Insurance_Outreach',
+   'Insurance_History',
+   '_data_quality', '_acknowledgments', '_excluded_properties', '_excluded_tenancies',
+   '_unit_variance', '_join_exceptions', '_inspection_junk', '_inspection_quality',
+   '_inspection_classes', '_step_inventory', '_auth_diagnostic', '_config_diagnostic',
+   '_deposit_diagnostic', '_deposit_trace', '_workorder_diagnostic', '_tickler_diagnostic',
+   '_expiring_diagnostic', '_sanity', '_metric_errors', '_errors', '_refresh_log',
+   'Discovery', 'Rent_To_Market', 'MoveOut_Assessment'
+  ].forEach(function (t) { if (!known[t]) known[t] = 'optional module'; });
+  return known;
+}
+
+/**
+ * What is actually in the workbook, and whether anything still writes it.
+ * Diagnostic tabs are called out separately — they were useful once and are now noise.
+ */
+function auditSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var known = knownTabs_();
+  var rows = [];
+
+  ss.getSheets().forEach(function (sh) {
+    var name = sh.getName();
+    var lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+    var cells = lastRow * lastCol;
+    var role = known[name] || null;
+
+    var verdict, why;
+    if (!role) {
+      verdict = 'ORPHAN';
+      why = 'Nothing in the pipeline writes this tab. Left over from an earlier version, ' +
+            'or created by hand.';
+    } else if (/^_.*(diagnostic|trace|inventory|classes|quality|junk|variance)$/.test(name)) {
+      verdict = 'DIAGNOSTIC';
+      why = 'One-off investigation output. Safe to delete once the question is settled — ' +
+            'it regenerates if the diagnostic is run again.';
+    } else if (lastRow <= 1) {
+      verdict = 'EMPTY';
+      why = 'Registered but never populated. Either the job has not run, or it produces ' +
+            'nothing for this portfolio.';
+    } else {
+      verdict = 'KEEP';
+      why = role;
+    }
+    rows.push({ verdict: verdict, tab: name, rows: Math.max(0, lastRow - 1),
+                columns: lastCol, cells: cells, role: role || '(unknown)', note: why });
+  });
+
+  rows.sort(function (a, b) {
+    var rank = { ORPHAN: 0, DIAGNOSTIC: 1, EMPTY: 2, KEEP: 3 };
+    return rank[a.verdict] - rank[b.verdict] || b.cells - a.cells;
+  });
+  writeTab_('_sheet_audit', rows);
+
+  var counts = {};
+  rows.forEach(function (r) { counts[r.verdict] = (counts[r.verdict] || 0) + 1; });
+  var totalCells = rows.reduce(function (s, r) { return s + r.cells; }, 0);
+
+  logRun_('auditSheet', 'system', '_sheet_audit', rows.length, 0,
+          JSON.stringify(counts) + ' · ' + Math.round(totalCells / 1000) + 'k cells');
+  Logger.log(JSON.stringify(counts, null, 1));
+  Logger.log('Total cells: ' + totalCells.toLocaleString() +
+             '  (Google caps a spreadsheet at 10,000,000)');
+  Logger.log('Review _sheet_audit, then run cleanupSheet() to delete ORPHAN and ' +
+             'DIAGNOSTIC tabs. Nothing has been deleted.');
+  return { counts: counts, cells: totalCells };
+}
+
+/**
+ * Deletes what auditSheet flagged. Run the audit first — this reads its output rather
+ * than deciding for itself, so you can override any row by changing its verdict to KEEP.
+ */
+function cleanupSheet(alsoDiagnostics) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var audit = readTab_('_sheet_audit');
+  if (!audit.length) {
+    Logger.log('Run auditSheet() first. Nothing deleted.');
+    return 'run auditSheet() first';
+  }
+
+  var deleted = [], kept = [];
+  audit.forEach(function (r) {
+    var v = String(r.verdict || '').toUpperCase();
+    var target = (v === 'ORPHAN') || (alsoDiagnostics && v === 'DIAGNOSTIC');
+    if (!target) return;
+    if (r.tab === '_sheet_audit') return;                 // never delete the audit itself
+    var sh = ss.getSheetByName(r.tab);
+    if (!sh) return;
+    if (ss.getSheets().length <= 1) { kept.push(r.tab + ' (last sheet)'); return; }
+    ss.deleteSheet(sh);
+    deleted.push(r.tab);
+  });
+
+  logRun_('cleanupSheet', 'system', '-', deleted.length, 0,
+          'deleted: ' + (deleted.join(', ') || 'none'));
+  Logger.log('Deleted ' + deleted.length + ' tab(s): ' + (deleted.join(', ') || 'none'));
+  if (kept.length) Logger.log('Skipped: ' + kept.join(', '));
+  Logger.log(alsoDiagnostics ? '' :
+    'Diagnostic tabs were kept. Run cleanupSheet(true) to remove those as well.');
+  return { deleted: deleted.length, tabs: deleted };
+}
+
+/**
+ * Which .gs files should exist, and which are safe to delete.
+ * Apps Script has no API to delete a file from within the project, so this prints the
+ * list and you remove them in the editor.
+ */
+/**
+ * WHAT THIS CAN AND CANNOT DO — read this before trusting the output.
+ *
+ * Apps Script gives a script NO way to list its own files. This function therefore
+ * cannot see your editor. An earlier version printed a static list that LOOKED like a
+ * detection result, which is worse than useless — it reported files as present after
+ * they had been deleted, and named files that never existed in this project.
+ *
+ * What it CAN do is probe for functions that only exist in files which should be gone.
+ * If the function answers, the file is still there. That is real evidence.
+ *
+ * For everything else: the file list in the editor sidebar is the source of truth.
+ */
+function auditScriptFiles() {
+  // A function found ONLY in a file that should have been deleted. Presence proves
+  // the file is still in the project.
+  var FINGERPRINTS = [
+    { file: 'Utility view diagnosis.gs', fns: ['diagnoseUtilityView', 'previewUtilityView',
+                                               'clearDashboardCacheNow'],
+      why: 'Temporary scaffolding for the utility view. Safe to delete now.' },
+    { file: 'Utilities.gs', fns: ['allocateWeighted_', 'screenUtilityBill_', 'seedUtilityMaster',
+                                  'utilControlTotals_'],
+      why: 'Parked allocation module, superseded by Utility schedule.gs and called by nothing.' },
+    { file: 'Cleanup.gs', fns: [],
+      why: 'Its contents are now inside Diagnostic.gs. If it still exists you have TWO ' +
+           'definitions of verifyProject, auditSheet, cleanupSheet and auditScriptFiles — ' +
+           'and the copy that wins is not guaranteed. If you are reading a stale version ' +
+           'of this text, that is exactly what has happened.' }
+  ];
+
+  var found = [], clean = [];
+  FINGERPRINTS.forEach(function (f) {
+    if (!f.fns.length) return;                 // nothing uniquely identifies it
+    var present = f.fns.filter(function (fn) {
+      try { return eval('typeof ' + fn) === 'function'; } catch (e) { return false; }
+    });
+    if (present.length) found.push({ file: f.file, evidence: present.join(', '), why: f.why });
+    else clean.push(f.file);
+  });
+
+  var KEEP = [
+    ['Core.gs', 'Auth, fetch, pagination, sheet I/O, logging, and every shared helper'],
+    ['Shared.gs', 'Address book and normaliser, TPO, exclusions, tenancy, month labels'],
+    ['Master scope.gs', 'Master_Units and Master_Tenancies — your scope decisions'],
+    ['Jobs.gs', 'The four AppFolio pulls, column sets, job chain'],
+    ['Metrics.gs', 'Metric calculations and computeMetrics'],
+    ['Portfolio.gs', 'Summary tiles, door history, leasing activity, rent timing'],
+    ['Inspections.gs', 'Inspection classifier and move-out assessment'],
+    ['Data quality.gs', 'Rent-vs-market, insurance compliance, field audit'],
+    ['Dashboard.gs', 'The web app: views, lists, charts, CSS'],
+    ['Dashboard utilities patch.gs', 'Utility Billing view blocks and panel'],
+    ['Utility schedule.gs', 'The utility posting clock'],
+    ['Diagnostic.gs', 'This file — verify, audit, cleanup, sanity, discover, diagnostics']
+  ];
+
+  Logger.log('THIS FUNCTION CANNOT SEE YOUR FILE LIST.');
+  Logger.log('Apps Script exposes no way to enumerate its own files. Compare the 12 below');
+  Logger.log('against the editor sidebar yourself.\n');
+
+  Logger.log('THE 12 FILES THAT SHOULD EXIST');
+  KEEP.forEach(function (k) { Logger.log('  ' + k[0] + '\n      ' + k[1]); });
+
+  Logger.log('\nDELETED FILES STILL DETECTED (by their functions)');
+  if (found.length) {
+    found.forEach(function (f) {
+      Logger.log('  STILL PRESENT: ' + f.file);
+      Logger.log('      proof: ' + f.evidence + ' still answers');
+      Logger.log('      ' + f.why);
+    });
+  } else {
+    Logger.log('  none — no function unique to a deleted file responded');
+  }
+  if (clean.length) Logger.log('\n  confirmed gone: ' + clean.join(', '));
+
+  Logger.log('\nALSO DELETE, if present: Discover.gs and Sanity.gs. Their functions were');
+  Logger.log('merged into Diagnostic.gs, so both copies define discover(), discoverAppFolio(),');
+  Logger.log('sanityCheck() and flag_(). Nothing errors — one copy silently wins. That cannot');
+  Logger.log('be detected from inside the script, which is why it has to be checked by eye.');
+
+  return { should_exist: KEEP.length, deleted_files_still_present: found };
+}
+
+// ============================================================ 3. SANITY CHECK
+
+var H1_2026_BASELINE = {
+  occupancy_rate:            { value: 89.5,  tolerance: 8,  note: 'was 382/427 on the old denominator' },
+  days_without_revenue:      { value: 29,    tolerance: 25, note: 'median days vacant — widened; the mix of vacant units changes fast, the p90 tail is the real signal' },
+  maint_speed_to_repair:     { value: 9.0,   tolerance: 5,  note: 'H1 median' },
+  maint_speed_to_schedule:   { value: 7.0,   tolerance: 5,  note: 'H1 median' },
+  maint_owner_approval:      { value: 6.0,   tolerance: 4,  note: 'H1 median' },
+  maint_cancellation_rate:   { value: 16.9,  tolerance: 8,  note: 'H1' },
+  unit_churn:                { value: 31.0,  tolerance: 12, note: '15.5% H1 annualized' }
+};
+
+function flag_(out, sev, metric, issue, detail) {
+  out.push({ severity: sev, metric_id: metric, issue: issue, detail: detail || null,
+             checked_at: nowStamp_() });
+}
+
+function sanityCheck() {
+  var t0 = new Date().getTime();
+  var rows = readTab_('Metrics').filter(function (r) { return r.period === 'ALL'; });
+  var out = [];
+
+  if (!rows.length) {
+    flag_(out, 'BLOCKER', '-', 'Metrics tab is empty', 'Run computeMetrics() first.');
+    writeTab_('_sanity', out);
+    return out;
+  }
+
+  var byId = indexBy_(rows, 'metric_id');
+
+  // ---------- per-metric structural checks ----------
+  rows.forEach(function (r) {
+    var v = num_(r.value), n = num_(r.n), den = num_(r.denominator);
+    var isRate = /rate|occupancy/.test(r.metric_id);
+    var status = String(r.status || '');
+
+    if (status === 'deferred' || status === 'blocked' || status === 'not_implemented') return;
+
+    if (v === null) {
+      // A metric that deliberately returns null and says why is doing its job.
+      // Only an unexplained null is a problem.
+      var notes = String(r.notes || '') + ' ' + String(r.detail || '');
+      if (/NO SOURCE|no source|Run build/i.test(notes)) {
+        flag_(out, 'LOW', r.metric_id, 'No value by design',
+              String(r.notes || '').slice(0, 200));
+      } else {
+        flag_(out, 'HIGH', r.metric_id, 'Metric returned no value and gave no reason',
+              'Status ' + status + '. Source tab may be empty.');
+      }
+      return;
+    }
+    if (isRate && (v < 0 || v > 100)) {
+      flag_(out, 'BLOCKER', r.metric_id, 'Rate outside 0-100', 'value=' + v);
+    }
+    if (den !== null && den === 0) {
+      flag_(out, 'BLOCKER', r.metric_id, 'Denominator is zero', 'Rate is meaningless.');
+    }
+    if (n !== null && n === 0) {
+      flag_(out, 'HIGH', r.metric_id, 'Sample size is zero', 'Nothing matched the filter.');
+    } else if (n !== null && n < CFG.MIN_N_TO_PUBLISH) {
+      flag_(out, 'MEDIUM', r.metric_id, 'Below publication threshold',
+            'n=' + n + ' (min ' + CFG.MIN_N_TO_PUBLISH + '). Show as insufficient data.');
+    }
+    // A median of exactly 0 on a duration metric usually means an empty date column.
+    // Unless the metric says otherwise — move-in evaluation clamps early walkthroughs
+    // to day 0, so zero there is a genuine top-quartile result.
+    var detail = {};
+    try { detail = r.detail ? JSON.parse(r.detail) : {}; } catch (e) {}
+    if (/speed|leadtime|days|dispatch|approval|assessment|disposition/.test(r.metric_id) &&
+        v === 0 && n > 5 && !detail.zero_is_meaningful) {
+      flag_(out, 'HIGH', r.metric_id, 'Duration median is exactly zero',
+            'Usually an unpopulated date field rather than instant completion.');
+    }
+
+    // Coverage matters more than the value on any metric that has to match two records.
+    if (detail.match_rate_pct !== undefined && detail.match_rate_pct !== null &&
+        num_(detail.match_rate_pct) < 60) {
+      flag_(out, 'MEDIUM', r.metric_id, 'Low record match rate',
+            detail.match_rate_pct + '% of events had a matching record (' + detail.matched +
+            ' of ' + (detail.move_ins || detail.move_outs || '?') + '). The value describes only ' +
+            'the matched subset — an operational gap, not necessarily a data error.');
+    }
+  });
+
+  // ---------- baseline reconciliation ----------
+  Object.keys(H1_2026_BASELINE).forEach(function (id) {
+    var r = byId[id];
+    if (!r) return;
+    var v = num_(r.value);
+    if (v === null) return;
+    var b = H1_2026_BASELINE[id];
+    var diff = Math.abs(v - b.value);
+    if (diff > b.tolerance) {
+      flag_(out, 'MEDIUM', id, 'Diverges from H1 2026 baseline',
+            'now=' + v + ' vs baseline=' + b.value + ' (' + b.note + '), diff=' + round1_(diff) +
+            '. Investigate the query before assuming the business changed.');
+    }
+  });
+
+  // ---------- delinquency: compare the cycle-independent figure ----------
+  // rent_roll.past_due is a snapshot that moves with the rent cycle. Pulled days after
+  // rent is due it roughly doubles versus a month-end pull, which produced a false
+  // alarm on 2026-08-05. The aged 30+ rate is what belongs against a baseline.
+  var rd = byId['rent_delinquency_rate'];
+  if (rd && rd.detail) {
+    var det = {};
+    try { det = JSON.parse(rd.detail); } catch (e) {}
+    var agedRate = num_(det.aged_30_plus_rate);
+    if (agedRate !== null) {
+      if (agedRate > 6) {
+        flag_(out, 'HIGH', 'rent_delinquency_rate', 'Aged 30+ delinquency above 6%',
+              'aged_30_plus_rate=' + agedRate + '%. This one is cycle-independent — a real collections signal, not a timing artifact.');
+      }
+      var snap = num_(rd.value);
+      if (snap !== null && snap > agedRate * 2.5 && snap > 8) {
+        flag_(out, 'LOW', 'rent_delinquency_rate', 'Snapshot inflated by rent-cycle timing',
+              'snapshot=' + snap + '% vs aged 30+=' + agedRate + '% as of ' + (det.as_of || 'today') +
+              '. Expected when pulled soon after the rent due date. Publish the aged figure, or pull at month-end.');
+      }
+    } else {
+      flag_(out, 'MEDIUM', 'rent_delinquency_rate', 'Aged 30+ rate unavailable',
+            'Delinquency_Aged tab may be empty — the snapshot alone is not comparable across dates.');
+    }
+  }
+
+  // ---------- cross-metric consistency ----------
+  var units = readTab_('Unit_Directory').length;
+  var rr = readTab_('Rent_Roll').length;
+  if (units && rr && Math.abs(units - rr) > units * 0.15) {
+    flag_(out, 'HIGH', 'denominators', 'Unit_Directory and Rent_Roll disagree by >15%',
+          'unit_directory=' + units + ' rent_roll=' + rr +
+          '. Occupancy and delinquency use different denominators — reconcile before publishing.');
+  }
+
+  var occR = byId['occupancy_rate'], vacR = byId['days_without_revenue'];
+  if (occR && vacR) {
+    var occPct = num_(occR.value), vacantUnits = num_(vacR.n);
+    if (occPct !== null && vacantUnits !== null && units) {
+      var impliedVacant = Math.round(units * (100 - occPct) / 100);
+      if (Math.abs(impliedVacant - vacantUnits) > Math.max(10, impliedVacant * 0.5)) {
+        flag_(out, 'MEDIUM', 'occupancy_rate', 'Occupancy and vacancy count disagree',
+              'occupancy implies ~' + impliedVacant + ' vacant; unit_vacancy reports ' + vacantUnits +
+              '. Different definitions of vacant — document which one the dashboard uses.');
+      }
+    }
+  }
+
+  var rentD = byId['rent_delinquency_rate'], totD = byId['total_delinquency_rate'];
+  if (rentD && totD && num_(rentD.value) !== null && num_(totD.value) !== null) {
+    if (num_(totD.numerator) < num_(rentD.numerator)) {
+      flag_(out, 'BLOCKER', 'total_delinquency_rate', 'Total delinquency count is below rent delinquency',
+            'Total must be a superset. Check the filters.');
+    }
+  }
+
+  // ---------- maintenance data completeness ----------
+  var wo = readTab_('Work_Orders');
+  if (wo.length) {
+    var completed = wo.filter(function (r) { return r.completed_on; }).length;
+    var pct = Math.round(completed / wo.length * 100);
+    if (pct < 20) {
+      flag_(out, 'BLOCKER', 'maintenance', 'Only ' + pct + '% of work orders are completed',
+            completed + ' of ' + wo.length + '. Speed metrics are computed on a mostly-open queue and are NOT publishable.');
+    }
+  } else {
+    flag_(out, 'HIGH', 'maintenance', 'Work_Orders tab is empty', 'All maintenance metrics are invalid.');
+  }
+
+  // ---------- deposit compliance ----------
+  var dep = readTab_('Deposit_Compliance');
+  if (dep.length) {
+    var exceeded = dep.filter(function (r) { return r.status === 'EXCEEDED_THRESHOLD'; }).length;
+    var ownerHeld = dep.filter(function (r) { return r.status === 'CANNOT_MEASURE_OWNER_HELD'; }).length;
+    if (exceeded) {
+      flag_(out, 'REVIEW', 'moveout_deposit_disposition',
+            exceeded + ' deposits exceeded the ' + CFG.DEPOSIT_DISPOSITION_DAYS + '-day standard',
+            'CALIFORNIA — surface to counsel. Reporting only: never auto-notify a resident.');
+    }
+    if (ownerHeld) {
+      flag_(out, 'REVIEW', 'moveout_deposit_disposition',
+            ownerHeld + ' owner-held deposits cannot be measured',
+            'Funds never touch WeLease trust. Visibility gap, not a data error.');
+    }
+  }
+
+  // ---------- unit variance ----------
+  var uv = readTab_('_unit_variance').filter(function (r) { return num_(r.variance); });
+  if (uv.length) {
+    var gap = uv.reduce(function (s, r) { return s + Math.abs(num_(r.variance) || 0); }, 0);
+    flag_(out, 'MEDIUM', 'denominators', uv.length + ' properties disagree on unit count',
+          'Total absolute gap ' + gap + ' units. Resolve before publishing any rate externally.');
+  }
+
+  out.sort(function (a, b) {
+    var order = { BLOCKER: 0, HIGH: 1, REVIEW: 2, MEDIUM: 3, LOW: 4 };
+    return (order[a.severity] || 9) - (order[b.severity] || 9);
+  });
+
+  writeTab_('_sanity', out.length ? out : [{ severity: 'CLEAN', issue: 'No problems detected' }]);
+  var counts = {};
+  out.forEach(function (f) { counts[f.severity] = (counts[f.severity] || 0) + 1; });
+  logRun_('sanityCheck', 'derived', '_sanity', out.length, new Date().getTime() - t0,
+          JSON.stringify(counts));
+  Logger.log(out.length + ' findings: ' + JSON.stringify(counts));
+  Logger.log('Blockers must be resolved before anything is published.');
+  return out;
+}
+
+
+// ============================================================ 4. FIELD DISCOVERY
+
+// ============================================================ APPFOLIO
+
+function discoverAppFolio() {
+  var out = [];
+  var from = ymd_(addDays_(today_(), -180));
+  var to = ymd_(today_());
+
+  try {
+    var wo = afReport_('work_order', {}, { maxPages: 3 });
+    sleepFor_('appfolio');
+
+    finding_(out, 'appfolio', 'work_order_type — distinct values',
+      distinctWithCounts_(wo, 'work_order_type'),
+      'MAP THESE: which values mean Make Ready vs Turnover vs general maintenance? Controls 7 metrics.');
+
+    finding_(out, 'appfolio', 'unit_turn_category — distinct values',
+      distinctWithCounts_(wo, 'unit_turn_category'),
+      'MAP THESE: finer grain than work_order_type for turn work.');
+
+    finding_(out, 'appfolio', 'ai_resolved — fill rate', fillRate_(wo, 'ai_resolved'),
+      'If near 0%, "Resolved Without Dispatch" needs a different definition. Values: ' +
+      distinctWithCounts_(wo, 'ai_resolved', 6));
+
+    finding_(out, 'appfolio', 'unit_turn_id — fill rate', fillRate_(wo, 'unit_turn_id'),
+      'Confirms turn work can be isolated from general maintenance.');
+
+    finding_(out, 'appfolio', 'status — distinct values', distinctWithCounts_(wo, 'status'), null);
+    finding_(out, 'appfolio', 'follow_up_on vs inspection_date fill',
+      'follow_up_on ' + fillRate_(wo, 'follow_up_on') + ' | inspection_date ' + fillRate_(wo, 'inspection_date'),
+      'Whichever is actually populated becomes the Validation Speed source.');
+    finding_(out, 'appfolio', 'work_order rows sampled', wo.length, null);
+  } catch (e) { finding_(out, 'appfolio', 'work_order discovery', 'FAILED: ' + e.message, 'Investigate'); }
+
+  try {
+    var insp = afReport_('inspection_detail', {}, { maxPages: 2 });
+    sleepFor_('appfolio');
+    finding_(out, 'appfolio', 'inspection_name — distinct values',
+      distinctWithCounts_(insp, 'inspection_name'),
+      'MAP THESE: which name means move-in inspection? Which means move-out?');
+    finding_(out, 'appfolio', 'inspection status values', distinctWithCounts_(insp, 'status'), null);
+  } catch (e) { finding_(out, 'appfolio', 'inspection_detail', 'FAILED: ' + e.message, null); }
+
+  try {
+    var banks = afReport_('bank_account_directory', {}, { maxPages: 1 });
+    sleepFor_('appfolio');
+    var names = banks.map(function (b) {
+      return (b.bank_account_name || '?') + ' [' + (b.account_type || '?') + ']';
+    }).join(' · ');
+    finding_(out, 'appfolio', 'Bank accounts — name and type', names,
+      'CONFIRM: which are TRUST and which are OPERATING? Needed for the deposit disposition clock.');
+  } catch (e) { finding_(out, 'appfolio', 'bank_account_directory', 'FAILED: ' + e.message, null); }
+
+  try {
+    var gl = afReport_('general_ledger', {
+      posted_on_from: from, posted_on_to: to,
+      gl_account_ids: DEPOSIT_GL.MGMT_HELD.concat(DEPOSIT_GL.OWNER_HELD)
+    }, { maxPages: 3 });
+    sleepFor_('appfolio');
+    finding_(out, 'appfolio', 'Deposit GL activity — last 180 days',
+      gl.length + ' entries · accounts: ' + distinctWithCounts_(gl, 'account_name', 12),
+      'Confirms the deposit clock has data to work with.');
+    finding_(out, 'appfolio', 'Deposit GL — party_type values', distinctWithCounts_(gl, 'party_type'),
+      'Must include "Occupancy" for the occupancy_id join to work.');
+    finding_(out, 'appfolio', 'Deposit GL — transaction types', distinctWithCounts_(gl, 'type', 15), null);
+  } catch (e) { finding_(out, 'appfolio', 'general_ledger deposits', 'FAILED: ' + e.message, 'Deposit clock blocked'); }
+
+  try {
+    var units = afReport_('unit_directory', {}, { maxPages: 3 });
+    sleepFor_('appfolio');
+    var occ = afReport_('occupancy_summary', { as_of_to: to }, { maxPages: 2 });
+    var occUnits = occ.reduce(function (s, r) { return s + (num_(r.number_of_units) || 0); }, 0);
+    finding_(out, 'appfolio', 'UNIT VARIANCE — the canon question',
+      'unit_directory = ' + units.length + ' · occupancy_summary = ' + occUnits + ' · legacy sheet = 407',
+      'CANON IS unit_directory. This quantifies the gap that must be explained before any rate publishes.');
+  } catch (e) { finding_(out, 'appfolio', 'unit variance', 'FAILED: ' + e.message, null); }
+
+  return out;
+}
+
+
+// ============================================================ RUNNER
+
+function discover() {
+  var t0 = new Date().getTime(), all = [];
+  try { all = all.concat(discoverAppFolio()); }
+  catch (e) {
+    all.push({ system: 'appfolio', question: 'DISCOVERY ABORTED', answer: e.message,
+               action_required: 'Investigate', discovered_at: nowStamp_() });
+  }
+  ['leadsimple', 'showmojo'].forEach(function (s) {
+    if (!systemEnabled_(s)) {
+      all.push({ system: s, question: 'Discovery skipped',
+                 answer: SYSTEMS[s].blockedReason,
+                 action_required: 'Resolve with vendor, then set SYSTEMS.' + s + '.enabled = true',
+                 discovered_at: nowStamp_() });
+    }
+  });
+  writeTab_('Discovery', all, { headers: ['system','question','answer','action_required','discovered_at'] });
+  logRun_('discover', 'appfolio', 'Discovery', all.length, new Date().getTime() - t0,
+          'findings=' + all.length + ' · actions=' +
+          all.filter(function (f) { return f.action_required; }).length);
+  Logger.log('Discovery complete: ' + all.length + ' findings. Open the Discovery tab.');
+  return all;
+}
+
+
+// ============================================================ 5. TARGETED DIAGNOSTICS
+
+// ============================================================ A. DEPOSIT FLOW
+
+/**
+ * Takes recent move-outs and pulls EVERY general ledger entry for those
+ * occupancies across ALL accounts — not just the deposit accounts we assumed.
+ * Wherever the deposit money actually goes, this finds it.
+ */
+function diagnoseDepositFlow() {
+  var t0 = new Date().getTime();
+  var from = ymd_(addDays_(today_(), -180));
+  var to   = ymd_(today_());
+  var out  = [];
+
+  // 1. Recent move-outs
+  var tick = afReport_('tenant_tickler', { occurred_on_from: from, occurred_on_to: to });
+  sleepFor_('appfolio');
+  var moveOuts = getMoveOuts_(tick);
+  finding_(out, 'deposit', 'Move-outs in window',
+    moveOuts.length + ' between ' + from + ' and ' + to +
+    ' (tenant_tickler returned ' + tick.length + ' rows)', null);
+
+  if (!moveOuts.length) {
+    finding_(out, 'deposit', 'ABORTED — no move-outs matched',
+      'None of the ' + tick.length + ' tickler rows qualified as a move-out.',
+      'Run diagnoseTicklerEvents() to see the real event values.');
+    writeTab_('_deposit_diagnostic', out, { headers: ['system','question','answer','action_required','discovered_at'] });
+    return out;
+  }
+
+  // 2. SAMPLE SELECTION — this is where the 2026-08-05 run went wrong.
+  //    Taking the 8 MOST RECENT move-outs selected residents who had only just left,
+  //    plus scheduled future-dated move-outs. Nothing had been disposed yet, so every
+  //    traced entry fell before the move-out date and the diagnostic learned nothing.
+  //
+  //    Correct window: move-outs SETTLED long enough ago that a disposition should
+  //    exist, but recent enough to sit inside the GL pull. 30 to 150 days back.
+  var todayStr = ymd_(today_());
+  var windowEnd   = ymd_(addDays_(today_(), -30));    // at least 30d elapsed
+  var windowStart = ymd_(addDays_(today_(), -150));
+
+  var future = moveOuts.filter(function (m) { return ymd_(m.move_out_date) > todayStr; });
+  if (future.length) {
+    finding_(out, 'deposit', 'Future-dated move-outs excluded',
+      future.length + ' rows have a move_out_date after today — scheduled, not completed.',
+      'Expected. Noting it so the count is not mistaken for missing data.');
+  }
+
+  var settled = moveOuts.filter(function (m) {
+    var d = ymd_(m.move_out_date);
+    return d && d <= windowEnd && d >= windowStart;
+  }).sort(function (a, b) { return ymd_(a.move_out_date) < ymd_(b.move_out_date) ? 1 : -1; });
+
+  finding_(out, 'deposit', 'Settled move-outs available',
+    settled.length + ' with a move_out_date between ' + windowStart + ' and ' + windowEnd,
+    settled.length ? null : 'None in range — widen the window and re-run.');
+
+  if (!settled.length) {
+    writeTab_('_deposit_diagnostic', out, { headers: ['system','question','answer','action_required','discovered_at'] });
+    return out;
+  }
+
+  var recent = settled.slice(0, 10);
+  finding_(out, 'deposit', 'Sample move-out dates',
+    recent.map(function (m) { return ymd_(m.move_out_date); }).join(' · '),
+    'Every one of these should have a disposition by now.');
+
+  var propIds = [], occIds = {};
+  recent.forEach(function (m) {
+    occIds[m.occupancy_id] = ymd_(m.move_out_date);
+    if (m.property_id && propIds.indexOf(m.property_id) === -1) propIds.push(m.property_id);
+  });
+  finding_(out, 'deposit', 'Tracing',
+    recent.length + ' settled move-outs across ' + propIds.length + ' properties · ids: ' + propIds.join(', '), null);
+
+  // properties is an object with additive sub-fields
+  var gl = afReport_('general_ledger', {
+    posted_on_from: ymd_(addDays_(today_(), -200)),
+    posted_on_to: ymd_(addDays_(today_(), 1)),
+    properties: { properties_ids: propIds }
+  }, { maxPages: 10 });
+  sleepFor_('appfolio');
+  finding_(out, 'deposit', 'GL entries for those properties', gl.length, null);
+
+  // 3. Every entry for those occupancies, across ALL accounts
+  var traced = gl.filter(function (e) {
+    return String(e.party_type || '') === 'Occupancy' && occIds[e.party_id];
+  }).map(function (e) {
+    return {
+      occupancy_id: e.party_id, party_name: e.party_name,
+      move_out_date: occIds[e.party_id], post_date: ymd_(e.post_date),
+      days_after_move_out: daysBetween_(occIds[e.party_id], ymd_(e.post_date)),
+      account_id: e.account_id, account_name: e.account_name,
+      txn_type: e.type, debit: num_(e.debit), credit: num_(e.credit),
+      bank_account: e.bank_account, description: e.description, reference: e.reference
+    };
+  }).sort(function (a, b) {
+    if (a.occupancy_id !== b.occupancy_id) return a.occupancy_id - b.occupancy_id;
+    return a.post_date < b.post_date ? -1 : 1;
+  });
+
+  writeTab_('_deposit_trace', traced.length ? traced : [{ note: 'no GL entries matched these occupancies' }]);
+  finding_(out, 'deposit', 'Traced GL entries', traced.length + ' → _deposit_trace tab',
+    'READ THIS TAB. Find rows where post_date is AFTER move_out_date. The account_name ' +
+    'and txn_type on those rows is what stops the deposit clock.');
+
+  var post = traced.filter(function (r) { return r.days_after_move_out !== null && r.days_after_move_out >= 0; });
+  finding_(out, 'deposit', 'GL entries AFTER move-out', post.length + ' of ' + traced.length + ' traced',
+    post.length ? null : 'ZERO — no ledger activity at all after these residents left. Widen the window or check whether move-out accounting is posted elsewhere.');
+  finding_(out, 'deposit', 'Accounts active AFTER move-out',
+    post.length ? distinctWithCounts_(post, 'account_name', 30) : '(none)',
+    post.length ? 'The disposition account is in this list.' : null);
+  finding_(out, 'deposit', 'Transaction types AFTER move-out',
+    post.length ? distinctWithCounts_(post, 'txn_type', 30) : '(none)',
+    post.length ? 'The disposition transaction type is in this list.' : null);
+  finding_(out, 'deposit', 'Days-after-move-out spread',
+    post.length ? ('min ' + Math.min.apply(null, post.map(function (r) { return r.days_after_move_out; })) +
+                   ' · max ' + Math.max.apply(null, post.map(function (r) { return r.days_after_move_out; }))) : '(none)',
+    null);
+
+  // 4. Debits vs credits on the deposit liability accounts specifically
+  var depIds = DEPOSIT_GL.MGMT_HELD.concat(DEPOSIT_GL.OWNER_HELD);
+  var dep = gl.filter(function (e) { return depIds.indexOf(e.account_id) !== -1; });
+  var debits = dep.filter(function (e) { return num_(e.debit) > 0; });
+  finding_(out, 'deposit', 'Deposit liability — debits vs credits',
+    debits.length + ' debits (money out) · ' +
+    dep.filter(function (e) { return num_(e.credit) > 0; }).length + ' credits (money in)',
+    debits.length === 0
+      ? 'ZERO DEBITS. Deposits are never reduced through these accounts for these properties. ' +
+        'Check _deposit_trace for the real path, then ask AppFolio support how security deposit ' +
+        'refunds post for this tenant.'
+      : 'Debits exist — their txn_type is the clock stop.');
+  if (debits.length) {
+    finding_(out, 'deposit', 'Debit transaction types', distinctWithCounts_(debits, 'type', 20), null);
+  }
+
+  writeTab_('_deposit_diagnostic', out, { headers: ['system','question','answer','action_required','discovered_at'] });
+  logRun_('diagnoseDepositFlow', 'appfolio', '_deposit_trace', traced.length, new Date().getTime() - t0, null);
+  return out;
+}
+
+// ============================================================ B. WORK ORDER HISTORY
+
+/**
+ * The default work_order pull returns the open queue only. Every maintenance speed
+ * metric needs COMPLETED work orders. This confirms the right filter.
+ */
+function diagnoseWorkOrderHistory() {
+  var t0 = new Date().getTime();
+  var out = [];
+  var from = ymd_(addDays_(today_(), -365));
+  var to = ymd_(today_());
+
+  // default (what discovery ran)
+  var def = afReport_('work_order', {}, { maxPages: 5 });
+  sleepFor_('appfolio');
+  finding_(out, 'work_order', 'Default pull (no filters)',
+    def.length + ' rows · statuses: ' + distinctWithCounts_(def, 'status', 15),
+    'Confirms the default returns the OPEN queue only.');
+
+  // status date range
+  try {
+    var ranged = afReport_('work_order', {
+      status_date_range_from: from, status_date_range_to: to
+    }, { maxPages: 5 });
+    sleepFor_('appfolio');
+    finding_(out, 'work_order', 'With status_date_range 365d',
+      ranged.length + ' rows · statuses: ' + distinctWithCounts_(ranged, 'status', 15),
+      'If this includes Completed and Canceled, it is the filter every maintenance metric uses.');
+    finding_(out, 'work_order', 'completed_on fill rate (ranged)', fillRate_(ranged, 'completed_on'), null);
+    finding_(out, 'work_order', 'canceled_on fill rate (ranged)', fillRate_(ranged, 'canceled_on'), null);
+    finding_(out, 'work_order', 'ai_resolved fill rate (ranged)', fillRate_(ranged, 'ai_resolved'),
+      'Discovery showed 0% on the open queue. If still 0% across a full year, ' +
+      'AppFolio AI triage is unused and "Resolved Without Dispatch" has no source.');
+    finding_(out, 'work_order', 'work_order_type distribution (ranged)',
+      distinctWithCounts_(ranged, 'work_order_type', 15), null);
+    finding_(out, 'work_order', 'unit_turn_category distribution (ranged)',
+      distinctWithCounts_(ranged, 'unit_turn_category', 20),
+      'Discovery showed only "Maintenance / Repair" and nulls. If that holds, Make Ready ' +
+      'cannot be separated from Turnover in the current AppFolio configuration.');
+  } catch (e) {
+    finding_(out, 'work_order', 'status_date_range attempt', 'FAILED: ' + e.message,
+      'Try work_order_statuses instead.');
+  }
+
+  // explicit status filter
+  try {
+    var completed = afReport_('work_order', {
+      work_order_statuses: ['Completed'], status_date_range_from: from, status_date_range_to: to
+    }, { maxPages: 5 });
+    finding_(out, 'work_order', 'Explicit Completed filter', completed.length + ' rows',
+      'If this works it is the cleanest filter for speed metrics.');
+  } catch (e) {
+    finding_(out, 'work_order', 'work_order_statuses filter', 'FAILED: ' + e.message,
+      'Filter the status client-side instead.');
+  }
+
+  writeTab_('_workorder_diagnostic', out, { headers: ['system','question','answer','action_required','discovered_at'] });
+  logRun_('diagnoseWorkOrderHistory', 'appfolio', '_workorder_diagnostic', out.length, new Date().getTime() - t0, null);
+  return out;
+}
+
+// ============================================================ C. INSPECTIONS
+// classifyInspection_() and the inspection data-quality report moved to
+// Inspections.gs. Defining them twice would let the stale copy win at runtime.
+
+
+// ============================================================ D. EXPIRING LEASES
+
+/**
+ * Three sessions have gone by with "leases expiring in 120 days" appearing empty and
+ * no way to tell which stage removed the rows. This walks the exact chain the
+ * dashboard uses and reports the count after every step.
+ */
+function diagnoseExpiringLeases() {
+  var out = [];
+  var t = ymd_(today_());
+  var to120 = ymd_(addDays_(today_(), 120));
+
+  // 1 — what the API returns, ignoring the tab entirely
+  var live = [];
+  try {
+    live = afReport_('lease_expiration_detail', {
+      filter_lease_date_range_by: 'current_lease',
+      ends_on_from: t, ends_on_to: to120, columns: COLS.lease_expiration_detail
+    }, { maxPages: 5 });
+    finding_(out, 'expiring', '1. Direct API pull', live.length + ' rows (' + t + ' to ' + to120 + ')',
+      live.length ? null : 'API RETURNS NOTHING. Try filter_lease_date_range_by = "all" or check the filter value.');
+  } catch (e) {
+    finding_(out, 'expiring', '1. Direct API pull', 'FAILED: ' + e.message,
+      'The filter combination is being rejected. This is the cause.');
+  }
+  if (live.length) {
+    var s = live[0];
+    finding_(out, 'expiring', '1a. Sample row',
+      JSON.stringify({ lease_expires: s.lease_expires, occupancy_id: s.occupancy_id,
+                       unit_id: s.unit_id, tenant_name: s.tenant_name, status: s.status }), null);
+    finding_(out, 'expiring', '1b. lease_expires populated', fillRate_(live, 'lease_expires'),
+      'If low, daysBetween_ returns null and every row is filtered out.');
+    finding_(out, 'expiring', '1c. occupancy_id populated', fillRate_(live, 'occupancy_id'),
+      'Tenancy matching needs this. Blank means every row is treated as not live.');
+    finding_(out, 'expiring', '1d. status values', distinctWithCounts_(live, 'status', 12), null);
+  }
+
+  // 2 — what the tab holds
+  var tab = readTab_('Lease_Expirations');
+  finding_(out, 'expiring', '2. Lease_Expirations tab', tab.length + ' rows',
+    tab.length ? null : 'TAB IS EMPTY — rebuildLeasing has not run since the last change.');
+
+  // 3 — the dashboard filter chain, step by step
+  if (tab.length) {
+    var afterTPO = dropTPO_(tab);
+    finding_(out, 'expiring', '3. After TPO and exclusions', afterTPO.length + ' rows',
+      (tab.length - afterTPO.length) + ' removed');
+
+    var liveT = liveTenancy_();
+    var afterTen = afterTPO.filter(function (r) { return isActiveTenancy_(r, liveT); });
+    finding_(out, 'expiring', '4. After active-tenancy filter', afterTen.length + ' rows',
+      (afterTPO.length - afterTen.length) + ' removed. If this is the big drop, occupancy ids ' +
+      'are not matching the rent roll.');
+
+    var afterDays = afterTen.filter(function (r) {
+      var d = daysBetween_(t, ymd_(r.lease_expires));
+      return d !== null && d <= 120;
+    });
+    finding_(out, 'expiring', '5. After the 120-day window', afterDays.length + ' rows',
+      afterDays.length ? 'These are what should render.' : 'ALL REMOVED HERE — check lease_expires values.');
+
+    var occInRoll = 0;
+    afterTPO.slice(0, 40).forEach(function (r) {
+      if (r.occupancy_id && liveT.occupancies[String(r.occupancy_id).trim()]) occInRoll++;
+    });
+    finding_(out, 'expiring', '6. Occupancy match rate (first 40)',
+      occInRoll + '/40 found in the rent roll',
+      occInRoll === 0 ? 'ZERO MATCHES — occupancy_id is missing from one side, or the rent roll ' +
+                        'pull is stale. This would empty the list on its own.' : null);
+  }
+
+  writeTab_('_expiring_diagnostic', out,
+    { headers: ['system','question','answer','action_required','discovered_at'] });
+  Logger.log(JSON.stringify(out, null, 1));
+  return out;
+}
+
+// ============================================================ DOOR HISTORY
+
+/**
+ * Why does churn read what it reads?
+ *
+ * Three things must all be true before a lost door can be counted:
+ *   1. the property carries a management_end_date (it lives on the PROPERTY, never
+ *      on the unit — units can only be hidden)
+ *   2. that property is still returned by the API, which for a hidden record means
+ *      property_visibility:"all"
+ *   3. its doors were placed in a month we can date
+ *
+ * Any one of them failing produces the same symptom: churn reads zero. This tells
+ * you which one. Run it from the editor and read the log.
+ */
+function diagnoseDoorHistory() {
+  var out = [];
+  var t = ymd_(today_());
+
+  var visP = readTab_('Properties_Units'), visU = readTab_('Unit_Directory');
+  var allP = readTab_('Properties_All'),   allU = readTab_('Unit_Directory_All');
+
+  out.push('--- STEP 1: does property_visibility:"all" return more? ---');
+  if (!allP.length) {
+    out.push('Properties_All is EMPTY. Run rebuildAll() first — everything below is');
+    out.push('measured against the wider pull.');
+    Logger.log(out.join('\n'));
+    return out.join('\n');
+  }
+  out.push('properties  visible-only ' + visP.length + '  ·  all ' + allP.length +
+           '  ·  hidden ' + (allP.length - visP.length));
+  out.push('units       visible-only ' + visU.length + '  ·  all ' + allU.length +
+           '  ·  hidden ' + (allU.length - visU.length));
+  if (allP.length === visP.length && allU.length === visU.length) {
+    out.push('>> The parameter changed nothing. Either nothing is hidden in AppFolio, or');
+    out.push('   property_directory ignores property_visibility. If offboarded properties');
+    out.push('   exist and are not in this count, it is the latter — raise it with AppFolio.');
+  } else {
+    out.push('>> Hidden records ARE being recovered. Door history uses this wider set.');
+  }
+
+  out.push('');
+  out.push('--- STEP 2: management_end_date, the only signal churn counts ---');
+  var seen = {}, ended = [], zFlagged = [], zOverdue = [], zUndated = [], both = 0;
+  allP.forEach(function (p) {
+    var id = String(p.property_id || '');
+    if (!id || seen[id]) return;
+    seen[id] = true;
+    var end = ymd_(p.management_end_date);
+    var e = endingMgmt_(p);
+    if (end) { ended.push({ p: p, id: id, date: end }); if (e) both++; }
+    else if (e) {
+      zFlagged.push({ p: p, id: id, date: e.date, raw: e.raw });
+      if (e.date && e.date < t) zOverdue.push(e); else if (!e.date) zUndated.push(e);
+    }
+  });
+  out.push(ended.length + ' propert' + (ended.length === 1 ? 'y has' : 'ies have') + ' the field set');
+  if (ended.length) {
+    var ds = ended.map(function (x) { return x.date; }).sort();
+    out.push('  range ' + ds[0] + ' to ' + ds[ds.length - 1]);
+    var wasVisible = 0;
+    var visIds = {};
+    visP.forEach(function (p) { visIds[String(p.property_id)] = 1; });
+    ended.forEach(function (x) { if (visIds[x.id]) wasVisible++; });
+    out.push('  of those, ' + wasVisible + ' appear in the visible-only pull and ' +
+             (ended.length - wasVisible) + ' are hidden');
+    if (ended.length - wasVisible > 0) {
+      out.push('  >> CONFIRMED: ' + (ended.length - wasVisible) + ' ended propert' +
+               (ended.length - wasVisible === 1 ? 'y was' : 'ies were') + ' invisible to the');
+      out.push('     old pull. That is why lost doors read near zero. Fixed by the wider pull.');
+    }
+    var doors = 0;
+    var unitsByProp = {};
+    allU.forEach(function (u) {
+      if (u.property_id) unitsByProp[String(u.property_id)] = (unitsByProp[String(u.property_id)] || 0) + 1;
+    });
+    ended.forEach(function (x) { doors += unitsByProp[x.id] || num_(x.p.units) || 0; });
+    out.push('  doors attached to ended properties: ' + doors);
+    var noUnits = ended.filter(function (x) { return !unitsByProp[x.id]; });
+    if (noUnits.length) {
+      out.push('  ' + noUnits.length + ' of them return NO units even with visibility:all,');
+      out.push('  so their door count comes from the property\u2019s own units field.');
+    }
+    var noStart = ended.filter(function (x) { return !ymd_(x.p.management_start_date); });
+    if (noStart.length) {
+      out.push('  >> WARNING: ' + noStart.length + ' ended propert' +
+               (noStart.length === 1 ? 'y has' : 'ies have') + ' no management_start_date, so');
+      out.push('     their doors can never be placed in a month and will not appear as lost.');
+      out.push('     ' + noStart.slice(0, 6).map(function (x) {
+        return x.p.property_name || x.id; }).join(' | '));
+    }
+  } else {
+    out.push('  >> Churn can only read 0%. Nothing has a completed offboarding date.');
+  }
+
+  out.push('');
+  out.push('--- STEP 3: the z naming flag (scheduled, still managed, NOT churn) ---');
+  out.push(zFlagged.length + ' flagged and still active');
+  out.push('  past their date and still managed: ' + zOverdue.length);
+  out.push('  no readable date in the name: ' + zUndated.length);
+  if (zUndated.length) {
+    out.push('  ' + zUndated.slice(0, 8).map(function (e) { return e.raw; }).join(' | '));
+  }
+  out.push(both + ' propert' + (both === 1 ? 'y carries' : 'ies carry') +
+           ' both a z name and an end date (offboarded, name not tidied up)');
+
+  out.push('');
+  out.push('--- STEP 4: what the dashboard will show ---');
+  var dh = readTab_('Door_History');
+  if (!dh.length) {
+    out.push('Door_History is empty — run rebuildPortfolio().');
+  } else {
+    var yr = dh.slice(-12);
+    var lost = yr.reduce(function (a, r) { return a + (num_(r.lost_doors) || 0); }, 0);
+    var gained = yr.reduce(function (a, r) { return a + (num_(r.new_doors) || 0); }, 0);
+    out.push('last 12 months: +' + gained + ' new, -' + lost + ' lost, net ' + (gained - lost));
+    var drift = 0;
+    dh.forEach(function (r) {
+      if (num_(r.doors_start) + num_(r.new_doors) - num_(r.lost_doors) !== num_(r.total_doors)) drift++;
+    });
+    out.push(drift ? '>> ' + drift + ' month(s) do not reconcile — report this.'
+                   : 'running balance reconciles in every month');
+  }
+
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ PERFORMANCE VIEW
+
+/**
+ * Why is a Performance tile blank?
+ *
+ * A tile needs four things to land: an entry in the registry, status active, a
+ * calculation in CALC, and data for that calculation to find. A benchmark tick needs a
+ * fifth — a benchmark block in the registry. On screen, all five failures looked the
+ * same: a dash.
+ *
+ * This reports each one separately, per metric, and names the file to edit.
+ */
+function diagnosePerformanceView() {
+  var out = [];
+  var reg;
+  try { reg = loadRegistry_(); }
+  catch (e) {
+    Logger.log('Registry could not be loaded: ' + e.message +
+               '\nREGISTRY_FILE_ID may be unset or the file may have moved.');
+    return 'Registry could not be loaded: ' + e.message;
+  }
+  var regMetrics = (reg && reg.metrics) || [];
+  var rows = readTab_('Metrics').filter(function (r) { return r.period === 'ALL'; });
+  var byId = indexBy_(rows, 'metric_id');
+
+  out.push('REGISTRY: ' + regMetrics.length + ' metrics defined');
+  out.push('METRICS TAB: ' + rows.length + ' rows with period=ALL');
+  var lastRun = rows.length ? rows[0].run_date : '(never)';
+  out.push('LAST computeMetrics RUN: ' + lastRun);
+  out.push('');
+
+  var byStatus = {}, noCalc = [], noBench = [], nullValue = [], live = [];
+  regMetrics.forEach(function (m) {
+    var st = String(m.status || 'active');
+    byStatus[st] = (byStatus[st] || 0) + 1;
+    var row = byId[m.id];
+    var hasCalc = false;
+    try { hasCalc = typeof CALC[m.id] === 'function'; } catch (e) {}
+    var hasBench = !!(m.benchmark && (m.benchmark.median !== null && m.benchmark.median !== undefined
+                                      && m.benchmark.median !== ''));
+    if (!hasCalc && st !== 'deferred' && st !== 'blocked') noCalc.push(m.id);
+    if (!hasBench) noBench.push(m.id);
+    if (row && (row.value === null || row.value === '')) nullValue.push(m.id + ' [' + (row.status || '') + ']');
+    if (row && row.value !== null && row.value !== '') live.push(m.id);
+  });
+
+  out.push('--- STATUS IN THE REGISTRY ---');
+  Object.keys(byStatus).sort().forEach(function (k) {
+    out.push('  ' + byStatus[k] + '  ' + k);
+  });
+  if (byStatus.deferred) {
+    out.push('  >> ' + byStatus.deferred + ' metric(s) are DEFERRED. computeMetrics never even');
+    out.push('     calls their calculation, so they publish a null no matter what data exists.');
+    out.push('     LeadSimple is live now — any deferred LeadSimple metric needs its status');
+    out.push('     changed to "active" in welease-metric-registry-v2.json.');
+    var defs = regMetrics.filter(function (m) { return m.status === 'deferred'; });
+    out.push('     ' + defs.map(function (m) {
+      return m.id + ' (' + String(m.system || '?') + ')'; }).join(', '));
+  }
+
+  out.push('');
+  out.push('--- BENCHMARKS ---');
+  out.push(noBench.length + ' of ' + regMetrics.length + ' metrics have NO benchmark median.');
+  if (noBench.length) {
+    out.push('  Those tiles can never show a target tick. Not a bug — the registry simply');
+    out.push('  has no survey figure for them. Add benchmark.median to the registry entry.');
+    out.push('  ' + noBench.slice(0, 25).join(', '));
+  }
+
+  out.push('');
+  out.push('--- CALCULATIONS ---');
+  if (noCalc.length) {
+    out.push(noCalc.length + ' active metric(s) have NO entry in CALC in Metrics.gs:');
+    out.push('  ' + noCalc.join(', '));
+  } else {
+    out.push('Every active metric has a calculation.');
+  }
+
+  out.push('');
+  out.push('--- WHAT LANDED ---');
+  out.push(live.length + ' metric(s) published a value: ' + live.join(', '));
+  out.push(nullValue.length + ' published a null:');
+  nullValue.forEach(function (x) { out.push('  ' + x); });
+
+  out.push('');
+  out.push('--- TILES ON THE DASHBOARD ---');
+  var wired = [], missing = [];
+  (typeof TILE_GROUPS === 'undefined' ? [] : TILE_GROUPS).forEach(function (g) {
+    g.metrics.forEach(function (id) {
+      if (byId[id]) wired.push(id); else missing.push(g.label + ' -> ' + id);
+    });
+  });
+  out.push(wired.length + ' tile id(s) resolve to a Metrics row.');
+  if (missing.length) {
+    out.push(missing.length + ' tile id(s) do NOT exist in the Metrics tab — these render');
+    out.push('as a warning on the page. Fix the id in TILE_GROUPS (Dashboard.gs) or add the');
+    out.push('metric to the registry:');
+    missing.forEach(function (x) { out.push('  ' + x); });
+  }
+
+  out.push('');
+  out.push('--- WHAT TO DO ---');
+  if (byStatus.deferred) out.push('1. Flip deferred LeadSimple metrics to active in the registry.');
+  if (noBench.length)    out.push('2. Add benchmark.median where you want a target tick.');
+  if (noCalc.length)     out.push('3. Write the missing CALC entries, or mark those metrics deferred.');
+  if (missing.length)    out.push('4. Correct the ids in TILE_GROUPS.');
+  out.push('Then: computeMetrics() -> rebuildDashboardCache() -> new deployment version.');
+
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+/**
+ * The 64-versus-0 puzzle: the banner counts rows sitting on Unassigned while the
+ * worksheet finds no properties without a manager. Both numbers cannot be right.
+ */
+function diagnoseUnassigned() {
+  var out = [];
+  var pm = pmLookup_();
+  var props = readTab_('Properties_Units');
+  var book = addressBook_();
+
+  out.push('PM_Groups rows: ' + readTab_('PM_Groups').length);
+  out.push('Properties with a PM-prefixed group: ' + Object.keys(pm).length);
+  out.push('Properties_Units rows: ' + props.length);
+  out.push('');
+
+  var seen = {}, noGroup = [], closing = 0, excluded = 0, inactive = 0;
+  props.forEach(function (p) {
+    var id = String(p.property_id || '');
+    if (!id || seen[id]) return;
+    seen[id] = true;
+    if (pm[id]) return;
+    if (isExcluded_(p)) { excluded++; return; }
+    if (!isActiveProperty_(p)) { inactive++; return; }
+    if (isEndingMgmt_(p)) { closing++; return; }
+    noGroup.push(p);
+  });
+
+  out.push('--- PROPERTIES WITH NO PM GROUP ---');
+  out.push('reaching the worksheet: ' + noGroup.length);
+  out.push('held back as excluded: ' + excluded);
+  out.push('held back as management ended: ' + inactive);
+  out.push('held back as closing (z name): ' + closing);
+  noGroup.slice(0, 15).forEach(function (p) {
+    out.push('   ' + String(p.property_id) + '  ' + (p.property_name || p.property || ''));
+  });
+
+  // THE ACTIONABLE PART: which lists produce Unassigned rows, and why.
+  out.push('');
+  out.push('--- WHERE THE UNASSIGNED ROWS ACTUALLY COME FROM ---');
+  out.push('The banner counts ROWS across every list. A row lands on Unassigned when');
+  out.push('pmOf_ cannot resolve it — which happens for three different reasons, and only');
+  out.push('one of them is fixable in AppFolio.');
+  out.push('');
+  var U = [];
+  try { U = urgencies_(pm); } catch (e) { out.push('  urgencies_ failed: ' + e.message); }
+
+  var perBlock = [];
+  U.forEach(function (b) {
+    var un = b.rows.filter(function (r) { return r.pm === UNASSIGNED; });
+    if (!un.length) return;
+
+    // Classify the reason, using the first few rows as the sample.
+    var noProp = 0, propUnknown = 0, propNoGroup = 0;
+    un.forEach(function (r) {
+      var src = r.src || {};
+      var pid = src.property_id;
+      if (pid === null || pid === undefined || pid === '') { noProp++; return; }
+      if (!seen[String(pid)]) { propUnknown++; return; }
+      propNoGroup++;
+    });
+    perBlock.push({ id: b.id, title: b.title, n: un.length,
+                    noProp: noProp, unknown: propUnknown, noGroup: propNoGroup });
+  });
+  perBlock.sort(function (a, b) { return b.n - a.n; });
+
+  var totNoProp = 0, totUnknown = 0, totNoGroup = 0;
+  out.push('list                          rows   no property id   property not in   property has');
+  out.push('                                     on the row       Properties_Units  no PM group');
+  perBlock.forEach(function (b) {
+    totNoProp += b.noProp; totUnknown += b.unknown; totNoGroup += b.noGroup;
+    out.push('  ' + String(b.id).padEnd(28) + String(b.n).padStart(5) +
+             String(b.noProp).padStart(17) + String(b.unknown).padStart(18) +
+             String(b.noGroup).padStart(14));
+  });
+  out.push('  ' + 'TOTAL'.padEnd(28) + String(totNoProp + totUnknown + totNoGroup).padStart(5) +
+           String(totNoProp).padStart(17) + String(totUnknown).padStart(18) +
+           String(totNoGroup).padStart(14));
+
+  out.push('');
+  out.push('--- WHAT TO CLEAN ---');
+  if (totNoGroup) {
+    out.push(totNoGroup + ' row(s): the property EXISTS and simply has no PM-prefixed group.');
+    out.push('   THIS is the fixable one. Add those properties to a PM group in AppFolio.');
+    out.push('   They are listed on Performance under "Properties with no manager assigned".');
+  }
+  if (totUnknown) {
+    out.push(totUnknown + ' row(s): the row carries a property_id that is not in');
+    out.push('   Properties_Units at all. Usually a hidden or offboarded property whose');
+    out.push('   records still appear on a financial report. Nothing to fix in AppFolio —');
+    out.push('   these should be scoped out, not assigned.');
+  }
+  if (totNoProp) {
+    out.push(totNoProp + ' row(s): the row has NO property_id. Vendor bills, owner-level');
+    out.push('   charges and similar are not attached to a property, so no manager can ever');
+    out.push('   be derived. Nothing to fix — the banner should not be counting these.');
+  }
+  out.push('');
+  out.push('If the fixable count is 0 and the banner still shows a large number, the');
+  out.push('banner is counting rows that were never assignable. Tell me the split above');
+  out.push('and I will narrow what it counts.');
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ SHOWMOJO
+
+/**
+ * What ShowMojo actually returns, and whether its listing codes can be joined to
+ * AppFolio.
+ *
+ * The registry's formulas for the ShowMojo metrics were written against fields that do
+ * not exist — it assumed listing_and_showing_metrics carried listed_date, leased_date
+ * and showings_count, when that report is an event log. This prints the real fields so
+ * nobody writes against imagined ones again, and probes the listing_code join that
+ * speed_to_listing and speed_to_first_applicant both depend on.
+ */
+function diagnoseShowMojo() {
+  var out = [];
+  out.push('Project timezone: ' + Session.getScriptTimeZone() + '   CFG.TZ: ' + CFG.TZ);
+  if (Session.getScriptTimeZone() !== CFG.TZ) {
+    out.push('  >> MISMATCH. ShowMojo parses dates in the ShowMojo account timezone.');
+    out.push('     A mismatch shifts every date boundary and silently clips records.');
+  }
+  out.push('');
+
+  out.push('--- TABS ---');
+  ['SM_High_Level', 'SM_Listing_Performance', 'SM_Listings', 'SM_Showings',
+   'SM_Listing_Showing', 'SM_Prospects', 'SM_Listing_Funnel'].forEach(function (t) {
+    var rows = readTab_(t);
+    var keys = rows.length ? Object.keys(rows[0]) : [];
+    out.push('  ' + t + ': ' + rows.length + ' rows' +
+             (keys.length ? '  [' + keys.slice(0, 12).join(', ') +
+              (keys.length > 12 ? ', +' + (keys.length - 12) + ' more' : '') + ']' : ''));
+  });
+
+  out.push('');
+  out.push('--- PII CHECK ---');
+  var leaked = [];
+  ['SM_Showings', 'SM_Prospects', 'SM_Listings'].forEach(function (t) {
+    var rows = readTab_(t);
+    if (!rows.length) return;
+    Object.keys(rows[0]).forEach(function (k) {
+      if (SM_DROP_FIELDS.indexOf(k) !== -1) leaked.push(t + '.' + k);
+    });
+  });
+  out.push(leaked.length
+    ? '  >> PERSONAL DATA PRESENT: ' + leaked.join(', ') + ' — SM_DROP_FIELDS did not apply.'
+    : '  No name, email, phone or free-text note fields reached the sheet.');
+
+  out.push('');
+  out.push('--- MARKET STATUS VALUES ---');
+  var st = {};
+  readTab_('SM_Listings').forEach(function (r) {
+    var k = String(r.market_status || '(blank)');
+    st[k] = (st[k] || 0) + 1;
+  });
+  var keys = Object.keys(st);
+  if (!keys.length) out.push('  SM_Listings is empty.');
+  keys.sort(function (a, b) { return st[b] - st[a]; }).forEach(function (k) {
+    var leasedLike = /leas|rent|off.?market|inactive/i.test(k);
+    out.push('  ' + String(st[k]).padStart(4) + '  ' + k + (leasedLike ? '   <- counted as leased' : ''));
+  });
+  out.push('  showings_per_lease treats the marked values as leased. If that is wrong,');
+  out.push('  widen or narrow the pattern in CALC.showings_per_lease.');
+
+  out.push('');
+  out.push('--- LISTING CODE -> APPFOLIO JOIN ---');
+  out.push('CORRECTION: an earlier version of this diagnostic reported that most codes');
+  out.push('"contain an AppFolio unit_id". That was a substring test against ids like "6"');
+  out.push('and "2", which appear inside every street number and zip. It matched noise.');
+  out.push('listing_code is an ADDRESS, not an id:');
+  out.push('  AppfolioAPI-<STREET>-<ZIP>-<BEDS>-<BATHS>-<UNIT?>');
+  out.push('');
+  var codes = readTab_('SM_Listings').map(function (r) { return String(r.listing_code || ''); })
+                                     .filter(function (c) { return c; });
+  if (!codes.length) {
+    out.push('  No listing_code values to inspect.');
+  } else {
+    var parsed = 0, withUnit = 0;
+    codes.forEach(function (c) {
+      var p = smCodeParse_(c);
+      if (p) { parsed++; if (p.unit) withUnit++; }
+    });
+    out.push('  ' + codes.length + ' codes · ' + parsed + ' parse cleanly · ' +
+             withUnit + ' carry a unit');
+    out.push('  samples:');
+    codes.slice(0, 4).forEach(function (c) {
+      var p = smCodeParse_(c);
+      out.push('    ' + c);
+      out.push('      -> street "' + (p ? p.street : '?') + '"  zip ' + (p ? p.zip : '?') +
+               '  unit "' + (p && p.unit ? p.unit : '(none)') + '"');
+    });
+
+    var j = readTab_('SM_Unit_Join').filter(function (r) { return r.unit_id; });
+    var ex = readTab_('_sm_join_exceptions').filter(function (r) { return r.source === 'listing_join'; });
+    out.push('');
+    if (!j.length && !ex.length) {
+      out.push('  buildShowMojoJoin() has not run yet. Run it, then re-run this.');
+    } else {
+      var rate = codes.length ? Math.round(j.length / codes.length * 100) : 0;
+      out.push('  JOINED: ' + j.length + ' of ' + codes.length + ' (' + rate + '%)');
+      var why = {};
+      ex.forEach(function (r) { var k = r.reason || 'unknown'; why[k] = (why[k] || 0) + 1; });
+      Object.keys(why).sort(function (a, b) { return why[b] - why[a]; }).forEach(function (k) {
+        out.push('    ' + String(why[k]).padStart(4) + '  ' + k);
+      });
+      if (rate >= 60) {
+        out.push('  >> Good enough to build on. speed_to_listing, speed_to_first_applicant');
+        out.push('     and showings_per_lease all read this join.');
+      } else {
+        out.push('  >> Below 60%. Those metrics describe the matched subset, not the');
+        out.push('     portfolio, and say so in their notes. The reasons above tell you');
+        out.push('     whether it is address formatting or genuinely missing units.');
+      }
+    }
+  }
+
+  out.push('');
+  out.push('--- WHAT "OFF MARKET" MEANS ---');
+  out.push('ShowMojo has no leased status. A listing goes off market when it leases, when');
+  out.push('the owner pulls it, or when it is paused. showings_per_lease therefore counts');
+  out.push('a listing as leased only when its joined AppFolio unit recorded a move-in');
+  out.push('after it left the market. Off-market listings with no move-in are withdrawals.');
+
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ RENT TIMING
+
+/**
+ * How much of each month the rent-timing trend actually covers.
+ *
+ * The measure depends on knowing a household's rent, and the only rent this pipeline
+ * stores is today's. Former residents have none at all. This prints, per month, how
+ * many occupancy-months were measurable against how many produced receipts — so the
+ * older the month, the more obvious the gap becomes.
+ */
+/**
+ * Does the rent-timing picture agree with what is actually outstanding?
+ *
+ * The two numbers come from opposite directions — timing is built from receipts, the
+ * aged receivables are built from charges — so if they agree, the picture is real. If
+ * they do not, this says by how much and in which direction, which is the part that
+ * every previous round of this argument was missing.
+ *
+ * Run it whenever the timing chart looks wrong. It answers in one screen.
+ */
+function reconcileRentTiming() {
+  var out = [];
+  var thisMonth = monthKey_(ymd_(today_()));
+  var day = today_().getDate();
+
+  var timing = readTab_('Rent_Timing').filter(function (r) {
+    return monthNorm_(r.month) === thisMonth; })[0];
+  if (!timing) {
+    Logger.log('No Rent_Timing row for ' + thisMonth + ' — run rebuildPortfolio().');
+    return 'No row for ' + thisMonth;
+  }
+
+  out.push('RENT TIMING vs WHAT IS OUTSTANDING  ·  ' + thisMonth + ', day ' + day);
+  out.push('');
+  out.push('From receipts (Rent_Timing):');
+  out.push('  households on the rent roll   ' + timing.households);
+  out.push('  satisfied before the 1st      ' + (timing.before_1st || 0) +
+           '   <- prepayment, applied on the 1st');
+  out.push('  satisfied on the 1st          ' + (timing.on_1st || 0));
+  out.push('  2nd to 5th                    ' +
+           ((num_(timing.on_2nd) || 0) + (num_(timing.on_3rd) || 0) +
+            (num_(timing.on_4th) || 0) + (num_(timing.on_5th) || 0)));
+  out.push('  after the 5th                 ' + (timing.after_5th || 0));
+  out.push('  nothing that reaches the rent ' + (timing.short_paid || 0));
+  out.push('  window closed                 ' + (timing.window_closed || 'YES'));
+
+  // The independent check. These are built from charges, not receipts.
+  var owes = 0, owesRent = 0, total = 0, aged0 = 0;
+  readTab_('Delinquency_Aged').forEach(function (d) {
+    var st = String(d.tenant_status || '').toLowerCase();
+    if (st.indexOf('current') === -1 && st.indexOf('notice') === -1) return;
+    owes++;
+    if ((num_(d.delinquent_rent) || 0) > 0) owesRent++;
+    total += num_(d.amount_receivable) || 0;
+    aged0 += num_(d['00_to30']) || num_(d['0_to30']) || 0;
+  });
+
+  var live = readTab_('Rent_Roll').filter(function (r) {
+    var st = String(r.status || '').toLowerCase();
+    return st.indexOf('current') !== -1 || st.indexOf('notice') !== -1;
+  }).length;
+
+  out.push('');
+  out.push('From the aged receivables (independent of receipts):');
+  out.push('  live households               ' + live);
+  out.push('  owing anything                ' + owes);
+  out.push('  owing RENT                    ' + owesRent);
+  out.push('  paid up entirely              ' + (live - owes));
+  out.push('  balance outstanding           $' + Math.round(total));
+  out.push('  of which 0-30 days            $' + Math.round(aged0) +
+           '   <- mostly this month, charged on the 1st');
+
+  // The comparison that settles it.
+  var timingLate = (num_(timing.after_5th) || 0) + (num_(timing.short_paid) || 0);
+  out.push('');
+  out.push('THE COMPARISON:');
+  out.push('  timing says not yet paid      ' + timingLate);
+  out.push('  receivables say owing rent    ' + owesRent);
+  var gap = timingLate - owesRent;
+  if (Math.abs(gap) <= Math.max(5, owesRent * 0.15)) {
+    out.push('  -> they agree. The picture is real.');
+  } else if (gap > 0) {
+    out.push('  -> timing reports ' + gap + ' MORE unpaid than actually owe rent.');
+    out.push('     That is the prepayment gap: households whose money arrived last month.');
+    out.push('     If this is large after a rebuild, the carry-forward is not reaching them.');
+  } else {
+    out.push('  -> timing reports ' + (-gap) + ' FEWER unpaid than owe rent.');
+    out.push('     Receipts are being credited that the ledger has not settled.');
+  }
+  if (String(timing.window_closed) === 'NO') {
+    out.push('');
+    out.push('  NOTE: day ' + day + '. The month has not reached the 5th, so "after the 5th"');
+    out.push('  cannot mean anything yet. The headline on screen uses the last closed month.');
+  }
+
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+function diagnoseRentTiming() {
+  var out = [];
+  var rec = inScopeIncludingInactive_(readTab_('Receivables_Activity'));
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+  var rentByOcc = {};
+  rr.forEach(function (r) { if (r.occupancy_id) rentByOcc[r.occupancy_id] = num_(r.rent) || 0; });
+
+  out.push('Rent on file for ' + Object.keys(rentByOcc).length + ' occupancies (current rent roll)');
+  out.push('Receivable rows: ' + rec.length);
+  out.push('');
+
+  var byMonth = {};
+  rec.forEach(function (r) {
+    var d = parseDate_(r.txn_receipt_date);
+    if (!d || !r.occupancy_id) return;
+    if ((num_(r.txn_amount) || 0) <= 0) return;
+    var m = monthKey_(r.txn_receipt_date);
+    var b = byMonth[m] || (byMonth[m] = { month: m, occs: {}, known: {}, unknown: {} });
+    b.occs[r.occupancy_id] = 1;
+    if (rentByOcc[r.occupancy_id]) b.known[r.occupancy_id] = 1;
+    else b.unknown[r.occupancy_id] = 1;
+  });
+
+  out.push('--- COVERAGE BY MONTH ---');
+  out.push('month     households  measurable  no rent on file  coverage');
+  Object.keys(byMonth).sort().slice(-18).forEach(function (m) {
+    var b = byMonth[m];
+    var all = Object.keys(b.occs).length;
+    var known = Object.keys(b.known).length;
+    var pct = all ? Math.round(known / all * 100) : 0;
+    out.push('  ' + m + '   ' + String(all).padStart(6) + String(known).padStart(12) +
+             String(all - known).padStart(17) + String(pct + '%').padStart(10) +
+             (pct < 80 ? '   <- thin' : ''));
+  });
+  out.push('');
+  out.push('Months below about 80% are describing a shrinking subset of households.');
+  out.push('The gap is former residents: they leave the rent roll, so their rent becomes');
+  out.push('unknown and their months drop out.');
+
+  out.push('');
+  out.push('--- WHAT THE RECEIPTS LOOK LIKE ---');
+  var types = {}, remarks = {};
+  rec.forEach(function (r) {
+    var t = String(r.payment_type || '(blank)');
+    types[t] = (types[t] || 0) + 1;
+    var rm = String(r.txn_remarks || '').trim().slice(0, 40);
+    if (rm) remarks[rm] = (remarks[rm] || 0) + 1;
+  });
+  out.push('payment_type values:');
+  Object.keys(types).sort(function (a, b) { return types[b] - types[a]; }).slice(0, 12)
+    .forEach(function (k) { out.push('  ' + String(types[k]).padStart(6) + '  ' + k); });
+  out.push('most common txn_remarks:');
+  Object.keys(remarks).sort(function (a, b) { return remarks[b] - remarks[a]; }).slice(0, 12)
+    .forEach(function (k) { out.push('  ' + String(remarks[k]).padStart(6) + '  ' + k); });
+  out.push('');
+  out.push('If any of these reliably distinguish a RENT receipt from a utility or fee,');
+  out.push('the 50%-of-rent threshold can be replaced with a direct classification and');
+  out.push('the measure stops depending on knowing the rent at all. Send me this list.');
+
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ REPAIRS
+
+/**
+ * Blanks the literal text "null" that appendTab_ used to write.
+ *
+ * typeof null === 'object', so the old mapper sent it to JSON.stringify and produced a
+ * four-character string. Every appendTab_ tab carries them. Re-pulling would fix it,
+ * but LS_Tasks_Completed alone is an hour, so this repairs in place.
+ *
+ * Deliberately narrow: only the exact string "null", only in tabs written by appendTab_.
+ * A cell that legitimately reads "null" as a word would be a false positive, which is
+ * why this is a hand-run repair and not something readTab_ does silently on every read.
+ */
+function repairNullText() {
+  var TABS = ['Metrics_History', 'LS_Tasks_All', 'LS_Tasks_Completed', 'Portfolio_Summary_History',
+              'SM_High_Level_History', 'Collections_History', 'Insurance_History',
+              'Item_Status_Log', 'Throughput'];
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var out = [], grand = 0;
+
+  TABS.forEach(function (name) {
+    var sh = ss.getSheetByName(name);
+    if (!sh || sh.getLastRow() < 2) { out.push('  ' + name + ': not present or empty'); return; }
+    var rng = sh.getDataRange();
+    var vals = rng.getValues();
+    var hits = 0;
+    for (var r = 1; r < vals.length; r++) {
+      for (var c = 0; c < vals[r].length; c++) {
+        if (vals[r][c] === 'null') { vals[r][c] = ''; hits++; }
+      }
+    }
+    if (hits) { rng.setValues(vals); invalidateTab_(name); }
+    grand += hits;
+    out.push('  ' + name + ': ' + hits + ' cell(s) cleared of ' +
+             ((vals.length - 1) * (vals[0] || []).length) + ' checked');
+  });
+
+  var text = 'Cleared ' + grand + ' literal "null" cells.\n' + out.join('\n') +
+             '\n\nappendTab_ no longer writes them. This is a one-off.';
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ LEADSIMPLE PROBE
+
+/**
+ * What a completed task ACTUALLY looks like.
+ *
+ * lsCompletedTaskRow_ reads t.step.name and t.skipped because the registry says
+ * Task.step and Task.skipped. Across 68,000 tasks both came back empty for every
+ * single row, which means either the fields are named differently, or they are not
+ * returned on the list endpoint at all.
+ *
+ * I got this wrong the same way twice now — writing extraction against a registry's
+ * description instead of the payload. This prints the payload.
+ *
+ * PII: values are shown as types and lengths, not contents, except for the small set
+ * of structural fields the metrics need.
+ */
+function lsProbeTask(sampleSize) {
+  if (!systemEnabled_('leadsimple')) return 'LeadSimple is disabled.';
+  var n = sampleSize || 50;
+  var res = lsGet2_('/tasks', { due_type: 'completed', per_page: n, page: 1 }, n);
+  var rows = (res && (res.data || res.results || res)) || [];
+  if (!Array.isArray(rows) || !rows.length) {
+    Logger.log('No completed tasks returned.');
+    return 'none';
+  }
+
+  var out = [];
+  out.push('Sampled ' + rows.length + ' completed task(s).');
+  out.push('');
+  out.push('--- TOP-LEVEL KEYS ---');
+  var keys = {};
+  rows.forEach(function (t) { Object.keys(t).forEach(function (k) { keys[k] = 1; }); });
+  Object.keys(keys).sort().forEach(function (k) {
+    var v = null;
+    for (var i = 0; i < rows.length && v === null; i++) {
+      if (rows[i][k] !== null && rows[i][k] !== undefined) v = rows[i][k];
+    }
+    var t = v === null ? 'always null' : (Array.isArray(v) ? 'array' : typeof v);
+    var hint = '';
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      hint = '  { ' + Object.keys(v).join(', ') + ' }';
+    }
+    out.push('  ' + k.padEnd(22) + t.padEnd(14) + hint);
+  });
+
+  out.push('');
+  out.push('--- FIELD COVERAGE ACROSS THE SAMPLE ---');
+  out.push('Counting how many of the ' + rows.length + ' carry a usable value. A field that is');
+  out.push('merely null in a small sample is NOT absent — reporting it that way is how the');
+  out.push('first version of this probe misread process and auto_send_error.');
+  [['step', 'step label for the onboarding and renewal durations'],
+   ['skipped', 'skipped_step_rate'],
+   ['auto_send', 'automation_failure_rate'],
+   ['auto_send_error', 'automation_failure_rate'],
+   ['completed_at', 'every duration'],
+   ['process', 'process type and created/closed dates'],
+   ['deal', 'tasks attached to a deal rather than a process']
+  ].forEach(function (pair) {
+    var k = pair[0];
+    var filled = rows.filter(function (t) {
+      return t[k] !== undefined && t[k] !== null && t[k] !== '';
+    }).length;
+    // For a boolean, "present on every row" says nothing — false is present. Report
+    // how many are actually TRUE, or the field looks universal when it is never set.
+    var isBool = rows.some(function (t) { return typeof t[k] === 'boolean'; });
+    var extra = isBool
+      ? '   (' + rows.filter(function (t) { return t[k] === true; }).length + ' true)'
+      : '';
+    out.push('  ' + String(filled).padStart(4) + '/' + rows.length + '  ' +
+             k.padEnd(18) + pair[1] + extra);
+  });
+
+  // The step object has no name field. Show what it does have.
+  var withStep = rows.filter(function (t) { return t.step; });
+  if (withStep.length) {
+    out.push('');
+    out.push('--- WHAT A STEP LOOKS LIKE ---');
+    out.push('  keys: ' + Object.keys(withStep[0].step).join(', '));
+    out.push('  there is no "name" — the label is description, with kind as a fallback');
+    withStep.slice(0, 5).forEach(function (t) {
+      out.push('    description: ' + JSON.stringify(t.step.description) +
+               '   kind: ' + JSON.stringify(t.step.kind) +
+               '   order: ' + JSON.stringify(t.step.sort_order));
+    });
+  }
+
+  // Is a zero skip rate real, or does due_type=completed exclude skipped tasks?
+  out.push('');
+  out.push('--- IS ANYTHING EVER SKIPPED? ---');
+  var skippedHere = rows.filter(function (t) { return t.skipped === true; }).length;
+  out.push('  completed sample: ' + skippedHere + ' of ' + rows.length + ' skipped');
+  try {
+    var alt = lsGet2_('/tasks', { per_page: n, page: 1 }, n);
+    var altRows = (alt && (alt.data || alt.results || alt)) || [];
+    var altSkipped = altRows.filter(function (t) { return t.skipped === true; }).length;
+    out.push('  unfiltered sample: ' + altSkipped + ' of ' + altRows.length + ' skipped');
+    if (!skippedHere && altSkipped) {
+      out.push('  >> Skipped tasks exist but do NOT appear under due_type=completed.');
+      out.push('     skipped_step_rate cannot be measured from the completed set — it needs');
+      out.push('     the unfiltered pull. Tell me and I will change the seed.');
+    } else if (!skippedHere && !altSkipped) {
+      out.push('  >> No skipped task in either sample. A zero rate may simply be true,');
+      out.push('     but a wider sample would settle it: lsProbeTask(200).');
+    }
+  } catch (e) {
+    out.push('  unfiltered probe failed: ' + e.message);
+  }
+
+  out.push('');
+  out.push('--- WHAT IS time_to_first_touch MEASURED FROM? ---');
+  out.push('The first version of this check compared it only against created_at ->');
+  out.push('first_contacted_at and reported UNCLEAR at a median ratio of 23.4. That ruled');
+  out.push('out every unit but could not say why. This tests several baselines, and looks');
+  out.push('at the SPREAD as well as the median — a real relationship is tight.');
+  try {
+    var dl = lsGet2_('/pipelines/' + LS.OWNERS_PIPELINE_ID + '/deals',
+                     { per_page: 100, page: 1 }, 100);
+    var deals = (dl && (dl.data || dl.results || dl)) || [];
+    var secs = function (a, b) {
+      if (!a || !b) return null;
+      var t = (new Date(b).getTime() - new Date(a).getTime()) / 1000;
+      return isFinite(t) && t >= 0 ? t : null;
+    };
+    var BASELINES = [
+      ['created_at', 'first_contacted_at'],
+      ['last_assigned_at', 'first_contacted_at'],
+      ['created_at', 'last_emailed_at'],
+      ['created_at', 'last_called_at']
+    ];
+    BASELINES.forEach(function (b) {
+      var rs = [];
+      deals.forEach(function (d) {
+        var v = num_(d.time_to_first_touch);
+        if (!v) return;
+        var e = secs(d[b[0]], d[b[1]]);
+        if (e === null || e <= 0) return;
+        rs.push(e / v);
+      });
+      if (!rs.length) { out.push('  ' + b[0] + ' -> ' + b[1] + ': no comparable deals'); return; }
+      rs.sort(function (x, y) { return x - y; });
+      var med = rs[Math.floor(rs.length / 2)];
+      var q1 = rs[Math.floor(rs.length * 0.25)], q3 = rs[Math.floor(rs.length * 0.75)];
+      // A genuine unit conversion is the SAME multiple on every record. Wide spread
+      // means the two things are not measuring the same interval at all.
+      var tight = q1 > 0 && (q3 / q1) < 1.3;
+      out.push('  ' + (b[0] + ' -> ' + b[1]).padEnd(40) +
+               'n=' + String(rs.length).padStart(3) +
+               '  median ' + (Math.round(med * 100) / 100) +
+               '  q1-q3 ' + (Math.round(q1 * 100) / 100) + '-' + (Math.round(q3 * 100) / 100) +
+               (tight ? '   <- TIGHT, this is the baseline' : '   (scattered)'));
+    });
+    out.push('');
+    out.push('  A tight ratio near 1 means seconds, 60 means minutes, 3600 means hours.');
+    out.push('  Scattered on every baseline means the field is derived some other way, and');
+    out.push('  lead_first_touch_speed is right to compute its own from the timestamps.');
+    out.push('  Nothing published reads the vendor field — it is stored raw for comparison.');
+  } catch (e) {
+    out.push('  probe failed: ' + e.message);
+  }
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+// ============================================================ RENT COLLECTION
+
+/**
+ * Why is a month's collections so far below what was charged?
+ *
+ * $315,152 collected against $1,020,731 charged is 31%. Either most receipts are
+ * missing, or "collected" is not counting what it looks like it counts. This separates
+ * the possibilities instead of guessing between them.
+ */
+function diagnoseRentCollection() {
+  var out = [];
+  var raw = readTab_('Receivables_Activity');
+  var rec = inScopeIncludingInactive_(raw);
+  var rr = dropTPO_(readTab_('Rent_Roll'));
+
+  out.push('Receivables_Activity rows: ' + raw.length +
+           '  (in scope: ' + rec.length + ', dropped by scope: ' + (raw.length - rec.length) + ')');
+  out.push('Rent_Roll rows: ' + rr.length);
+  out.push('');
+
+  if (!raw.length) {
+    out.push('The tab is EMPTY. Run rebuildFinancials().');
+    Logger.log(out.join('\n'));
+    return out.join('\n');
+  }
+
+  // Did the pull cover the window it asked for?
+  var dates = raw.map(function (r) { return ymd_(r.txn_receipt_date); })
+                 .filter(function (d) { return d; }).sort();
+  out.push('--- WINDOW ---');
+  out.push('requested: ' + ymd_(addDays_(today_(), -365)) + ' to ' + ymd_(today_()));
+  out.push('received : ' + dates[0] + ' to ' + dates[dates.length - 1]);
+  if (dates[0] > ymd_(addDays_(today_(), -350))) {
+    out.push('>> The earliest receipt is well inside the requested window. The pull was');
+    out.push('   probably truncated — check _errors for maxRows or maxPages on');
+    out.push('   receivables_activity.');
+  }
+
+  // What the TAB actually holds, cell by cell, beside what the source says it should.
+  // The tile disagreeing with this diagnostic is the whole reason this section exists:
+  // the diagnostic recomputes from Receivables_Activity, the tile reads Rent_Collection,
+  // and until you can see both there is no way to tell which one is wrong.
+  out.push('');
+  out.push('--- WHAT Rent_Collection ACTUALLY HOLDS ---');
+  var tab = readTab_('Rent_Collection');
+  if (!tab.length) {
+    out.push('EMPTY — run rebuildPortfolio(). The tile has nothing to read.');
+  } else {
+    out.push('month cells come back as: ' + tab.map(function (r) {
+      return Object.prototype.toString.call(r.month).replace(/\[object |\]/g, '');
+    }).filter(function (t, i, a) { return a.indexOf(t) === i; }).join(', ') +
+    '   (String means the format held; Date means Sheets coerced it and monthNorm_ is ' +
+    'doing the repairing)');
+    out.push('');
+    out.push('raw cell        monthNorm_   label          collected      part?   paying HH   $/HH');
+    tab.forEach(function (r) {
+      var key = monthNorm_(r.month);
+      var co = num_(r.rent_collected);
+      var hh = num_(r.households_paying);
+      var per = (co && hh) ? Math.round(co / hh) : null;
+      out.push(String(r.month).slice(0, 15).padEnd(16) + String(key).padEnd(13) +
+               String(monthLabel_(key)).padEnd(15) + String(co === null ? '—' : money_(co)).padEnd(15) +
+               String(r.is_partial === 'YES' ? 'YES' : '').padEnd(8) +
+               String(hh === null ? '—' : String(hh)).padEnd(12) +
+               (per === null ? '—' : money_(per)) +
+               // A complete month collecting under a single month's rent per paying
+               // household is a part-month wearing a full month's label.
+               ((per !== null && per < 1200 && r.is_partial !== 'YES') ? '   <<< SUSPECT' : ''));
+    });
+    out.push('');
+    var nowKey = monthNorm_(ymd_(today_()));
+    var comp = tab.map(function (r) { return { k: monthNorm_(r.month), r: r }; })
+                  .filter(function (x) { return x.k && x.r.is_partial !== 'YES' && x.k < nowKey; })
+                  .sort(function (a, b) { return a.k < b.k ? -1 : 1; });
+    var pick = comp.length ? comp[comp.length - 1] : null;
+    out.push('The tile will show: ' + (pick
+      ? money_(num_(pick.r.rent_collected)) + ' labelled ' + monthLabel_(pick.k)
+      : 'nothing — no complete month in the tab'));
+    out.push('Today is ' + ymd_(today_()) + ', so the current month key is ' + nowKey + '.');
+  }
+
+  // Is the running month actually behind, or does it just look that way because it is not
+  // over? Comparing a part month against whole months is the mistake that started all of
+  // this. The only fair comparison is the SAME DAY OF MONTH in previous months.
+  out.push('');
+  out.push('--- IS THIS MONTH BEHIND? (same day of month, like for like) ---');
+  var todayYmd = ymd_(today_());
+  var dom = Number(todayYmd.slice(8, 10));
+  out.push('Today is day ' + dom + ' of the month, so each row below counts only receipts');
+  out.push('dated on or before day ' + dom + ' of ITS month.');
+  out.push('');
+  out.push('month     receipts   households        $ by day ' + dom + '     full month');
+  var sameDay = {}, fullMonth = {};
+  rec.forEach(function (r) {
+    var d = ymd_(r.txn_receipt_date);
+    var a = num_(r.txn_amount);
+    if (!d || a === null) return;
+    var m = monthNorm_(d);
+    var day = Number(d.slice(8, 10));
+    var f = fullMonth[m] || (fullMonth[m] = { n: 0, amt: 0, occ: {} });
+    f.n++; f.amt += a;
+    if (r.occupancy_id) f.occ[r.occupancy_id] = 1;
+    if (day <= dom) {
+      var b = sameDay[m] || (sameDay[m] = { n: 0, amt: 0, occ: {} });
+      b.n++; b.amt += a;
+      if (r.occupancy_id) b.occ[r.occupancy_id] = 1;
+    }
+  });
+  var sdMonths = Object.keys(sameDay).sort().slice(-7);
+  var thisKey = monthNorm_(todayYmd);
+  var priorSd = [];
+  sdMonths.forEach(function (m) {
+    var b = sameDay[m], f = fullMonth[m] || { amt: 0 };
+    var hh = Object.keys(b.occ).length;
+    out.push('  ' + m + String(b.n).padStart(10) + String(hh).padStart(13) +
+             money_(Math.round(b.amt)).padStart(18) +
+             money_(Math.round(f.amt)).padStart(15) +
+             (m === thisKey ? '   <- running month' : ''));
+    if (m !== thisKey) priorSd.push({ amt: b.amt, hh: hh, n: b.n });
+  });
+  if (priorSd.length >= 3 && sameDay[thisKey]) {
+    var cur = sameDay[thisKey];
+    var medAmt = median_(priorSd.map(function (x) { return x.amt; }));
+    var medHh = median_(priorSd.map(function (x) { return x.hh; }));
+    var curHh = Object.keys(cur.occ).length;
+    var ratio = medAmt ? Math.round(cur.amt / medAmt * 100) : null;
+    var hhRatio = medHh ? Math.round(curHh / medHh * 100) : null;
+    out.push('');
+    out.push('By day ' + dom + ', a typical month had ' + money_(Math.round(medAmt)) + ' from ' +
+             medHh + ' households.');
+    out.push('This month has ' + money_(Math.round(cur.amt)) + ' from ' + curHh +
+             ' households — ' + ratio + '% of the money, ' + hhRatio + '% of the households.');
+    out.push('');
+    if (ratio !== null && ratio >= 80) {
+      out.push('>> NORMAL. The running month is tracking where it usually is by this date.');
+      out.push('   Its total looks small only because the month is not over. Nothing is missing.');
+    } else if (hhRatio !== null && hhRatio < 60) {
+      out.push('>> ROWS ARE MISSING. Far fewer households have transacted than by this date in');
+      out.push('   any recent month, and a collections problem does not make households');
+      out.push('   disappear — it makes them pay less. Check the windowed pull ran.');
+    } else {
+      out.push('>> The households are there but the money is light, so this is about AMOUNTS,');
+      out.push('   not missing rows — partial payments or a genuinely slow month.');
+    }
+  }
+
+  // A WARNING ABOUT THE SECTION ABOVE, learned the hard way.
+  //
+  // The same-day comparison tells you whether this month looks like the ones before it. It
+  // CANNOT tell you whether the series as a whole is right. On 2026-08-17 it reported the
+  // running month at 101% of normal — correctly — while every month in the series was
+  // understating rent by roughly two thirds, because they were all understating it equally.
+  // An internally consistent series can be uniformly wrong, and this comparison is blind to
+  // exactly that.
+  //
+  // The section below is the one that catches it, because it compares against a different
+  // source rather than against ourselves.
+  out.push('');
+  out.push('--- AGAINST THE LEDGER (a different source, which is the point) ---');
+  var gl = readTab_('Rent_Income_GL').filter(function (r) { return r.month; });
+  if (!gl.length) {
+    out.push('Rent_Income_GL is empty. Run buildRentIncomeGL() — without it there is nothing');
+    out.push('here to check the receipts series against except itself, and that is how a');
+    out.push('systematic shortfall stays invisible.');
+  } else {
+    out.push('Rent income is GL 4100 + 4105 on an accrual basis: recognised in the month the');
+    out.push('rent COVERS. Receipts are cash on the day it ARRIVED, and include the Resident');
+    out.push('Benefits Package, pet rent, late fees, utility reimbursements and deposits.');
+    out.push('They are different measures. Expect a gap; watch its SHAPE.');
+    out.push('');
+    out.push('month       rent income      receipts       receipts as % of income');
+    var glBy = {};
+    gl.forEach(function (r) { glBy[monthNorm_(r.month)] = num_(r.rent_income); });
+    var recBy = {};
+    readTab_('Rent_Collection').forEach(function (r) {
+      recBy[monthNorm_(r.month)] = num_(r.rent_collected);
+    });
+    Object.keys(glBy).sort().forEach(function (m) {
+      var g = glBy[m], c = recBy[m];
+      var pc = (g && c !== null && c !== undefined) ? Math.round(c / g * 100) : null;
+      out.push('  ' + m + money_(Math.round(g || 0)).padStart(16) +
+               (c === null || c === undefined ? '—' : money_(Math.round(c))).padStart(14) +
+               (pc === null ? '' : String(pc) + '%').padStart(22) +
+               (pc !== null && pc < 60 ? '   <- receipts far below income' : ''));
+    });
+    out.push('');
+    out.push('A month where receipts run WELL BELOW rent income is the signal that matters:');
+    out.push('rent income cannot exceed the cash that funded it over any long window, so a');
+    out.push('persistent shortfall means receipts rows are missing, not that residents are');
+    out.push('behind. Over a full year the two should be within a few percent of each other.');
+
+    // THE SHAPE OF THE GAP NAMES ITS CAUSE.
+    //
+    // A cliff means truncation: rows were cut at a page boundary. A smooth slope rising
+    // with recency means something is dropping rows as they AGE — and the only thing that
+    // ages is the tenancy. On 2026-08-19 the slope ran 63% twelve months back to 98% last
+    // month, with zero receipts from any past resident in 4,961 rows. That is not churn
+    // being measured; it is churn being deleted.
+    var slope = [];
+    Object.keys(glBy).sort().forEach(function (m) {
+      var g = glBy[m], c = recBy[m];
+      if (g && c !== null && c !== undefined) slope.push({ m: m, pct: c / g * 100 });
+    });
+    if (slope.length >= 6) {
+      var oldest = slope.slice(0, 3), newest = slope.slice(-3);
+      var avg = function (a) {
+        return a.reduce(function (s2, x) { return s2 + x.pct; }, 0) / a.length;
+      };
+      var oldAvg = avg(oldest), newAvg = avg(newest);
+      out.push('');
+      out.push('--- THE SHAPE OF THE GAP ---');
+      out.push('oldest three months average ' + Math.round(oldAvg) + '% of rent income');
+      out.push('newest three months average ' + Math.round(newAvg) + '%');
+      if (newAvg - oldAvg > 15) {
+        out.push('');
+        out.push('>> RISING WITH RECENCY. Something is dropping rows as they age, and the only');
+        out.push('   thing that ages here is the TENANCY. Check the status mix below: if there');
+        out.push('   is not a single receipt from a past resident, receivables_activity is');
+        out.push('   scoped to current occupancies and every mover-out took their payment');
+        out.push('   history with them. Use the ledger for anything historical.');
+      } else if (oldAvg - newAvg > 15) {
+        out.push('>> FALLING WITH RECENCY, which is the opposite and would suggest recent rows');
+        out.push('   are missing — check the most recent window of the pull.');
+      } else {
+        out.push('>> FLAT. Whatever the level, it is consistent across the year, so this is a');
+        out.push('   definition difference rather than rows going missing.');
+      }
+    }
+  }
+
+  var rrCharged = 0;
+  rr.forEach(function (r) {
+    if (String(r.status || '').toLowerCase().indexOf('current') === -1) return;
+    rrCharged += (num_(r.rent) || 0);
+  });
+  out.push('');
+  out.push('rent CHARGED per month from the rent roll: ' + money_(Math.round(rrCharged)));
+
+  // Per month: money, receipts, and how many households appear.
+  out.push('');
+  out.push('--- BY MONTH ---');
+  out.push('month     receipts    net $        positive $     negative $   households');
+  var byMonth = {};
+  rec.forEach(function (r) {
+    var m = monthKey_(r.txn_receipt_date);
+    if (!m) return;
+    var a = num_(r.txn_amount);
+    if (a === null) return;
+    var b = byMonth[m] || (byMonth[m] = { n: 0, net: 0, pos: 0, neg: 0, occ: {} });
+    b.n++; b.net += a;
+    if (a >= 0) b.pos += a; else b.neg += a;
+    if (r.occupancy_id) b.occ[r.occupancy_id] = 1;
+  });
+  var months = Object.keys(byMonth).sort().slice(-14);
+  months.forEach(function (m) {
+    var b = byMonth[m];
+    out.push('  ' + m + String(b.n).padStart(9) + money_(round2_(b.net)).padStart(14) +
+             money_(round2_(b.pos)).padStart(15) + money_(round2_(b.neg)).padStart(14) +
+             String(Object.keys(b.occ).length).padStart(12));
+  });
+
+  // The decisive comparison: how many households paid, against how many are billed.
+  var last = months[months.length - 2] || months[months.length - 1];
+  if (last) {
+    var b2 = byMonth[last];
+    var paying = Object.keys(b2.occ).length;
+    var billed = rr.filter(function (r) {
+      return String(r.status || '').toLowerCase().indexOf('current') !== -1;
+    }).length;
+    out.push('');
+    out.push('--- THE DECIDING NUMBER (' + last + ') ---');
+    out.push('households with a receipt : ' + paying);
+    out.push('households on the rent roll: ' + billed);
+    var cover = billed ? Math.round(paying / billed * 100) : 0;
+    out.push('coverage: ' + cover + '%');
+    if (cover < 70) {
+      out.push('>> MOST HOUSEHOLDS ARE MISSING. This is not a definition problem, it is');
+      out.push('   missing rows. Likely the report is paginated beyond what afReport_');
+      out.push('   fetched, or receivables_activity only returns some payment types.');
+    } else {
+      out.push('>> Nearly every household appears, so rows are not missing. The shortfall');
+      out.push('   is in the AMOUNTS — receivables_activity is probably reporting');
+      out.push('   something narrower than a full rent payment.');
+    }
+  }
+
+  // What kind of transactions are these?
+  out.push('');
+  out.push('--- WHAT KIND OF TRANSACTIONS ---');
+  out.push('Read the STATUS block especially. Every tenancy that has ever paid should appear');
+  out.push('somewhere in a 12-month window, so if Past / Former / Moved out is ZERO, the');
+  out.push('report is only returning current occupancies and the history is incomplete.');
+  [['payment_type', 'payment_type'], ['party', 'party'], ['status', 'status']]
+    .forEach(function (f) {
+      var c = {};
+      rec.forEach(function (r) {
+        var k = String(r[f[1]] === null || r[f[1]] === undefined ? '(blank)' : r[f[1]]);
+        var a = num_(r.txn_amount) || 0;
+        var e = c[k] || (c[k] = { n: 0, sum: 0 });
+        e.n++; e.sum += a;
+      });
+      out.push(f[0] + ':');
+      Object.keys(c).sort(function (x, y) { return c[y].sum - c[x].sum; }).slice(0, 10)
+        .forEach(function (k) {
+          out.push('  ' + String(c[k].n).padStart(7) + '  ' +
+                   money_(round2_(c[k].sum)).padStart(14) + '  ' + k);
+        });
+    });
+
+  out.push('');
+  out.push('--- AVERAGE RECEIPT ---');
+  var amts = rec.map(function (r) { return num_(r.txn_amount); })
+                .filter(function (a) { return a !== null && a > 0; });
+  if (amts.length) {
+    out.push('median positive receipt: ' + money_(median_(amts)));
+    var rents = rr.map(function (r) { return num_(r.rent); })
+                  .filter(function (x) { return x && x > 0; });
+    out.push('median rent charged    : ' + money_(median_(rents)));
+    out.push('If the median receipt is far below the median rent, receipts are being');
+    out.push('reported per charge line rather than per payment, and summing them is');
+    out.push('still right — but a low household coverage above would mean rows are lost.');
+  }
+
+  var text = out.join('\n');
+  Logger.log(text);
+  return text;
+}
+
+/**
+ * Can receivables_activity be made to return PAST tenancies?
+ *
+ * The evidence that it currently cannot: across 4,961 receipts spanning thirteen months,
+ * every single one belongs to a Current or Notice tenancy and not one to a resident who has
+ * moved out. On a portfolio with ordinary churn that is not possible — so the report is
+ * scoped to current occupancies, and every mover-out took their payment history with them.
+ *
+ * That is why our receipts run at 63% of rent income twelve months back and 98% last month:
+ * the further back you look, the more of those residents have since gone.
+ *
+ * This tries the parameters that might widen the scope. It is a probe, not a fix — if none
+ * of them works, the answer is that receivables_activity is a CURRENT-RESIDENT report and
+ * anything historical must come from the ledger.
+ */
+function probeReceivablesScope() {
+  var from = ymd_(addDays_(today_(), -365));
+  var to = ymd_(today_());
+  var base = { receipt_date_from: from, receipt_date_to: to };
+
+  var attempts = [
+    ['baseline (what we pull today)', {}],
+    ['property_visibility all', { property_visibility: 'all' }],
+    ['tenant_status all', { tenant_status: 'all' }],
+    ['occupancy_status all', { occupancy_status: 'all' }],
+    ['include_past_tenants', { include_past_tenants: 'true' }],
+    ['include_former_residents', { include_former_residents: 'true' }],
+    ['tenancy_status all', { tenancy_status: 'all' }],
+    ['status all', { status: 'all' }],
+    ['include_inactive', { include_inactive: 'true' }]
+  ];
+
+  var out = ['--- CAN WE SEE PAST TENANCIES? ---', '',
+             'window: ' + from + ' to ' + to, ''];
+  var baseline = null;
+
+  attempts.forEach(function (a) {
+    var body = {};
+    Object.keys(base).forEach(function (k) { body[k] = base[k]; });
+    Object.keys(a[1]).forEach(function (k) { body[k] = a[1][k]; });
+
+    var rows;
+    try {
+      rows = afReportWindowed_('receivables_activity', body,
+        'receipt_date_from', 'receipt_date_to', from, to,
+        { windowDays: 60, maxRows: 60000 });
+    } catch (e) {
+      out.push('  ' + a[0].padEnd(32) + 'REJECTED  ' + String(e.message).slice(0, 60));
+      return;
+    }
+
+    var statuses = {}, total = 0;
+    rows.forEach(function (r) {
+      var st = String(r.status || '(blank)');
+      statuses[st] = (statuses[st] || 0) + 1;
+      total += (num_(r.txn_amount) || 0);
+    });
+    var past = Object.keys(statuses).filter(function (k) {
+      return /past|former|moved|prior|inactive/i.test(k);
+    });
+
+    if (baseline === null) baseline = rows.length;
+    var delta = rows.length - baseline;
+
+    out.push('  ' + a[0].padEnd(32) + String(rows.length).padStart(6) + ' rows  ' +
+             (delta > 0 ? '(+' + delta + ')' : delta < 0 ? '(' + delta + ')' : '(same)') +
+             '  ' + money_(Math.round(total)).padStart(13) +
+             (past.length ? '   <<< PAST TENANCIES: ' + past.join(', ') : ''));
+    out.push('      statuses: ' + Object.keys(statuses).map(function (k) {
+      return k + '=' + statuses[k]; }).join(', '));
+    sleepFor_('appfolio');
+  });
+
+  out.push('');
+  out.push('WHAT TO LOOK FOR: a row that returns MORE records than the baseline, and a status');
+  out.push('list that finally contains something other than Current and Notice. If nothing');
+  out.push('does, receivables_activity only knows about current residents — which is fine as');
+  out.push('long as nothing historical is built on it. Rent_Income_GL already is not.');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+/**
+ * Does our ledger figure agree with AppFolio's own cash flow statement?
+ *
+ * Frank's export, 2026-08-19, Aug 2025 to Jul 2026. These are AppFolio's numbers, not ours,
+ * and they are the check that matters: if buildRentIncomeGL disagrees with the statement the
+ * accountant reads, the dashboard is wrong regardless of how reasonable it looks.
+ *
+ * Hardcoded on purpose. A baseline you can re-derive from the same broken pull is not a
+ * baseline — it has to come from outside the system it is checking.
+ */
+var CASHFLOW_BASELINE_2026 = {
+  '2025-08': 1095496.63, '2025-09': 1105829.35, '2025-10': 1074100.03,
+  '2025-11': 1101340.13, '2025-12': 1089109.97, '2026-01': 1090372.50,
+  '2026-02': 1097738.69, '2026-03': 1091388.79, '2026-04': 1087419.48,
+  '2026-05': 1127352.22, '2026-06': 1124257.45, '2026-07': 1119990.85
+};
+var CASHFLOW_BASELINE_SUB = {
+  '2025-08': 19166, '2025-09': 19166, '2025-10': 19171, '2025-11': 19171,
+  '2025-12': 35726, '2026-01': 23006, '2026-02': 22885, '2026-03': 21262,
+  '2026-04': 12141, '2026-05': 17106, '2026-06': 17356, '2026-07': 17356
+};
+
+function reconcileRentIncome() {
+  var gl = readTab_('Rent_Income_GL').filter(function (r) { return r.month; });
+  var out = ['--- OUR LEDGER FIGURE vs APPFOLIO\'S CASH FLOW STATEMENT ---', ''];
+  if (!gl.length) {
+    out.push('Rent_Income_GL is empty. Run buildRentIncomeGL(), then this again.');
+    Logger.log(out.join('\n'));
+    return out.join('\n');
+  }
+
+  var ours = {};
+  gl.forEach(function (r) { ours[monthNorm_(r.month)] = num_(r.rent_income); });
+
+  out.push('Baseline: the 12-month cash flow exported 2026-08-19. 4100 + 4105.');
+  out.push('');
+  out.push('month      AppFolio        ours        difference');
+  var worst = 0, checked = 0, missing = [], offenders = [], pcts = [], diffs = [];
+  Object.keys(CASHFLOW_BASELINE_2026).sort().forEach(function (m) {
+    var want = CASHFLOW_BASELINE_2026[m] + (CASHFLOW_BASELINE_SUB[m] || 0);
+    var got = ours[m];
+    if (got === null || got === undefined) {
+      missing.push(m);
+      out.push('  ' + m + money_(Math.round(want)).padStart(14) + '            —' +
+               '          not pulled');
+      return;
+    }
+    checked++;
+    var diff = got - want;
+    var pct = Math.abs(diff) / want * 100;
+    if (pct > worst) worst = pct;
+    pcts.push(pct);
+    diffs.push({ m: m, pct: pct, want: want, got: got, sign: diff < 0 ? -1 : (diff > 0 ? 1 : 0) });
+    if (pct > 2) offenders.push({ m: m, pct: pct, want: want, got: got });
+    out.push('  ' + m + money_(Math.round(want)).padStart(14) +
+             money_(Math.round(got)).padStart(14) +
+             (diff >= 0 ? '  +' : '  ') + money_(Math.round(diff)) +
+             (pct > 2 ? '   <<< off by ' + pct.toFixed(1) + '%' : ''));
+  });
+
+  out.push('');
+  if (!checked) {
+    out.push('>> No overlapping month. Widen INCOME_GL.MONTHS or check the pull window.');
+  } else if (worst <= 2) {
+    out.push('>> AGREES within ' + worst.toFixed(1) + '% on all ' + checked + ' month(s).');
+    out.push('   The ledger figure on the dashboard is the same number your accountant reads.');
+  } else {
+    // READ THE SHAPE, DO NOT LIST THE POSSIBILITIES.
+    //
+    // This used to end with "either an account is missing or the window clipped a month",
+    // which is two guesses dressed as a finding — and it sent the last round of this
+    // looking at the account configuration when the accounts were fine.
+    //
+    // The two causes look nothing alike, and the tell is DIRECTION plus SPREAD:
+    //
+    //   A MISSING ACCOUNT is short in every month, in the same direction, by a similar
+    //   proportion — because an account does not appear and disappear month to month.
+    //   It can be small: dropping subsidised rent is under 2% here, which is why a
+    //   threshold-based test misses it entirely.
+    //
+    //   A CLIPPED WINDOW is one month, at the edge of the range, wrong by a lot —
+    //   because 93% of this portfolio's rent posts on the 1st, so a month missing its
+    //   first day comes back at single digits of itself.
+    //
+    //   ORDINARY DRIFT goes both ways and stays small.
+    //
+    // The direction test runs over EVERY month, not just the ones past a threshold.
+    var months = Object.keys(CASHFLOW_BASELINE_2026).sort();
+    var edge = [months[0], months[months.length - 1]];
+    var big = offenders.filter(function (o) { return o.pct > 25; });
+
+    var neg = diffs.filter(function (d) { return d.sign < 0; }).length;
+    var pos = diffs.filter(function (d) { return d.sign > 0; }).length;
+    var oneWay = (neg === checked || pos === checked) && checked >= 4;
+    var medPct = median_(pcts.slice()) || 0;
+
+    if (big.length && big.every(function (o) { return edge.indexOf(o.m) > -1; })) {
+      out.push('>> ONE MONTH IS CLIPPED, THE REST AGREE. This is a window boundary, not a');
+      out.push('   configuration problem — the accounts are right.');
+      big.forEach(function (o) {
+        out.push('   ' + o.m + ' returned ' + Math.round(o.got / o.want * 100) +
+                 '% of the month. It sits at the ' +
+                 (o.m === edge[0] ? 'START' : 'END') + ' of the pull window.');
+      });
+      out.push('   Rent posts on the 1st here, so a window beginning on the 2nd loses almost');
+      out.push('   the entire month. buildRentIncomeGL now starts the window on the 1st of a');
+      out.push('   month rather than counting back in days.');
+      out.push('   FIX: re-run buildRentIncomeGL(). The clipped month should come back whole.');
+      var rest = pcts.filter(function (x) { return x <= 25; });
+      if (rest.length) {
+        out.push('   The other ' + rest.length + ' month(s) agree within ' +
+                 Math.max.apply(null, rest).toFixed(1) + '%, which is normal ledger drift.');
+      }
+    } else if (oneWay && neg === checked) {
+      out.push('>> EVERY MONTH IS SHORT, none over, median ' + medPct.toFixed(1) + '%.');
+      out.push('   That is an income account missing from INCOME_GL.ACCOUNTS — an account');
+      out.push('   cannot come and go month to month. Note it does NOT need to be a large');
+      out.push('   gap: dropping subsidised rent alone is under 2%.');
+      out.push('   FIX: run discoverGlAccounts(35) and add whatever 4-series account carries');
+      out.push('   the difference. Both known ids should be set: 4100 = 27, 4105 = 28.');
+    } else if (oneWay && pos === checked) {
+      out.push('>> EVERY MONTH IS OVER, none under, median ' + medPct.toFixed(1) + '%.');
+      out.push('   An account is being counted that the statement excludes, or the basis is');
+      out.push('   wrong. INCOME_GL.BASIS is currently ' + INCOME_GL.BASIS + '.');
+      out.push('   FIX: run discoverGlAccounts(35) and check nothing beyond 4100/4105 resolves.');
+    } else {
+      out.push('>> DISAGREES by up to ' + worst.toFixed(1) + '%: ' + neg + ' month(s) short, ' +
+               pos + ' over, median ' + medPct.toFixed(1) + '%.');
+      out.push('   Not a missing account — that would be short in every month. Not a clipped');
+      out.push('   window — that would be one month at the edge. Most likely posting-date');
+      out.push('   differences between the accrual ledger and the exported statement.');
+      if (offenders.length) {
+        out.push('   Worst: ' + offenders.slice(0, 3).map(function (o) {
+          return o.m + ' ' + (o.got > o.want ? '+' : '') +
+                 Math.round(o.got - o.want); }).join(', '));
+      }
+    }
+  }
+  if (missing.length) {
+    out.push('   Not pulled: ' + missing.join(', ') + '. INCOME_GL.MONTHS is ' +
+             INCOME_GL.MONTHS + '.');
+  }
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
