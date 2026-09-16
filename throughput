@@ -1,0 +1,308 @@
+/**
+ * WeLease Pipeline — THROUGHPUT  v1.0.0 · 2026-08-06
+ * Requires Core.gs, Shared.gs, Dashboard.gs.
+ *
+ * Added versus cleared, per list, per week.
+ *
+ * WHY THIS AND NOT JUST A COUNT: a list sitting at 18 for a month and a list that took
+ * in 40 and cleared 40 look identical on a scorecard. One team is drowning, the other is
+ * keeping pace. Only added-versus-cleared distinguishes them, and it is the only number
+ * that tells you whether the team is gaining or losing ground.
+ *
+ * HOW: each run records the KEY of every open item per list. The next run compares.
+ *   in the new set but not the old  -> ADDED
+ *   in the old set but not the new  -> CLEARED
+ *   in both                         -> CARRIED, with its age on our list
+ *
+ * Item-level, not count-level. Ten in and ten out is not "no change" — it is twenty
+ * events, and a count would have shown zero.
+ *
+ * Starts producing numbers on the SECOND run. There is no way to reconstruct history,
+ * so the sooner it runs nightly the sooner it is useful.
+ */
+
+var THRU = {
+  SNAPSHOT_TAB: '_throughput_snapshot',
+  LEDGER_TAB: 'Throughput',
+  RETAIN_WEEKS: 26
+};
+
+/**
+ * Compares the current open items against the last snapshot and records the movement.
+ * Run AFTER the rebuild jobs and BEFORE the dashboard cache.
+ */
+function buildThroughput() {
+  var t0 = new Date().getTime();
+  var runDate = ymd_(today_());
+  var pm = pmLookup_();
+
+  // Current open items, straight from the same builders the dashboard uses — so the
+  // ledger can never drift from what people actually see.
+  var U = urgencies_(pm);
+  if (typeof collectionsBlocks_ === 'function') {
+    try { U = U.concat(collectionsBlocks_(pm)); } catch (e) {}
+  }
+
+  var current = {};
+  U.forEach(function (b) {
+    current[b.id] = {};
+    b.rows.forEach(function (r) {
+      var k = String(r.key === null || r.key === undefined ? '' : r.key).trim();
+      if (k) current[b.id][k] = 1;
+    });
+  });
+
+  // Previous snapshot, keyed list -> key -> first seen
+  var prev = {}, firstSeen = {};
+  readTab_(THRU.SNAPSHOT_TAB).forEach(function (r) {
+    if (!r.list_id || !r.item_key) return;
+    (prev[r.list_id] = prev[r.list_id] || {})[String(r.item_key)] = 1;
+    firstSeen[r.list_id + '|' + r.item_key] = ymd_(r.first_seen) || runDate;
+  });
+  var hadSnapshot = Object.keys(prev).length > 0;
+
+  var ledger = [], snapshot = [];
+  var lists = {};
+  Object.keys(current).forEach(function (k) { lists[k] = 1; });
+  Object.keys(prev).forEach(function (k) { lists[k] = 1; });
+
+  Object.keys(lists).sort().forEach(function (listId) {
+    var now = current[listId] || {}, was = prev[listId] || {};
+    var added = [], cleared = [], carried = [];
+
+    Object.keys(now).forEach(function (k) {
+      if (was[k]) carried.push(k); else added.push(k);
+    });
+    Object.keys(was).forEach(function (k) { if (!now[k]) cleared.push(k); });
+
+    // Age on OUR list — how long it has been outstanding here, not in AppFolio.
+    var ages = carried.map(function (k) {
+      var fs = firstSeen[listId + '|' + k];
+      return fs ? daysBetween_(fs, runDate) : 0;
+    });
+
+    var blk = U.filter(function (b) { return b.id === listId; })[0] || {};
+    var title = blk.title || listId;
+
+    ledger.push({
+      // WHICH TAB THIS LIST LIVES ON. Recorded here rather than re-derived later, because
+      // the "what changed since yesterday" panel rolls these up per tab, and re-deriving
+      // the mapping in a second place is how the two drift apart.
+      run_date: runDate, list_id: listId, list: title, view: blk.view || '',
+      open_now: Object.keys(now).length,
+      added: added.length, cleared: cleared.length,
+      carried: carried.length,
+      net: added.length - cleared.length,
+      // Above 1.0 the list is growing faster than it is being worked.
+      intake_ratio: cleared.length ? round2_(added.length / cleared.length)
+                                   : (added.length ? null : 0),
+      oldest_days: ages.length ? Math.max.apply(null, ages) : 0,
+      median_age_days: median_(ages) || 0,
+      over_30_days: ages.filter(function (a) { return a > 30; }).length,
+      first_run: hadSnapshot ? '' : 'YES — no movement until the next run'
+    });
+
+    Object.keys(now).forEach(function (k) {
+      snapshot.push({
+        list_id: listId, item_key: k,
+        first_seen: firstSeen[listId + '|' + k] || runDate,
+        last_seen: runDate
+      });
+    });
+  });
+
+  writeTab_(THRU.SNAPSHOT_TAB, snapshot);
+  appendTab_(THRU.LEDGER_TAB, ledger);
+
+  var totals = ledger.reduce(function (a, r) {
+    a.added += r.added; a.cleared += r.cleared; a.open += r.open_now; return a;
+  }, { added: 0, cleared: 0, open: 0 });
+
+  logRun_('buildThroughput', 'derived', THRU.LEDGER_TAB, ledger.length,
+          new Date().getTime() - t0,
+          hadSnapshot
+            ? ('added ' + totals.added + ' · cleared ' + totals.cleared +
+               ' · net ' + (totals.added - totals.cleared) + ' · open ' + totals.open)
+            : ('FIRST RUN — ' + snapshot.length + ' items recorded, movement starts next run'));
+  Logger.log(JSON.stringify(totals, null, 1));
+  return totals;
+}
+
+/**
+ * One-off repair for the ledger rows written between the `view` column being added to
+ * buildThroughput and appendTab_ learning to reconcile headers.
+ *
+ * WHAT WENT WRONG. appendTab_ used to write a header only when the tab was empty, then
+ * wrote later batches positionally against the header the CALLER computed. Adding `view`
+ * as the fourth key meant those rows went down as
+ *
+ *     run_date | list_id | list | VIEW | open_now | added | ...
+ *
+ * under a header row that still read `... | list | open_now | added | ...`. Everything from
+ * column four rightwards is one place to the left of its heading. No error, no warning —
+ * the Throughput panel just started reading a tab name where a count belongs, which is why
+ * it looked like the section had been overwritten.
+ *
+ * The values are all still there and still in order, so this is fully recoverable: shift
+ * the affected rows back one place and park the recovered view name in its own column.
+ * Rows written before the change are untouched.
+ *
+ * HOW A BROKEN ROW IS RECOGNISED — by arithmetic, not by guessing at the layout. Every
+ * ledger row satisfies two identities by construction:
+ *
+ *     net      = added + (-cleared)
+ *     open_now = added + carried
+ *
+ * Read under the right headings both hold. Read one column out they both fail. So a row is
+ * only touched when reading it the OLD way makes both identities true and reading it the
+ * current way does not — the repair proves itself before it writes. Anything that fits
+ * neither is left exactly as it is and reported, because a row I cannot explain is not a
+ * row I should rewrite.
+ *
+ * Safe to run twice. A row that already lines up is skipped.
+ */
+var THRU_SHIFTED_ORDER = ['run_date', 'list_id', 'list', 'view', 'open_now', 'added',
+  'cleared', 'carried', 'net', 'intake_ratio', 'oldest_days', 'median_age_days',
+  'over_30_days', 'first_run'];
+
+/** Do the two ledger identities hold for this set of named values? */
+function thruConsistent_(o) {
+  var n = function (v) { var x = Number(v); return isNaN(x) ? null : x; };
+  var open = n(o.open_now), add = n(o.added), cle = n(o.cleared),
+      car = n(o.carried), net = n(o.net);
+  if (open === null || add === null || cle === null || car === null || net === null) return false;
+  return net === add - cle && open === add + car;
+}
+
+function repairThroughputLedger() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(THRU.LEDGER_TAB);
+  if (!sh || sh.getLastRow() < 2) {
+    Logger.log('No ledger to repair.');
+    return { checked: 0, repaired: 0, unexplained: 0 };
+  }
+
+  var vals = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  var head = vals[0].map(function (h) { return String(h == null ? '' : h).trim(); });
+
+  // Make sure there is somewhere for the recovered view to go.
+  var iView = head.indexOf('view');
+  if (iView === -1) {
+    iView = head.length;
+    head.push('view');
+    vals[0] = head.slice();
+    for (var k = 1; k < vals.length; k++) vals[k].push('');
+  }
+
+  var repaired = 0, unexplained = [];
+  for (var r = 1; r < vals.length; r++) {
+    var row = vals[r];
+    if (!row[0]) continue;
+
+    var asIs = {};
+    head.forEach(function (h, i) { if (h) asIs[h] = row[i]; });
+    if (thruConsistent_(asIs)) continue;                 // already correct
+
+    var asShifted = {};
+    THRU_SHIFTED_ORDER.forEach(function (k, i) { asShifted[k] = row[i]; });
+    if (!thruConsistent_(asShifted)) {                   // neither reading works
+      unexplained.push(String(row[0]) + ' / ' + String(row[1]));
+      continue;
+    }
+
+    // Re-emit by name against whatever the header row says today.
+    // Unnamed trailing columns are cleared too — that is where the old fourteenth value
+    // landed, and a stale figure under no heading is the next person's puzzle.
+    head.forEach(function (h, i) {
+      row[i] = (h && asShifted[h] !== undefined) ? asShifted[h] : '';
+    });
+    row[iView] = asShifted.view || '';
+    repaired++;
+  }
+
+  if (repaired) {
+    sh.getRange(1, 1, vals.length, head.length).setValues(vals);
+    sh.getRange(1, 1, 1, head.length).setFontWeight('bold');
+    try { invalidateTab_(THRU.LEDGER_TAB); } catch (e) {}
+  }
+
+  var msg = 'Throughput ledger: ' + (vals.length - 1) + ' rows checked, ' + repaired +
+    ' realigned' + (unexplained.length
+      ? ', ' + unexplained.length + ' left alone (fit neither layout): ' +
+        unexplained.slice(0, 5).join('; ')
+      : '') + '.';
+  Logger.log(msg);
+  logRun_('repairThroughputLedger', 'derived', THRU.LEDGER_TAB, repaired, 0, msg);
+  if (unexplained.length) logError_('derived', 'repairThroughputLedger', msg);
+  return { checked: vals.length - 1, repaired: repaired, unexplained: unexplained.length };
+}
+
+/**
+ * The panel that turns a to-do list into a management review.
+ * Lists where intake outruns clearance, worst first.
+ */
+function throughputPanel_() {
+  var rows = readTab_(THRU.LEDGER_TAB);
+  if (!rows.length) {
+    return '<section class="card"><h2>Throughput</h2>' +
+      '<p class="warnrow">No history yet — run <code>buildThroughput()</code>. ' +
+      'It records what is open today; movement appears on the second run. ' +
+      'There is no way to reconstruct this retroactively.</p></section>';
+  }
+
+  var latest = rows[rows.length - 1].run_date;
+  var today = rows.filter(function (r) { return r.run_date === latest; });
+  if (today.some(function (r) { return r.first_run; })) {
+    return '<section class="card"><h2>Throughput</h2>' +
+      '<p class="note">Baseline recorded ' + esc_(latest) + '. Added and cleared appear ' +
+      'after the next run — there is nothing to compare against yet.</p></section>';
+  }
+
+  today.sort(function (a, b) { return (num_(b.net) || 0) - (num_(a.net) || 0); });
+  var tot = today.reduce(function (a, r) {
+    a.added += num_(r.added) || 0; a.cleared += num_(r.cleared) || 0;
+    a.open += num_(r.open_now) || 0; return a;
+  }, { added: 0, cleared: 0, open: 0 });
+  var net = tot.added - tot.cleared;
+
+  var h = ['<section class="card"><h2>Throughput — are we keeping up?</h2>'];
+  h.push('<p class="note">Added versus cleared since the previous run. A list holding ' +
+    'steady at 18 and a list that took in 40 and cleared 40 look identical on a count — ' +
+    'only this tells them apart.</p>');
+
+  h.push('<div class="cards">');
+  h.push('<div class="sc"><span class="sc-n">' + tot.added + '</span>' +
+    '<span class="sc-l">Added</span><span class="sc-s">new since last run</span></div>');
+  h.push('<div class="sc"><span class="sc-n">' + tot.cleared + '</span>' +
+    '<span class="sc-l">Cleared</span><span class="sc-s">resolved or aged out</span></div>');
+  h.push('<div class="sc ' + (net > 0 ? 'bad' : (net < 0 ? 'clear' : 'warn')) + '">' +
+    '<span class="sc-n">' + (net > 0 ? '+' : '') + net + '</span>' +
+    '<span class="sc-l">Net</span><span class="sc-s">' +
+    (net > 0 ? 'losing ground' : (net < 0 ? 'gaining ground' : 'holding')) + '</span></div>');
+  h.push('<div class="sc"><span class="sc-n">' + tot.open + '</span>' +
+    '<span class="sc-l">Open now</span><span class="sc-s">across every list</span></div>');
+  h.push('</div>');
+
+  h.push('<table><thead><tr><th>List</th><th class="num">Open</th><th class="num">Added</th>' +
+    '<th class="num">Cleared</th><th class="num">Net</th><th class="num">Oldest</th>' +
+    '<th class="num">Over 30 days</th><th>Verdict</th></tr></thead><tbody>');
+  today.forEach(function (r) {
+    var n = num_(r.net) || 0;
+    var verdict = n > 0 ? 'growing' : (n < 0 ? 'shrinking' : 'flat');
+    var tone = n > 0 ? 'bad' : (n < 0 ? 'good' : 'none');
+    h.push('<tr><td class="strong">' + esc_(r.list) + '</td>' +
+      '<td class="num">' + esc_(r.open_now) + '</td>' +
+      '<td class="num">' + esc_(r.added) + '</td>' +
+      '<td class="num">' + esc_(r.cleared) + '</td>' +
+      '<td class="num strong">' + (n > 0 ? '+' : '') + n + '</td>' +
+      '<td class="num muted">' + esc_(daySpan_(r.oldest_days)) + '</td>' +
+      '<td class="num muted">' + esc_(r.over_30_days) + '</td>' +
+      '<td><span class="tag ' + tone + '">' + verdict + '</span></td></tr>');
+  });
+  h.push('</tbody></table>');
+  h.push('<p class="note"><strong>Oldest</strong> and <strong>over 30 days</strong> measure age ' +
+    'on THIS list, not in AppFolio. An item carried five weeks running is a different ' +
+    'problem from a new one, even when the list length has not moved.</p>');
+  h.push('</section>');
+  return h.join('');
+}
