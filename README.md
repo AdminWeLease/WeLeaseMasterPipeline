@@ -47,26 +47,28 @@ ShowMojo ────────────────┘                    
 
 | File | Holds |
 |---|---|
-| `Core_v2.gs` | HTTP, retries, pagination, tab read/write, dates, money, the admin gate |
+| `Core.gs` | HTTP, retries, pagination, tab read/write, dates, money, the admin gate |
 | `Jobs.gs` | The nightly job chain and the AppFolio column allow-lists |
 | `Shared.gs` | Address book, scope filters, tenancy liveness |
-| `Master_Scope.gs` | The two human-owned sheets that decide what counts |
+| `MasterScope.gs` | The two human-owned sheets that decide what counts |
 | `Metrics.gs` | KPI calculations against the benchmark registry |
 | `Portfolio.gs` | Portfolio summary, door history, rent income, rent timing |
 | `Collections.gs` | Vendor bills, approvals, owner shortfalls |
 | `Inspections.gs` | The renewal pipeline and the 80-day clock |
-| `Data_Quality.gs` | The audit, and insurance compliance |
+| `DataQuality.gs` | The audit, and insurance compliance |
 | `LeadSimple.gs` | Process and deal sync, onboarding journeys |
 | `ShowMojo.gs` | Showings and listing performance |
-| `Utility_Schedule.gs` | Utility billing schedule |
+| `UtilitySchedule.gs` | Utility billing schedule |
 | `Throughput.gs` | Added versus cleared, per list, per run |
 | `Status.gs` | Per-item status, follow-ups and the note thread |
-| `Weekly_Report.gs` | The Tuesday management report |
-| `Drive_Export.gs` | Daily and monthly snapshots for the owner review |
-| `Owner_Update.gs` | Owner packs |
-| `Notice_Feed.gs` | The merge feed the PDF notice filler reads |
+| `WeeklyReport.gs` | The Tuesday management report |
+| `DriveExport.gs` | Daily and monthly snapshots for the owner review |
+| `OwnerUpdates.gs` | Owner packs |
+| `NoticeFeed.gs` | The merge feed the PDF notice filler reads |
 | `Dashboard.gs` | All rendering, CSS, client JS |
-| `Diagnostic.gs` | Everything named `diagnose*` and `reconcile*` |
+| `DashboardUtilities.gs` | Shared dashboard rendering helpers |
+| `ReportingV3.gs` | Normalized current-period owner reporting, accounting, forecast and QA |
+| `Diagnostics.gs` | Everything named `diagnose*` and `reconcile*` |
 | `Server.gs` | **Separate project.** The PDF notice filler backend — do not paste into this one |
 
 ---
@@ -89,7 +91,7 @@ NOTICE_TOOL_URL             optional, the PDF filler web app URL
 4. Run `setupSheets()`, then `verifyConnections()`.
 5. Run `installTriggers()` — ⚠️ deletes existing triggers first.
 6. **Deploy → New deployment → Web app.** Execute as **Me**, access **Anyone in WeLease**.
-7. Run `rebuildAll()` once by hand, then `rebuildDashboardCache()`.
+7. Run `rebuildAll()` once by hand, then `rebuildOwnerReporting()`, `buildWeeklyReport()`, and `rebuildDashboardCache()`.
 
 ### Credentials never go in a file
 
@@ -114,7 +116,8 @@ Every secret is read through `PropertiesService.getScriptProperties()`. There ar
 04:45  rebuildDataQuality
 04:50  rebuildThroughput       needs two runs before movement appears
 04:55  buildNoticeMergeFeed
-05:00  rebuildDashboardCache   must be last
+05:00  rebuildDashboardCache   operational dashboard cache
+05:10  rebuildOwnerReporting    normalized owner-report data + QA
 05:30  exportDailySnapshot
 06:30  buildWeeklyReport       Mondays
 06:00  exportMonthlySnapshot   15th
@@ -128,12 +131,19 @@ Every secret is read through `PropertiesService.getScriptProperties()`. There ar
 
 ```bash
 npm install jsdom          # two suites need a real DOM
-for f in *_test.js jsdom_ui.js; do node "$f" || echo "FAILED: $f"; done
+./run_tests.sh
 ```
+
+**Use the runner, not a bare loop over exit codes.** `render_test.js` once printed
+`5 STRUCTURAL FAILURES` and exited 0, so a loop checking only the status reported it
+green — five obsolete assertions failed in plain sight for weeks, two of them directly
+contradicting newer suites. That file is fixed and every suite now exits on its counter,
+but the loophole is a property of shell runners rather than of one file, so `run_tests.sh`
+fails on **either** a non-zero exit **or** the word FAIL in the output.
 
 `harness.js` loads every `.gs` into one VM context — which also catches **duplicate function definitions**, the failure mode Apps Script hides by silently letting the last one win.
 
-`size_test.js` projects page weight at real portfolio volume. Currently ~400 KB. **Keep it under 600 KB** — beyond that, first paint on the Apps Script iframe gets noticeably worse.
+`size_test.js` **enforces** page weight at real portfolio volume: 600 KB hard ceiling, warning at 500, currently ~401 KB. It also bounds `<title>` count, chart dots and list rows — each has been a real regression once. Until September 2026 it printed a number and never failed, so the ceiling the README claimed was never actually checked.
 
 ---
 
